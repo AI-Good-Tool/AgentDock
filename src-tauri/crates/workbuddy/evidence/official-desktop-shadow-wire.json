@@ -1,0 +1,541 @@
+{
+  "evidence": "real desktop session pipeline with model transport replaced by loopback fixtures",
+  "productionModelCalls": 0,
+  "pid": 75774,
+  "records": [
+    {
+      "sequence": 1,
+      "time": "2026-10-20T04:22:50.468Z",
+      "host": "127.0.0.1",
+      "path": "/v2/chat/completions",
+      "method": "POST",
+      "pid": 75774,
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "x-stainless-arch": "arm64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "MacOS",
+        "x-stainless-package-version": "6.25.0",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v22.21.1",
+        "x-conversation-id": "d317de32-0ca7-40c4-a747-a88896e0170e",
+        "x-agent-intent": "craft",
+        "x-agent-purpose": "conversation",
+        "x-ide-type": "WorkBuddy",
+        "x-ide-name": "WorkBuddy",
+        "x-ide-version": "5.8.3",
+        "x-private-data": "true",
+        "acp-connection-id": "01a15788-4b40-797f-a948-5dadba5365a8",
+        "x-codebuddy-request": "1",
+        "x-device-token": "[REDACTED]",
+        "x-request-id": "01a1578c3b517e7fa27d556a84fcfe9b",
+        "x-conversation-message-id": "01a1578c3b517e7fa27d556a84fcfe9b",
+        "x-conversation-request-id": "01a1578c36557ffe8f549e22e405ec9e",
+        "x-root-request-id": "01a1578c36557ffe8f549e22e405ec9e",
+        "x-agent-type": "main",
+        "content-encoding": "gzip",
+        "traceparent": "00-5c4049654389447b90413a508b15e754-986137f40507ca84-01",
+        "b3": "5c4049654389447b90413a508b15e754-a9bd3dbff815589f-1-fed7a7098b4b2157",
+        "x-b3-traceid": "5c4049654389447b90413a508b15e754",
+        "x-b3-parentspanid": "fed7a7098b4b2157",
+        "x-b3-spanid": "a9bd3dbff815589f",
+        "x-b3-sampled": "1",
+        "x-trace-id": "5c4049654389447b90413a508b15e754",
+        "x-product": "SaaS",
+        "user-agent": "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0",
+        "authorization": "[REDACTED]",
+        "x-user-id": "[REDACTED]",
+        "x-domain": "[REDACTED]",
+        "content-length": "49880",
+        "accept-encoding": "gzip, compress, deflate, br",
+        "caller_method": "",
+        "host": "127.0.0.1:53493"
+      },
+      "wireBytes": 49880,
+      "gzipHeaderHex": "1f8b0800000000000013",
+      "body": {
+        "fields": [
+          "extra_vars",
+          "max_tokens",
+          "messages",
+          "model",
+          "reasoning_effort",
+          "reasoning_summary",
+          "stream",
+          "stream_options",
+          "temperature",
+          "tools",
+          "verbosity"
+        ],
+        "model": "deepseek-v4.1-flash",
+        "stream": true,
+        "parameters": {
+          "temperature": 1,
+          "max_tokens": 128000,
+          "stream_options": {
+            "include_usage": true
+          },
+          "reasoning_effort": "high"
+        },
+        "messages": [
+          {
+            "role": "system",
+            "fields": [
+              "content",
+              "role"
+            ],
+            "contentType": "string",
+            "contentBytes": 43112,
+            "contentSha256": "23e7e7d85fdc32717dcb5c133dcd391b12974c53d4cd2e62a0d951bbf4d1ae9b"
+          },
+          {
+            "role": "user",
+            "fields": [
+              "agent",
+              "content",
+              "conversationRequestId",
+              "role",
+              "startsNewUserRequest"
+            ],
+            "contentType": "object",
+            "contentBlocks": [
+              "text",
+              "text",
+              "text"
+            ],
+            "contentBytes": 7880,
+            "contentSha256": "c8731a0b15d95256a2b7d242da4aedc56c8f1b58fa83d28bd5ee693b32b3cf02"
+          },
+          {
+            "role": "assistant",
+            "fields": [
+              "agent",
+              "content",
+              "conversationRequestId",
+              "messageId",
+              "model",
+              "rawUsage",
+              "requestModelId",
+              "requestModelName",
+              "role",
+              "stepSeq",
+              "traceId",
+              "usage"
+            ],
+            "contentType": "object",
+            "contentBlocks": [
+              "text"
+            ],
+            "contentBytes": 63,
+            "contentSha256": "f1111a5ed0b5520091f86ed6f94a442968247e6d4fd0e5b928e4697108a0e2fc"
+          },
+          {
+            "role": "user",
+            "fields": [
+              "agent",
+              "content",
+              "conversationRequestId",
+              "role",
+              "startsNewUserRequest"
+            ],
+            "contentType": "object",
+            "contentBlocks": [
+              "text",
+              "text"
+            ],
+            "contentBytes": 1829,
+            "contentSha256": "c384af17d37b3421cc5831ac75500816f1760d7a3a9208c412cca2f867b9e8e2"
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "name": "Read",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "26dae905b79b8826984116a9382580d9be1a71cbd8f1e2ea9b288d75c44e0bc3"
+          },
+          {
+            "type": "function",
+            "name": "Write",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "7e772a3c75c25b474a034ee0110b51e52f6c88ee98ac21a8b9564dc46d922914"
+          },
+          {
+            "type": "function",
+            "name": "Edit",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "6c087a7c48baf8a7fd8d202f87b160c3f2aaa530fd2e2ce6092cd6bdec46abb9"
+          },
+          {
+            "type": "function",
+            "name": "Glob",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "0f1fc07c182f12da4fcc7159e5d4efb950cd986b3ffc233515b508d375460efa"
+          },
+          {
+            "type": "function",
+            "name": "Grep",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "3382e6b0831914ace7ee131fe8122466d39eff9590434b02c1a8800e77f74492"
+          },
+          {
+            "type": "function",
+            "name": "Bash",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "72013c999af4f72e1f0fa6a61bd59605d59151f920fe9b5cc7b864bd46c1d5da"
+          },
+          {
+            "type": "function",
+            "name": "TaskCreate",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "264c7e870389197fed46587b570ce49c3983974f8826b03fa67ff314e0e912e1"
+          },
+          {
+            "type": "function",
+            "name": "TaskGet",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "513fc01a478acd700d089136912ab792faa051d7f7ab984aaab971804d72dc50"
+          },
+          {
+            "type": "function",
+            "name": "TaskUpdate",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "d4a4335c84b4d4e621046f8123f8a3e1dbe37e767d9098a75dbfe0b659a3236a"
+          },
+          {
+            "type": "function",
+            "name": "TaskOutput",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "9798ee59c4a952e2be62016a5233506d77e37483a6aa07343dbff3ee1b007e79"
+          },
+          {
+            "type": "function",
+            "name": "WebFetch",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "71cbfcd41d5018b67afa0583ab979d0ebdd1c34ebb0d134cdacedf1569e10eaa"
+          },
+          {
+            "type": "function",
+            "name": "WebSearch",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "2d0b7a8c0e33be102c0e5cb2225525f8eddb724817cc131d864fc1b8f19f84d5"
+          },
+          {
+            "type": "function",
+            "name": "AskUserQuestion",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "7047918e1fe5f0122d7ea302509a7ef75b5c87f0cf9676dd5ef787427ea40d85"
+          },
+          {
+            "type": "function",
+            "name": "DeferExecuteTool",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "14cb31bb8cda582a8a13df4b06e2a20501b313c8af22ccc6212baa109ae376f9"
+          },
+          {
+            "type": "function",
+            "name": "automation_update",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "0e47d89c2371b6c1633109a9c6b98766c73f554b892ac2415e8d6984df933a7c"
+          },
+          {
+            "type": "function",
+            "name": "present_files",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "4017e4863fe948c14228bd043b9feaaf1cd9fbe3ad54c38aede8d1d81949018e"
+          },
+          {
+            "type": "function",
+            "name": "show_widget",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "078e2be6d3da25de53b2df5cad13535308d83c78794f567cfee0f4a623491a91"
+          },
+          {
+            "type": "function",
+            "name": "widget_guidelines",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "d1989bf7d004df36ccee6f9423a5c55439a079b587a2c755952363c67abcacb7"
+          },
+          {
+            "type": "function",
+            "name": "TaskList",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "6c9f16e97bc4049d69d6b4679008d06cc12612156d3db99d0dec1fee3d320091"
+          },
+          {
+            "type": "function",
+            "name": "Skill",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "ed960592d10d3a421080f30ec5230b9ee77f5e91f487ed5a39de7b732f6b6537"
+          },
+          {
+            "type": "function",
+            "name": "Agent",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "e3ea43260fdc2bdc82bf1149c40176fe84745f0e05205d42b8739fdefe005d07"
+          },
+          {
+            "type": "function",
+            "name": "ToolSearch",
+            "fields": [
+              "description",
+              "name",
+              "parameters",
+              "strict"
+            ],
+            "schemaSha256": "b63b24d9708315bff589fd5227a70eca94e4b6b0ccd4c330e4e817970cee3ccc"
+          }
+        ],
+        "jsonSha256": "7032551c25d23fbc28d54ad5e833d02f1a75908926806ad64d407217ed4883dd"
+      },
+      "testMarkerPresent": true,
+      "status": 200,
+      "responseHeaders": {
+        "content-type": "text/event-stream",
+        "date": "Tue, 20 Oct 2026 04:22:50 GMT",
+        "connection": "close",
+        "transfer-encoding": "chunked"
+      },
+      "responseBytes": 296,
+      "sseModels": [
+        "deepseek-v4.1-flash"
+      ],
+      "sseFrames": 1,
+      "usage": {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "credit": 0
+      },
+      "finishReason": "stop",
+      "done": true,
+      "exactReply": false,
+      "completedAt": "2026-10-20T04:22:50.477Z",
+      "originalLogicalHeaders": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "x-stainless-arch": "arm64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "MacOS",
+        "x-stainless-package-version": "6.25.0",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v22.21.1",
+        "x-conversation-id": "d317de32-0ca7-40c4-a747-a88896e0170e",
+        "x-agent-intent": "craft",
+        "x-agent-purpose": "conversation",
+        "x-ide-type": "WorkBuddy",
+        "x-ide-name": "WorkBuddy",
+        "x-ide-version": "5.8.3",
+        "x-private-data": "true",
+        "acp-connection-id": "01a15788-4b40-797f-a948-5dadba5365a8",
+        "x-codebuddy-request": "1",
+        "x-device-token": "[REDACTED]",
+        "x-request-id": "01a1578c3b517e7fa27d556a84fcfe9b",
+        "x-conversation-message-id": "01a1578c3b517e7fa27d556a84fcfe9b",
+        "x-conversation-request-id": "01a1578c36557ffe8f549e22e405ec9e",
+        "x-root-request-id": "01a1578c36557ffe8f549e22e405ec9e",
+        "x-agent-type": "main",
+        "content-encoding": "gzip",
+        "traceparent": "00-5c4049654389447b90413a508b15e754-a9bd3dbff815589f-01",
+        "b3": "5c4049654389447b90413a508b15e754-a9bd3dbff815589f-1-fed7a7098b4b2157",
+        "x-b3-traceid": "5c4049654389447b90413a508b15e754",
+        "x-b3-parentspanid": "fed7a7098b4b2157",
+        "x-b3-spanid": "a9bd3dbff815589f",
+        "x-b3-sampled": "1",
+        "x-trace-id": "5c4049654389447b90413a508b15e754",
+        "x-product": "SaaS",
+        "user-agent": "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0",
+        "authorization": "[REDACTED]",
+        "x-user-id": "[REDACTED]",
+        "x-domain": "[REDACTED]",
+        "content-length": "49880",
+        "accept-encoding": "gzip, compress, deflate, br"
+      },
+      "comparison": {
+        "bodyFields": [
+          "extra_vars",
+          "max_tokens",
+          "messages",
+          "model",
+          "reasoning_effort",
+          "reasoning_summary",
+          "stream",
+          "stream_options",
+          "temperature",
+          "tools",
+          "verbosity"
+        ],
+        "bodyPreserved": true,
+        "extra": [],
+        "gzipDecoded": true,
+        "gzipHeaderHex": "1f8b08000000000000ff",
+        "gzipWireBytes": 49483,
+        "matchedFixedHeaders": [
+          "accept",
+          "accept-encoding",
+          "content-encoding",
+          "content-type",
+          "user-agent",
+          "x-agent-intent",
+          "x-agent-purpose",
+          "x-agent-type",
+          "x-b3-sampled",
+          "x-codebuddy-request",
+          "x-ide-name",
+          "x-ide-type",
+          "x-ide-version",
+          "x-private-data",
+          "x-product",
+          "x-requested-with",
+          "x-stainless-arch",
+          "x-stainless-lang",
+          "x-stainless-os",
+          "x-stainless-package-version",
+          "x-stainless-retry-count",
+          "x-stainless-runtime",
+          "x-stainless-runtime-version"
+        ],
+        "mismatches": [],
+        "missing": [
+          "acp-connection-id",
+          "caller_method",
+          "x-b3-parentspanid",
+          "x-device-token"
+        ],
+        "productionCalls": 0,
+        "requestIdMatchesMessageId": true,
+        "rootMatchesConversationRequestId": true,
+        "singleHeaderValues": true
+      },
+      "officialWireBytes": 49880,
+      "officialGzipHeaderHex": "1f8b0800000000000013"
+    }
+  ],
+  "observerRestored": true,
+  "confirmedLogicalHeaderGaps": [
+    "x-device-token",
+    "acp-connection-id",
+    "x-b3-parentspanid"
+  ],
+  "fixtureOnlyHeaderGaps": [
+    "caller_method"
+  ],
+  "extraVarsShape": {
+    "growthEvent": {
+      "type": "string",
+      "chars": 216
+    }
+  },
+  "uiSyntheticPhaseCompleted": false,
+  "uiSyntheticPhaseNote": "The local shadow transport guard produced an error after collecting the request; this is not an upstream production rejection."
+}

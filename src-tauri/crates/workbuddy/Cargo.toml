@@ -1,0 +1,26 @@
+[package]
+# Keep the original crate version: the signed WorkBuddy transport helper's
+# keychain ACL fingerprint includes it, so changing it forces re-authorization.
+name = "workbuddy-api"
+version = "0.1.17"
+edition = "2021"
+description = "AgentDock WorkBuddy provider (account pool, official transport, check-in, statistics)"
+
+[lib]
+name = "workbuddy"
+path = "src/lib.rs"
+
+[dependencies]
+agentdock-core = { path = "../core" }
+wb-switch-core = { path = "../../../vendor/workbuddy-switch/crates/wb-switch-core" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip", "brotli", "deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+flate2 = "1"
+dirs = "6"
+chrono = "0.4"
+futures-util = "0.3"
+async-stream = "0.3"

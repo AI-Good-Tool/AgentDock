@@ -1,0 +1,309 @@
+//! The AgentDock hub: providers, settings, the routing table, the scheduler
+//! runtime and the request log, shared by the HTTP gateway and the desktop UI.
+use crate::{
+    catalog::{self, Route},
+    logs::{LogStore, RequestLog},
+    scheduler::{self, Exec},
+    settings::{RouteOverride, Settings},
+};
+use agentdock_core::provider::{PoolAccount, ProviderKind, UpstreamModel};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+pub type Shared = Arc<Hub>;
+
+pub struct ServerHandle {
+    pub port: u16,
+    pub stop: tokio::sync::oneshot::Sender<()>,
+}
+
+pub struct Hub {
+    pub dir: PathBuf,
+    settings: Mutex<Settings>,
+    settings_writer: Mutex<()>,
+    pub key: crate::api_key::LocalKey,
+    pub wb: workbuddy::pool::Shared,
+    pub qoder: Arc<qoder::gateway::Provider>,
+    pub trae: Arc<trae::Provider>,
+    pub runtime: Mutex<scheduler::Runtime>,
+    pub logs: Arc<LogStore>,
+    /// Requests currently streaming (for the overview and request list).
+    pub active: Mutex<HashMap<String, RequestLog>>,
+    pub server: Mutex<Option<ServerHandle>>,
+    pub error: Mutex<String>,
+    pub qoder_scheduler: Mutex<Value>,
+}
+
+pub fn read_settings(path: &Path) -> Settings {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| "无法创建数据目录")?;
+    }
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut f = options.open(&tmp).map_err(|_| "无法写入设置")?;
+        f.write_all(data).map_err(|_| "无法写入设置")?;
+        f.sync_all().map_err(|_| "无法同步设置")?;
+        std::fs::rename(&tmp, path).map_err(|_| "无法保存设置".to_owned())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+impl Hub {
+    /// Open every provider under `dir` (created and migrated by `paths`).
+    pub fn open(dir: &Path) -> Result<Shared, String> {
+        qoder::qcore::set_data_dir(dir.join("qoder"));
+        let settings = read_settings(&dir.join("settings.json"));
+        let key_path = dir.join("api-key");
+        let key = match std::fs::read_to_string(&key_path) {
+            Ok(k) if crate::api_key::validate(k.trim()).is_ok() => k.trim().to_owned(),
+            _ => {
+                let k = crate::api_key::generate();
+                write_private(&key_path, k.as_bytes())?;
+                k
+            }
+        };
+        let wb = workbuddy::pool::AppState::new(dir.join("workbuddy/store.json"))?;
+        let qoder = qoder::gateway::Provider::new()?;
+        let trae = trae::Provider::open(&dir.join("trae"))?;
+        let logs = Arc::new(LogStore::open(dir));
+        let sink_logs = logs.clone();
+        *wb.log_sink.lock().unwrap() = Some(Arc::new(move |log: &workbuddy::pool::RequestLog| {
+            sink_logs.push(from_workbuddy(log));
+        }));
+        Ok(Arc::new(Self {
+            dir: dir.to_owned(),
+            settings: Mutex::new(settings),
+            settings_writer: Mutex::new(()),
+            key: crate::api_key::LocalKey::new(key),
+            wb,
+            qoder,
+            trae,
+            runtime: Mutex::default(),
+            logs,
+            active: Mutex::default(),
+            server: Mutex::new(None),
+            error: Mutex::new(String::new()),
+            qoder_scheduler: Mutex::new(json!({"lastRun":null,"lastResults":[]})),
+        }))
+    }
+    /// Test assembly with fixture providers and no migration.
+    #[cfg(test)]
+    pub fn assemble(
+        dir: &Path,
+        settings: Settings,
+        key: &str,
+        qoder: Arc<qoder::gateway::Provider>,
+        trae: Arc<trae::Provider>,
+    ) -> Shared {
+        let wb = workbuddy::pool::AppState::new(dir.join("workbuddy/store.json")).unwrap();
+        Arc::new(Self {
+            dir: dir.to_owned(),
+            settings: Mutex::new(settings),
+            settings_writer: Mutex::new(()),
+            key: crate::api_key::LocalKey::new(key.into()),
+            wb,
+            qoder,
+            trae,
+            runtime: Mutex::default(),
+            logs: Arc::new(LogStore::open(dir)),
+            active: Mutex::default(),
+            server: Mutex::new(None),
+            error: Mutex::new(String::new()),
+            qoder_scheduler: Mutex::new(json!({})),
+        })
+    }
+    pub fn settings(&self) -> Settings {
+        self.settings.lock().unwrap().clone()
+    }
+    pub fn running(&self) -> bool {
+        self.server.lock().unwrap().is_some()
+    }
+    pub fn api_key(&self) -> String {
+        self.key.get()
+    }
+    pub fn set_api_key(&self, value: String, expected: &str) -> Result<(), String> {
+        self.key.replace(&self.dir.join("api-key"), value, expected)
+    }
+    /// Validate, persist, then publish. Port changes require a stopped gateway.
+    pub fn update_settings(&self, change: impl FnOnce(&mut Settings) -> Result<(), String>) -> Result<Settings, String> {
+        let _w = self.settings_writer.lock().unwrap();
+        let mut next = self.settings();
+        let previous = next.clone();
+        change(&mut next)?;
+        next.validate()?;
+        if next.port != previous.port && self.running() {
+            return Err("请先停止服务再修改端口".into());
+        }
+        write_private(
+            &self.dir.join("settings.json"),
+            &serde_json::to_vec_pretty(&next).unwrap(),
+        )?;
+        *self.settings.lock().unwrap() = next.clone();
+        Ok(next)
+    }
+
+    pub fn upstream_models(&self) -> Vec<UpstreamModel> {
+        let mut models = self.wb.upstream_models();
+        models.extend(self.qoder.upstream_models());
+        models.extend(self.trae.upstream_models());
+        models
+    }
+    pub fn routes(&self, settings: &Settings) -> Vec<Route> {
+        catalog::build(&self.upstream_models(), settings)
+    }
+    pub fn save_route(&self, route_id: &str, o: RouteOverride) -> Result<(), String> {
+        let models = self.upstream_models();
+        self.update_settings(|s| {
+            catalog::validate_override(&models, s, route_id, &o)?;
+            s.routes.insert(route_id.to_owned(), o);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+    pub fn reset_route(&self, route_id: &str) -> Result<(), String> {
+        self.update_settings(|s| {
+            s.routes.remove(route_id);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// All accounts in global stable order: WorkBuddy, Qoder, Trae.
+    pub fn pool_accounts(&self) -> Vec<PoolAccount> {
+        let mut out = self.wb.pool_accounts();
+        out.extend(self.qoder.pool_accounts());
+        out.extend(self.trae.pool_accounts());
+        out
+    }
+    pub fn eligibility(
+        &self,
+        account: &PoolAccount,
+        target: &UpstreamModel,
+        body: &Value,
+        headers: &http::HeaderMap,
+    ) -> Result<Exec, &'static str> {
+        match account.provider {
+            ProviderKind::Workbuddy => {
+                let allow = self.wb.store.lock().unwrap().settings.allow_auxiliary_agents;
+                workbuddy::official::purpose(headers, allow).map_err(|_| "辅助 Agent 未获允许")?;
+                self.wb
+                    .chat_eligibility(&account.id, &target.id, body)
+                    .map(Exec::Workbuddy)
+            }
+            ProviderKind::Qoder => self
+                .qoder
+                .chat_eligibility(&account.id, &target.id)
+                .map(Exec::Qoder),
+            ProviderKind::Trae => {
+                // The native endpoint is text-only: leave tool/image requests to other providers.
+                trae::gateway::native_body(body, None).map_err(|_| "Trae 仅支持纯文本对话（请求含工具或图片）")?;
+                self.trae
+                    .chat_eligibility(&account.id, &target.id)
+                    .map(Exec::Trae)
+            }
+        }
+    }
+    /// Resolve an `x-account-id` value: a full key or an unambiguous provider-local id.
+    pub fn resolve_account(&self, value: &str) -> Result<String, String> {
+        let accounts = self.pool_accounts();
+        if accounts.iter().any(|a| a.key() == value) {
+            return Ok(value.to_owned());
+        }
+        let matches: Vec<_> = accounts.iter().filter(|a| a.id == value).collect();
+        match matches.len() {
+            1 => Ok(matches[0].key()),
+            0 => Err("指定账号不存在或已移除；未向上游发送请求".into()),
+            _ => Err("指定账号 ID 在多个端重复，请使用「端/账号 ID」格式".into()),
+        }
+    }
+    pub fn set_account_enabled(&self, provider: ProviderKind, id: &str, enabled: bool) -> Result<(), String> {
+        match provider {
+            ProviderKind::Workbuddy => self.wb.set_enabled(id, enabled)?,
+            ProviderKind::Qoder => self.qoder.set_enabled(id, enabled)?,
+            ProviderKind::Trae => {
+                self.trae
+                    .update_account(id, &json!({"enabled": enabled}))?;
+            }
+        }
+        if enabled {
+            // Re-enabling acknowledges a repaired login.
+            let key = agentdock_core::provider::account_key(provider, id);
+            let mut rt = self.runtime.lock().unwrap();
+            rt.auth_failed.remove(&key);
+            rt.cooldown.remove(&key);
+        }
+        Ok(())
+    }
+    /// Runtime state per account key for the UI.
+    pub fn account_runtime(&self) -> Value {
+        let settings = self.settings();
+        let rt = self.runtime.lock().unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut out = serde_json::Map::new();
+        for a in self.pool_accounts() {
+            let key = a.key();
+            out.insert(key.clone(), json!({
+                "inFlight": rt.in_flight.get(&key).copied().unwrap_or(0),
+                "concurrency": settings.scope(a.provider).concurrency,
+                "cooldownUntil": rt.cooldown.get(&key).filter(|t| **t > now),
+                "authFailed": rt.auth_failed.contains(&key),
+                "enabled": a.enabled,
+                "credit": a.credit,
+                "expiresAt": a.expires_at,
+                "blocked": a.blocked,
+                "name": a.name,
+                "region": a.region,
+                "provider": a.provider,
+                "id": a.id,
+            }));
+        }
+        Value::Object(out)
+    }
+}
+
+/// WorkBuddy management records (catalog, credits, check-in) in the unified log.
+fn from_workbuddy(log: &workbuddy::pool::RequestLog) -> RequestLog {
+    RequestLog {
+        id: log.id.clone(),
+        time: log.time.clone(),
+        protocol: log.details.protocol.clone(),
+        path: log.details.client_path.clone(),
+        requested_model: log.model.clone(),
+        model: log.model.clone(),
+        real_model: log.real_model.clone(),
+        provider: "workbuddy".into(),
+        region: workbuddy::pool::unified_region(&log.account_variant).into(),
+        account_id: log.account_id.clone(),
+        account_name: log.account_name.clone(),
+        status: log.status,
+        outcome: log.outcome.clone(),
+        duration_ms: log.duration_ms,
+        first_byte_ms: log.details.first_byte_ms,
+        usage: log.details.usage.clone(),
+        message: log.details.error["message"].as_str().unwrap_or("").to_owned(),
+        details: serde_json::to_value(&log.details).unwrap_or_default(),
+        ..RequestLog::default()
+    }
+}

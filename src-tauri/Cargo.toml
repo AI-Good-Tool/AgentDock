@@ -1,0 +1,50 @@
+[workspace]
+members = [".", "crates/core", "crates/workbuddy", "crates/qoder", "crates/trae"]
+resolver = "2"
+
+[package]
+name = "agentdock"
+version = "1.0.0"
+edition = "2021"
+description = "AgentDock — WorkBuddy / Qoder / Trae unified local workspace and model gateway"
+
+[lib]
+name = "agentdock"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentdock"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+agentdock-core = { path = "crates/core" }
+workbuddy-api = { path = "crates/workbuddy" }
+agentdock-qoder = { path = "crates/qoder" }
+agentdock-trae = { path = "crates/trae" }
+wb-switch-core = { path = "../vendor/workbuddy-switch/crates/wb-switch-core" }
+tauri = { version = "2", features = [] }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+uuid = { version = "1", features = ["v4", "v7"] }
+chrono = "0.4"
+dirs = "6"
+futures-util = "0.3"
+async-stream = "0.3"
+http = "1"
+percent-encoding = "2"
+
+[dev-dependencies]
+agentdock-qoder = { path = "crates/qoder", features = ["fixtures"] }
+agentdock-trae = { path = "crates/trae", features = ["fixtures"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,120 @@
+import { invoke, isTauri } from '@tauri-apps/api/core'
+
+export const desktop = isTauri()
+
+export const previewMode = !desktop && import.meta.env.DEV && new URLSearchParams(location.search).has('preview')
+
+export function call<T = any>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (previewMode) return import('./dev/preview').then((m) => m.preview(command) as T)
+  if (!desktop) return Promise.reject(new Error('请在 AgentDock 桌面应用中使用 / Please use the AgentDock desktop app'))
+  return invoke<T>(command, args)
+}
+
+export type ProviderKey = 'workbuddy' | 'qoder' | 'trae'
+export type Region = 'cn' | 'intl'
+export type Strategy = 'roundRobin' | 'creditFirst' | 'expiryFirst' | 'ordered' | 'random'
+
+export interface ProviderScope {
+  enabled: boolean
+  regions: Region[]
+  concurrency: number
+}
+export interface RouteOverride {
+  alias: string
+  targets?: string[] | null
+  disabled: boolean
+  custom: boolean
+}
+export interface Settings {
+  port: number
+  strategy: Strategy
+  providers: Record<ProviderKey, ProviderScope>
+  routes: Record<string, RouteOverride>
+  pinned: Record<string, string>
+  rejectBrowserOrigin: boolean
+  autoStart: boolean
+  theme: 'light' | 'dark' | 'system'
+  lang: 'system' | 'zh' | 'en'
+  timezone: string
+  tokenFormat: string
+}
+export interface RequestLog {
+  id: string
+  time: string
+  protocol: string
+  path: string
+  requestedModel: string
+  model: string
+  routeId: string
+  realModel: string
+  modelName: string
+  provider: string
+  region: string
+  accountId: string
+  accountName: string
+  status: number
+  outcome: string
+  durationMs: number
+  firstByteMs?: number | null
+  usage?: Record<string, any> | null
+  message: string
+  upstreamCode?: string | null
+  strategy: string
+  stream: boolean
+  details?: any
+}
+export interface AppSnapshot {
+  version: string
+  dataDir: string
+  running: boolean
+  port: number
+  apiKey: string
+  error: string
+  settings: Settings
+  active: RequestLog[]
+  migration?: any
+}
+export interface Target {
+  key: string
+  provider: ProviderKey
+  region: Region
+  id: string
+  name: string
+  supportsTools?: boolean | null
+  supportsImages?: boolean | null
+  efforts: string[]
+  contextWindow?: number | null
+  maxOutput?: number | null
+}
+export interface RouteView {
+  routeId: string
+  alias: string
+  defaultAlias: string
+  available: boolean
+  disabled: boolean
+  configured: boolean
+  custom: boolean
+  supportsTools: boolean
+  supportsImages: boolean
+  contextWindow?: number | null
+  efforts: string[]
+  providers: ProviderKey[]
+  regions: Region[]
+  targets: Target[]
+  allTargets: Target[]
+  missing: string[]
+}
+export interface AccountRuntime {
+  inFlight: number
+  concurrency: number
+  cooldownUntil?: number | null
+  authFailed: boolean
+  enabled: boolean
+  credit: { remaining?: number | null; earliestExpiry?: number | null; unit: string; updatedAt?: number | null }
+  expiresAt?: number | null
+  blocked?: string | null
+  name: string
+  region: Region
+  provider: ProviderKey
+  id: string
+}

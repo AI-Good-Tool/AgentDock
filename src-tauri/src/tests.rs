@@ -1,0 +1,316 @@
+//! End-to-end gateway tests over local fixture upstreams (no real accounts,
+//! no production traffic): cross-provider routing, scopes, aliases, protocol
+//! conversion, authentication and failure isolation.
+use crate::{app::Hub, settings::Settings};
+use axum::{routing::post, Json, Router};
+use serde_json::{json, Value};
+use std::{
+    collections::HashMap,
+    sync::{atomic::{AtomicUsize, Ordering}, Arc},
+};
+
+const KEY: &str = "fixture-local-key-0123456789";
+
+struct Fixture {
+    hub: crate::app::Shared,
+    url: String,
+    qoder_calls: Arc<AtomicUsize>,
+    trae_calls: Arc<AtomicUsize>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+}
+
+async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (url, tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }))
+}
+
+async fn fixture() -> Fixture {
+    let qoder_calls = Arc::new(AtomicUsize::new(0));
+    let qc = qoder_calls.clone();
+    let qoder_upstream = Router::new().route(
+        "/model/v1/chat/completions",
+        post(move |Json(body): Json<Value>| {
+            let qc = qc.clone();
+            async move {
+                qc.fetch_add(1, Ordering::SeqCst);
+                if body["model"] == "q-flaky" {
+                    return (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "30"), ("content-type", "application/json")],
+                        json!({"code":"rate_limited"}).to_string(),
+                    );
+                }
+                let mut chunks = vec![];
+                if body["tools"].as_array().is_some_and(|t| !t.is_empty())
+                    && !body["messages"].as_array().unwrap().iter().any(|m| m["role"] == "tool")
+                {
+                    let tool = &body["tools"][0]["function"];
+                    chunks.push(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":tool["name"],"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}));
+                } else {
+                    chunks.push(json!({"choices":[{"index":0,"delta":{"content":format!("OK from {}", body["model"].as_str().unwrap())}}]}));
+                    chunks.push(json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
+                }
+                chunks.push(json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}));
+                let wire = chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n";
+                (axum::http::StatusCode::OK, [("retry-after", "0"), ("content-type", "text/event-stream")], wire)
+            }
+        }),
+    );
+    let trae_calls = Arc::new(AtomicUsize::new(0));
+    let tc = trae_calls.clone();
+    let trae_upstream = Router::new().route(
+        "/api/agent/v3/llm_utils_chat",
+        post(move |Json(body): Json<Value>| {
+            let tc = tc.clone();
+            async move {
+                tc.fetch_add(1, Ordering::SeqCst);
+                assert!(body.get("tools").is_none());
+                let text = format!("你好 from {}", body["model"].as_str().unwrap_or("auto"));
+                let wire = format!(
+                    "event: output\ndata: {}\n\nevent: usage\ndata: {}\n\nevent: done\ndata: {{}}\n\n",
+                    json!({"response": text}),
+                    json!({"usage":{"prompt_tokens":3,"completion_tokens":2}})
+                );
+                ([("content-type", "text/event-stream")], wire)
+            }
+        }),
+    );
+    let (qoder_url, q_task) = serve(qoder_upstream).await;
+    let (trae_url, t_task) = serve(trae_upstream).await;
+    let dir = std::env::temp_dir().join(format!("agentdock-e2e-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let qoder = qoder::gateway::Provider::fixture(
+        vec![
+            qoder::qcore::Account { edition: "cn".into(), uid: "u1".into(), name: "Qoder CN".into(), token: "never-real".into(), ..Default::default() },
+            qoder::qcore::Account { edition: "intl".into(), uid: "u2".into(), name: "Qoder Intl".into(), token: "never-real".into(), ..Default::default() },
+        ],
+        qoder::gateway::Config {
+            transport: "modelServer".into(),
+            cn_endpoint: qoder_url.clone(),
+            intl_endpoint: qoder_url,
+            disabled_accounts: vec![],
+        },
+        HashMap::from([
+            ("cn".into(), vec![json!({"id":"q-shared","name":"Shared"}), json!({"id":"q-only","name":"QoderOnly"}), json!({"id":"q-flaky","name":"Flaky"})]),
+            ("intl".into(), vec![json!({"id":"q-shared-i","name":"Shared"})]),
+        ]),
+    );
+    let trae = trae::Provider::open(&dir.join("trae")).unwrap();
+    trae.store
+        .upsert(json!({"variant":"cn","user":{"userId":"t1","token":"never-real","expiredAt":"2099-01-01T00:00:00Z","account":{"username":"Trae CN","storeRegion":"CN"}},
+            "models":[{"id":"cfg-shared","model":"shared-real","name":"Shared"},{"id":"cfg-flaky","model":"flaky-real","name":"Flaky"}]}))
+        .unwrap();
+    *trae.test_host.lock().unwrap() = Some(trae_url);
+    let hub = Hub::assemble(&dir, Settings::default(), KEY, qoder, trae);
+    let (url, g_task) = serve(crate::server::router(hub.clone())).await;
+    Fixture { hub, url, qoder_calls, trae_calls, tasks: vec![q_task, t_task, g_task] }
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+async fn post_json(f: &Fixture, path: &str, body: Value) -> reqwest::Response {
+    client().post(format!("{}{path}", f.url)).bearer_auth(KEY).json(&body).send().await.unwrap()
+}
+fn chat(model: &str) -> Value {
+    json!({"model":model,"messages":[{"role":"user","content":"PRIVATE PROMPT"}]})
+}
+async fn wait_logs(f: &Fixture, n: usize) -> Vec<crate::logs::RequestLog> {
+    for _ in 0..100 {
+        let logs = f.hub.logs.list();
+        if logs.len() >= n {
+            return logs;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    f.hub.logs.list()
+}
+
+#[tokio::test]
+async fn identical_models_rotate_across_every_provider_and_region() {
+    let f = fixture().await;
+    let mut seen = vec![];
+    for i in 0..6 {
+        let r = post_json(&f, "/v1/chat/completions", chat("Shared")).await;
+        assert_eq!(r.status(), 200);
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["model"], "Shared", "alias is returned, never the real id");
+        let logs = wait_logs(&f, i + 1).await;
+        let l = &logs[0];
+        assert_eq!(l.model, "Shared");
+        assert_eq!(l.outcome, "completed");
+        seen.push(format!("{}/{}/{}", l.provider, l.region, l.real_model));
+    }
+    assert_eq!(
+        seen,
+        ["qoder/cn/q-shared", "qoder/intl/q-shared-i", "trae/cn/shared-real", "qoder/cn/q-shared", "qoder/intl/q-shared-i", "trae/cn/shared-real"]
+    );
+    // Prompts never reach the log.
+    assert!(!serde_json::to_string(&f.hub.logs.list()).unwrap().contains("PRIVATE PROMPT"));
+    // Usage is recorded for statistics.
+    let stats = crate::logs::statistics(&f.hub.logs.usage_rows(), &json!({}), 480);
+    assert_eq!(stats["summary"]["records"], 6);
+    assert_eq!(stats["providers"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn exclusive_models_and_scoped_paths_never_widen_the_pool() {
+    let f = fixture().await;
+    for _ in 0..3 {
+        let v: Value = post_json(&f, "/v1/chat/completions", chat("QoderOnly")).await.json().await.unwrap();
+        assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("q-only"));
+    }
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0);
+    // Region scope: only international accounts.
+    for _ in 0..2 {
+        let v: Value = post_json(&f, "/intl/v1/chat/completions", chat("Shared")).await.json().await.unwrap();
+        assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("q-shared-i"));
+    }
+    // Provider scope: Trae only; a model Trae lacks is unavailable there.
+    let v: Value = post_json(&f, "/trae/v1/chat/completions", chat("Shared")).await.json().await.unwrap();
+    assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("cfg-shared"));
+    let r = post_json(&f, "/trae/v1/chat/completions", chat("QoderOnly")).await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(r.json::<Value>().await.unwrap()["error"]["code"], "model_not_available");
+    // Scoped model lists.
+    let list: Value = client().get(format!("{}/trae/cn/v1/models", f.url)).bearer_auth(KEY).send().await.unwrap().json().await.unwrap();
+    let ids: Vec<_> = list["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_owned()).collect();
+    assert!(ids.contains(&"Shared".into()) && !ids.contains(&"QoderOnly".into()), "{ids:?}");
+    // A pinned account outside the model's pool is rejected without upstream traffic.
+    let before = f.qoder_calls.load(Ordering::SeqCst) + f.trae_calls.load(Ordering::SeqCst);
+    let r = client().post(format!("{}/v1/chat/completions", f.url)).bearer_auth(KEY).header("x-account-id", "qoder/intl:u2").json(&chat("QoderOnly")).send().await.unwrap();
+    assert_eq!(r.status(), 503);
+    assert_eq!(before, f.qoder_calls.load(Ordering::SeqCst) + f.trae_calls.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn aliases_apply_to_requests_lists_logs_and_all_protocols() {
+    let f = fixture().await;
+    let routes = f.hub.routes(&f.hub.settings());
+    let shared = crate::catalog::resolve(&routes, "Shared").unwrap().route_id.clone();
+    f.hub
+        .save_route(&shared, crate::settings::RouteOverride { alias: "my-shared".into(), ..Default::default() })
+        .unwrap();
+    let list: Value = client().get(format!("{}/v1/models", f.url)).header("x-api-key", KEY).send().await.unwrap().json().await.unwrap();
+    let ids: Vec<_> = list["data"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_owned()).collect();
+    assert!(ids.contains(&"my-shared".to_owned()) && !ids.contains(&"Shared".to_owned()));
+    for stream in [false, true] {
+        for (path, body) in [
+            ("/qoder/v1/messages", json!({"model":"my-shared","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"stream":stream})),
+            ("/qoder/v1/responses", json!({"model":"my-shared","input":"hi","stream":stream})),
+            ("/trae/v1/responses", json!({"model":"my-shared","input":"hi","stream":stream})),
+            ("/trae/v1/messages", json!({"model":"my-shared","max_tokens":32,"messages":[{"role":"user","content":"hi"}],"stream":stream})),
+            ("/v1/chat/completions", json!({"model":"my-shared","messages":[{"role":"user","content":"hi"}],"stream":stream})),
+        ] {
+            let r = post_json(&f, path, body).await;
+            assert_eq!(r.status(), 200, "{path} stream={stream}");
+            let text = r.text().await.unwrap();
+            assert!(text.contains("my-shared"), "{path}: {text}");
+            assert!(!text.contains("q-shared") || text.contains("OK from"), "real ids only appear in generated text");
+            if stream {
+                assert!(
+                    text.contains(if path.ends_with("messages") { "message_stop" } else if path.ends_with("responses") { "response.completed" } else { "[DONE]" }),
+                    "{path}: {text}"
+                );
+            }
+        }
+    }
+    let logs = wait_logs(&f, 10).await;
+    assert!(logs.iter().all(|l| l.model == "my-shared" && l.outcome == "completed"), "{logs:?}");
+    // Real model ids still resolve when unambiguous.
+    assert_eq!(post_json(&f, "/v1/chat/completions", chat("q-shared-i")).await.status(), 200);
+}
+
+#[tokio::test]
+async fn tools_roundtrip_on_capable_upstreams_and_are_refused_by_text_only_trae() {
+    let f = fixture().await;
+    let body = json!({"model":"Shared","max_tokens":64,"tools":[{"name":"read","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"use a tool"}]});
+    let v: Value = post_json(&f, "/qoder/v1/messages", body.clone()).await.json().await.unwrap();
+    assert_eq!(v["stop_reason"], "tool_use");
+    assert_eq!(v["content"][0]["name"], "read");
+    // Trae is text-only: the scheduler never sends a tool request there.
+    let r = post_json(&f, "/trae/v1/messages", body.clone()).await;
+    assert_eq!(r.status(), 503);
+    assert!(r.json::<Value>().await.unwrap()["error"]["message"].as_str().unwrap().contains("Trae 仅支持纯文本对话"));
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0);
+    // On the unified path the shared model rotates only over capable accounts.
+    for _ in 0..4 {
+        let v: Value = post_json(&f, "/v1/messages", body.clone()).await.json().await.unwrap();
+        assert_eq!(v["stop_reason"], "tool_use");
+    }
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn rate_limited_accounts_cool_down_and_traffic_moves_to_other_providers() {
+    let f = fixture().await;
+    let r = post_json(&f, "/v1/chat/completions", chat("Flaky")).await;
+    assert_eq!(r.status(), 429);
+    let key = "qoder/cn:u1";
+    assert!(f.hub.runtime.lock().unwrap().cooldown.contains_key(key));
+    let before = f.qoder_calls.load(Ordering::SeqCst);
+    for _ in 0..3 {
+        assert_eq!(post_json(&f, "/v1/chat/completions", chat("Flaky")).await.status(), 200);
+    }
+    assert_eq!(before, f.qoder_calls.load(Ordering::SeqCst), "cooled-down account is skipped");
+    // Shared still works on the remaining accounts.
+    for _ in 0..2 {
+        assert_eq!(post_json(&f, "/v1/chat/completions", chat("Shared")).await.status(), 200);
+    }
+    let logs = wait_logs(&f, 6).await;
+    assert!(logs.iter().any(|l| l.status == 429 && l.outcome == "upstream_rejected" && l.provider == "qoder"));
+    assert_eq!(f.hub.runtime.lock().unwrap().in_flight.values().sum::<usize>(), 0);
+    // Disabling a provider removes it from the pool.
+    f.hub.update_settings(|s| { s.providers.get_mut(&agentdock_core::provider::ProviderKind::Trae).unwrap().enabled = false; Ok(()) }).unwrap();
+    let r = post_json(&f, "/v1/chat/completions", chat("Flaky")).await;
+    assert_eq!(r.status(), 503, "only the cooled-down Qoder account remains");
+    assert!(r.json::<Value>().await.unwrap()["error"]["message"].as_str().unwrap().contains("账号冷却中"));
+}
+
+#[tokio::test]
+async fn authentication_origin_estimates_limits_and_unknown_models() {
+    let f = fixture().await;
+    let url = format!("{}/v1/models", f.url);
+    assert_eq!(client().get(&url).send().await.unwrap().status(), 401);
+    assert_eq!(client().get(&url).bearer_auth("wrong").send().await.unwrap().status(), 401);
+    assert_eq!(client().get(&url).header("x-api-key", KEY).send().await.unwrap().status(), 200);
+    assert_eq!(client().get(&url).bearer_auth(KEY).header("origin", "https://evil.example").send().await.unwrap().status(), 403);
+    assert_eq!(client().get(&url).bearer_auth(KEY).header("origin", "null").send().await.unwrap().status(), 200);
+    assert_eq!(client().get(format!("{}/health", f.url)).send().await.unwrap().status(), 200);
+    let r = post_json(&f, "/v1/messages/count_tokens", json!({"model":"Shared","messages":[{"role":"user","content":"hello"}]})).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["x-token-count-method"], "estimate");
+    let r = post_json(&f, "/v1/messages", json!({"model":"nope","max_tokens":8,"messages":[{"role":"user","content":"x"}]})).await;
+    assert_eq!(r.status(), 400);
+    assert_eq!(r.json::<Value>().await.unwrap()["type"], "error");
+    let big = reqwest::Body::from(vec![b' '; agentdock_core::MAX_REQUEST_BODY_BYTES + 1]);
+    let r = client().post(format!("{}/v1/responses", f.url)).bearer_auth(KEY).header("content-type", "application/json").body(big).send().await.unwrap();
+    assert_eq!(r.status(), 413);
+    // Unauthenticated requests are rejected without reading a never-ending body.
+    let pending = reqwest::Body::wrap_stream(futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>());
+    let r = client().post(format!("{}/v1/responses", f.url)).body(pending).timeout(std::time::Duration::from_secs(2)).send().await.unwrap();
+    assert_eq!(r.status(), 401);
+    let detail: Value = client().get(format!("{}/v1/models/Shared", f.url)).bearer_auth(KEY).send().await.unwrap().json().await.unwrap();
+    assert_eq!(detail["type"], "model");
+    assert_eq!(detail["upstreams"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn credit_first_prefers_richer_accounts_across_providers() {
+    let f = fixture().await;
+    f.hub.qoder.cache_credits("intl:u2", json!({"ok":true,"usage":{"userQuota":{"remaining":900,"total":1000},"addOnQuota":{"remaining":0}},"updatedAt":1}));
+    f.hub.qoder.cache_credits("cn:u1", json!({"ok":true,"usage":{"userQuota":{"remaining":10,"total":1000},"addOnQuota":{"remaining":0}},"updatedAt":1}));
+    f.hub.update_settings(|s| { s.strategy = crate::settings::Strategy::CreditFirst; Ok(()) }).unwrap();
+    for i in 0..3 {
+        assert_eq!(post_json(&f, "/v1/chat/completions", chat("Shared")).await.status(), 200);
+        assert_eq!(wait_logs(&f, i + 1).await[0].account_id, "intl:u2");
+    }
+}
