@@ -112,11 +112,9 @@ body[arco-theme='dark'] {
 .pmark.workbuddy {
   background: var(--wb);
 }
-.pmark.qoder {
-  background: #f6faf7;
-}
+.pmark.qoder,
 .pmark.trae {
-  background: #0d1117;
+  background: #f6faf7;
 }
 :root[data-theme='dark'] .pmark {
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);

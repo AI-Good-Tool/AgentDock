@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agentdock"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "agentdock-core",
  "agentdock-qoder",
