@@ -50,14 +50,16 @@ async function exportBundle() {
     Message.success(t(`已导出到 ${r.path}`, `Exported to ${r.path}`))
   }
 }
-const importPath = ref('')
 const inspected = ref<{ path: string; summary: any } | null>(null)
+const importFileName = computed(() => inspected.value?.path.split(/[\\/]/).pop() ?? '')
 const importParts = ref({ providers: [] as Provider[], accounts: true, settings: true })
-async function inspectBundle() {
-  const path = importPath.value.trim()
-  if (!path) return Message.error(t('请输入备份文件路径', 'Enter the backup file path'))
-  const r = await act('backup-inspect', () => call('backup_inspect', { path }))
-  if (!r) return
+async function chooseBundle() {
+  const r = await act('backup-inspect', () => call('backup_choose'))
+  if (r === null) return // Cancelling keeps the previously inspected file.
+  if (!r) {
+    inspected.value = null
+    return
+  }
   inspected.value = r
   importParts.value.providers = platforms.filter((p) => r.summary?.[p.key]?.present).map((p) => p.key)
 }
@@ -211,8 +213,8 @@ function summaryText(s: any, p: Provider) {
       <div class="backup-card">
         <div class="backup-title"><IconUpload /><b>{{ t('导入备份', 'Import') }}</b></div>
         <div class="backup-line nowrap">
-          <a-input v-model="importPath" :placeholder="t('备份文件路径，如 ~/Downloads/agentdock-backup-….json', 'Backup path, e.g. ~/Downloads/agentdock-backup-….json')" allow-clear @press-enter="inspectBundle" @input="inspected = null" @clear="inspected = null" />
-          <a-button :loading="busy('backup-inspect')" @click="inspectBundle">{{ t('读取', 'Read') }}</a-button>
+          <a-button :loading="busy('backup-inspect')" :disabled="busy('backup-import')" @click="chooseBundle"><template #icon><IconFolder /></template>{{ inspected ? t('重新选择', 'Choose another file') : t('选择备份文件', 'Choose backup file') }}</a-button>
+          <span v-if="inspected" class="backup-file-name mono" :title="inspected.path">{{ importFileName }}</span>
         </div>
         <template v-if="inspected">
           <div class="backup-summary">
@@ -228,10 +230,10 @@ function summaryText(s: any, p: Provider) {
           </div>
           <p class="backup-note">{{ inspected.summary?.exportedAt ? t('导出于 ', 'Exported ') + fmtDateTime(inspected.summary.exportedAt) + ' · ' : '' }}{{ t('按账号合并，不删除现有账号。', 'Merges by account; deletes nothing.') }}</p>
           <div class="backup-actions">
-            <a-button type="primary" :disabled="!importParts.providers.length && !importParts.settings" :loading="busy('backup-import')" @click="importBundle"><template #icon><IconUpload /></template>{{ t('导入所选内容', 'Import selected') }}</a-button>
+            <a-button type="primary" :disabled="busy('backup-inspect') || (!importParts.providers.length && !importParts.settings)" :loading="busy('backup-import')" @click="importBundle"><template #icon><IconUpload /></template>{{ t('导入所选内容', 'Import selected') }}</a-button>
           </div>
         </template>
-        <p v-else class="backup-note">{{ t('先读取文件，确认内容后再选择要导入的平台。也支持 Qoder Switch 旧版账号备份。', 'Read the file first, then choose what to import. Legacy Qoder Switch backups also work.') }}</p>
+        <p v-else class="backup-note">{{ t('选择 JSON 备份文件后自动读取，确认内容后再选择要导入的平台。也支持 Qoder Switch 旧版账号备份。', 'Choose a JSON backup to preview it, then select what to import. Legacy Qoder Switch backups also work.') }}</p>
       </div>
     </div>
 

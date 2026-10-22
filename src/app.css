@@ -916,6 +916,16 @@ body[arco-theme='dark'] {
   flex-wrap: nowrap;
   gap: 8px;
 }
+.backup-line.nowrap .arco-btn {
+  flex-shrink: 0;
+}
+.backup-file-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
 .backup-label {
   width: 44px;
   flex: none;

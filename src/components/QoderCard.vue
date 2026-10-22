@@ -46,7 +46,7 @@ const rows = computed(() => [
   { label: t('订阅额度', 'Subscription'), q: usage.value?.userQuota, time: '' },
   { label: t('个人资源包', 'Bonus packs'), q: usage.value?.addOnQuota, time: Number(usage.value?.addOnQuota?.total) > 0 ? addonExpiry.value : '' },
 ])
-const known = computed(() => rows.value.some((r) => r.q && Number.isFinite(Number(r.q.remaining))))
+const known = computed(() => rows.value.some((r) => r.q && typeof r.q.remaining === 'number' && Number.isFinite(r.q.remaining)))
 const total = computed(() => rows.value.reduce((s, r) => s + (Number(r.q?.remaining) || 0), 0))
 const pct = (q: any) => (q && Number(q.total) > 0 ? Math.min(100, Math.max(0, (Number(q.remaining) / Number(q.total)) * 100)) : 0)
 const expiry = computed(() => {
@@ -94,7 +94,7 @@ const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
         <IconStar /><strong>{{ known ? credits(total) : pending('qcredit') ? t('查询中', 'Loading') : '—' }}</strong
         ><span>{{ t('剩余积分', 'credits left') }}</span
         ><small :class="{ stale: a.credit?.stale }" :title="a.credit?.error"
-          ><IconClockCircle /> {{ a.credit?.stale ? t('旧数据 · ', 'Stale · ') : '' }}{{ a.credit?.updatedAt ? t(`${updated(a.credit.updatedAt)} 更新`, `Updated ${updated(a.credit.updatedAt)}`) : t('尚未查询', 'Not queried') }}</small
+          ><IconClockCircle /> {{ a.credit?.stale ? t('旧数据 · ', 'Stale · ') : a.credit?.cached ? t('缓存 · ', 'Cached · ') : '' }}{{ a.credit?.updatedAt ? t(`${updated(a.credit.updatedAt)} 更新`, `Updated ${updated(a.credit.updatedAt)}`) : t('尚未查询', 'Not queried') }}</small
         >
       </div>
       <p v-if="a.credit?.ok === false || a.credit?.stale" class="credit-error">

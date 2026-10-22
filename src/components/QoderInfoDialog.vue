@@ -1,20 +1,23 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import { call } from '../api'
-import { t, fmtNumber, fmtDate } from '../i18n'
+import { t, fmtNumber, fmtDate, fmtDateTime } from '../i18n'
 import { refreshPool } from '../store'
 const props = defineProps<{ account: any }>()
 const emit = defineEmits<{ close: [] }>()
-const data = ref<any>(null)
+const data = ref<any>(props.account.credit?.usage ? { usage: props.account.credit.usage } : null)
+const cached = ref(!!props.account.credit?.usage)
 const error = ref('')
 onMounted(async () => {
   try {
     const r = await call('qoder_credits', { id: props.account.id })
     if (!r.ok) throw new Error(r.message)
     data.value = r.data
-    refreshPool()
+    cached.value = false
   } catch (e) {
     error.value = String(e instanceof Error ? e.message : e)
+  } finally {
+    refreshPool()
   }
 })
 const status: Record<string, [string, string]> = {
@@ -35,6 +38,7 @@ function expiry(u: any) {
   <a-modal :visible="true" :title="t('用量明细 · ', 'Usage · ') + (account.note || account.name || account.uid)" :footer="false" :width="600" @cancel="emit('close')">
     <a-spin v-if="!data && !error" style="width: 100%" />
     <a-alert v-if="error" type="error">{{ error }}</a-alert>
+    <p v-if="cached" class="hint">{{ t('当前显示上次查询的缓存额度', 'Showing the last cached quota') }}<template v-if="account.credit?.updatedAt"> · {{ fmtDateTime(account.credit.updatedAt) }}</template></p>
     <template v-if="data">
       <template v-if="data.usage">
         <div

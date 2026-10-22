@@ -31,6 +31,7 @@ pub fn open_hub() -> Result<app::Shared, String> {
 pub fn run_desktop() {
     let hub = open_hub().expect("初始化 AgentDock 数据目录失败");
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(hub.clone())
         .manage(app_update::Updater::default())
         .setup(move |_| {
@@ -76,6 +77,7 @@ pub fn run_desktop() {
             commands::clear_app_logs,
             commands::backup_export,
             commands::backup_inspect,
+            commands::backup_choose,
             commands::backup_import,
             commands::proxy_statistics,
             commands::open_url,

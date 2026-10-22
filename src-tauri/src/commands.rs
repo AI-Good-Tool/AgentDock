@@ -4,6 +4,7 @@ use crate::{app::Shared, catalog, settings::RouteOverride};
 use agentdock_core::provider::ProviderKind;
 use serde_json::{json, Value};
 use tauri::State;
+use tauri_plugin_dialog::DialogExt;
 
 type Res = Result<Value, String>;
 
@@ -72,6 +73,24 @@ pub async fn backup_inspect(path: String) -> Res {
         crate::backup::read(&path).map(|b| json!({"path": path, "summary": crate::backup::summary(&b)}))
     })
     .await?
+}
+#[tauri::command]
+pub async fn backup_choose(window: tauri::Window) -> Res {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let mut picker = window.dialog().file()
+        .set_parent(&window)
+        .set_title("AgentDock · 选择备份文件 / Select backup")
+        .add_filter("JSON", &["json"]);
+    if let Some(downloads) = dirs::download_dir() {
+        picker = picker.set_directory(downloads);
+    }
+    picker.pick_file(move |path| { let _ = sender.send(path); });
+    let Some(path) = receiver.await.map_err(|_| "文件选择窗口已关闭")? else {
+        return Ok(Value::Null);
+    };
+    let path = path.into_path().map_err(|_| "请选择本地 JSON 备份文件")?;
+    let path = path.to_str().ok_or("备份文件路径不是有效的 Unicode")?.to_owned();
+    backup_inspect(path).await
 }
 #[tauri::command]
 pub async fn backup_import(hub: State<'_, Shared>, path: String, parts: Option<crate::backup::Parts>) -> Res {
@@ -752,12 +771,14 @@ pub async fn qoder_credits(hub: State<'_, Shared>, id: String) -> Res {
         let data = json!({"summary": if s1 == 200 { summary } else { Value::Null },
             "campaigns": if s2 == 200 { camps.get("campaigns").cloned().unwrap_or(json!([])) } else { json!([]) },
             "usage": usage});
-        if data["usage"].is_object() {
-            hub.qoder.cache_credits(&id, json!({"ok":true,"usage":data["usage"],"updatedAt":chrono::Utc::now().timestamp_millis()}));
+        let entry = json!({"ok":true,"usage":data["usage"],"updatedAt":chrono::Utc::now().timestamp_millis()});
+        let known = qoder::gateway::credit_rank(Some(&entry)).remaining.is_some();
+        if known {
+            hub.qoder.cache_credits(&id, entry);
         } else {
             hub.qoder.cache_credits(&id, json!({"ok":false,"error":"额度查询失败"}));
         }
-        json!({"ok":true,"data":data})
+        json!({"ok":known,"data":data,"message":if known { "" } else { "额度查询失败，请稍后重试" }})
     })
     .await
 }

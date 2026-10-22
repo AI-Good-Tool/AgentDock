@@ -97,12 +97,16 @@ pub struct Provider {
     models: Mutex<HashMap<String, Vec<Value>>>,
     model_updated: Mutex<HashMap<String, String>>,
     credits: Mutex<HashMap<String, Value>>,
+    data_dir: Option<PathBuf>,
     client: reqwest::Client,
 }
 
 impl Provider {
     pub fn new() -> Result<Arc<Self>, String> {
-        let config: Config = fs::read(data_file("settings.json"))
+        Self::open_at(qcore::switch_dir().join("gateway"))
+    }
+    fn open_at(dir: PathBuf) -> Result<Arc<Self>, String> {
+        let config: Config = fs::read(dir.join("settings.json"))
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
@@ -117,7 +121,7 @@ impl Provider {
         let mut models = HashMap::new();
         let mut updated = HashMap::new();
         for ed in ["cn", "intl"] {
-            let path = data_file(&format!("models-{ed}.json"));
+            let path = dir.join(format!("models-{ed}.json"));
             if let Ok(bytes) = fs::read(&path) {
                 if let Ok(items) = serde_json::from_slice::<Vec<Value>>(&bytes) {
                     models.insert(ed.into(), items);
@@ -130,11 +134,15 @@ impl Provider {
                 }
             }
         }
-        let credits = fs::read(data_file("credits.json"))
+        let mut credits: HashMap<String, Value> = fs::read(dir.join("credits.json"))
             .ok()
             .and_then(|v| serde_json::from_slice(&v).ok())
             .unwrap_or_default();
+        for entry in credits.values_mut().filter(|entry| entry["usage"].is_object()) {
+            entry["cached"] = json!(true);
+        }
         Ok(Arc::new(Self {
+            data_dir: Some(dir),
             #[cfg(any(test, feature = "fixtures"))]
             fixture_accounts: Mutex::new(None),
             config: Mutex::new(config),
@@ -151,6 +159,9 @@ impl Provider {
         models: HashMap<String, Vec<Value>>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            // Fixtures may exercise cache/config mutations, but must never
+            // write into the user's Qoder gateway directory.
+            data_dir: None,
             fixture_accounts: Mutex::new(Some(accounts)),
             config: Mutex::new(config),
             models: Mutex::new(models),
@@ -158,6 +169,12 @@ impl Provider {
             credits: Mutex::new(HashMap::new()),
             client: reqwest::Client::new(),
         })
+    }
+    fn persist(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        match &self.data_dir {
+            Some(dir) => write_private(&dir.join(name), bytes),
+            None => Ok(()),
+        }
     }
     pub fn accounts(&self) -> Vec<qcore::Account> {
         #[cfg(any(test, feature = "fixtures"))]
@@ -180,8 +197,8 @@ impl Provider {
         {
             return Err("请先停止服务再修改 Qoder 传输协议或上游地址".into());
         }
-        write_private(
-            &data_file("settings.json"),
+        self.persist(
+            "settings.json",
             &serde_json::to_vec_pretty(&c).unwrap(),
         )?;
         *current = c;
@@ -194,8 +211,8 @@ impl Provider {
             c.disabled_accounts.push(id.to_owned());
         }
         let mut current = self.config.lock().unwrap();
-        write_private(
-            &data_file("settings.json"),
+        self.persist(
+            "settings.json",
             &serde_json::to_vec_pretty(&c).unwrap(),
         )?;
         *current = c;
@@ -227,16 +244,17 @@ impl Provider {
             entry
         };
         credits.insert(id.to_owned(), value);
-        let _ = write_private(
-            &data_file("credits.json"),
-            &serde_json::to_vec(&*credits).unwrap_or_default(),
-        );
+        if self.persist("credits.json", &serde_json::to_vec(&*credits).unwrap()).is_err() {
+            agentdock_core::applog::warn("qoder.credits", || (
+                "Qoder 积分缓存保存失败，重启后可能需要重新刷新".into(), Value::Null
+            ));
+        }
     }
     pub fn forget_account(&self, id: &str) {
         let mut credits = self.credits.lock().unwrap();
         if credits.remove(id).is_some() {
-            let _ = write_private(
-                &data_file("credits.json"),
+            let _ = self.persist(
+                "credits.json",
                 &serde_json::to_vec(&*credits).unwrap_or_default(),
             );
         }
@@ -299,8 +317,8 @@ impl Provider {
         let text = String::from_utf8(bytes).map_err(|_| "模型目录编码无效")?;
         let raw = runtime_helper(json!({"op":"decrypt","edition":edition,"text":text})).await?;
         let models = normalize_models(&raw)?;
-        write_private(
-            &data_file(&format!("models-{edition}.json")),
+        self.persist(
+            &format!("models-{edition}.json"),
             &serde_json::to_vec_pretty(&models).unwrap(),
         )?;
         self.models
@@ -1135,6 +1153,110 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct CacheDir(PathBuf);
+    impl CacheDir {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("agentdock-qoder-credits-{}", uuid::Uuid::new_v4())),
+            )
+        }
+        fn open(&self) -> Arc<Provider> {
+            Provider::open_at(self.0.clone()).unwrap()
+        }
+    }
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn quota_cache_survives_restart_and_failed_refresh_without_losing_zero_balances() {
+        let dir = CacheDir::new();
+        let provider = dir.open();
+        provider.cache_credits("cn:demo", json!({"ok":true,"updatedAt":1234,
+            "usage":{"userQuota":{"remaining":0,"total":100},"addOnQuota":{"remaining":20,"total":50}}}));
+        provider.cache_credits("cn:demo", json!({"ok":false,"error":"network unavailable"}));
+        drop(provider);
+        let provider = dir.open();
+        let cached = provider.credit_cache()["cn:demo"].clone();
+        assert_eq!(cached["updatedAt"], 1234);
+        assert_eq!(cached["usage"]["userQuota"]["remaining"], 0);
+        assert_eq!(cached["cached"], true);
+        assert_eq!(cached["stale"], true);
+        assert_eq!(credit_rank(Some(&cached)).remaining, Some(20.0));
+        provider.cache_credits("cn:demo", json!({"ok":false,"error":"still unavailable"}));
+        assert_eq!(provider.credit_cache()["cn:demo"]["updatedAt"], 1234);
+        provider.cache_credits("cn:demo", json!({"ok":true,"updatedAt":5678,
+            "usage":{"userQuota":{"remaining":0,"total":100},"addOnQuota":{"remaining":0,"total":50}}}));
+        let fresh = provider.credit_cache()["cn:demo"].clone();
+        assert_eq!(credit_rank(Some(&fresh)).remaining, Some(0.0));
+        assert!(fresh["stale"].is_null());
+        assert!(fresh["error"].is_null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.0.join("credits.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        provider.forget_account("cn:demo");
+        assert!(dir.open().credit_cache().is_empty());
+    }
+    #[test]
+    fn independent_stores_and_in_memory_fixtures_do_not_overwrite_each_others_cache() {
+        let first = CacheDir::new();
+        let second = CacheDir::new();
+        let a = first.open();
+        let b = second.open();
+        a.cache_credits(
+            "cn:demo",
+            json!({"ok":true,"updatedAt":1,"usage":{"userQuota":{"remaining":10}}}),
+        );
+        let before = fs::read(first.0.join("credits.json")).unwrap();
+        b.cache_credits(
+            "cn:demo",
+            json!({"ok":true,"updatedAt":2,"usage":{"userQuota":{"remaining":90}}}),
+        );
+        let fixture = Provider::fixture(vec![], Config::default(), HashMap::new());
+        assert!(fixture.data_dir.is_none());
+        fixture.cache_credits(
+            "cn:demo",
+            json!({"ok":true,"usage":{"userQuota":{"remaining":999}}}),
+        );
+        fixture.set_enabled("cn:demo", false).unwrap();
+        fixture.forget_account("cn:demo");
+        assert_eq!(fs::read(first.0.join("credits.json")).unwrap(), before);
+        assert_eq!(
+            credit_rank(first.open().credit_cache().get("cn:demo")).remaining,
+            Some(10.0)
+        );
+        assert_eq!(
+            credit_rank(second.open().credit_cache().get("cn:demo")).remaining,
+            Some(90.0)
+        );
+    }
+    #[test]
+    fn corrupt_cache_can_be_replaced_by_a_successful_query() {
+        let dir = CacheDir::new();
+        fs::create_dir_all(&dir.0).unwrap();
+        fs::write(dir.0.join("credits.json"), b"not json").unwrap();
+        let provider = dir.open();
+        assert!(provider.credit_cache().is_empty());
+        provider.cache_credits(
+            "cn:demo",
+            json!({"ok":true,"updatedAt":1,"usage":{"userQuota":{"remaining":12}}}),
+        );
+        assert_eq!(
+            credit_rank(dir.open().credit_cache().get("cn:demo")).remaining,
+            Some(12.0)
+        );
+    }
     #[test]
     fn official_endpoints_only() {
         assert!(valid_endpoint("https://api2-v2.qoder.sh"));
