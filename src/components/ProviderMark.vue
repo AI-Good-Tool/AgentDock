@@ -8,17 +8,29 @@ const uid = useId()
 const tile = computed(() => `${uid}-tile`)
 const shine = computed(() => `${uid}-shine`)
 const accent = computed(() => `${uid}-accent`)
-const known = computed(() => ['workbuddy', 'qoder', 'trae'].includes(props.provider))
+const known = computed(() => ['workbuddy', 'trae'].includes(props.provider))
 const colors: Record<string, [string, string]> = {
   workbuddy: ['#26c99c', '#0e8f70'],
-  qoder: ['#5f8f6e', '#284232'],
   trae: ['#323c4b', '#0d1117'],
 }
 </script>
 
 <template>
   <span class="pmark" :class="provider" role="img" :aria-label="providerLabel(provider)">
-    <svg v-if="known" viewBox="0 0 32 32" aria-hidden="true">
+    <svg v-if="provider === 'qoder'" viewBox="0 0 32 32" aria-hidden="true">
+      <defs>
+        <linearGradient :id="tile" x1="4" y1="2" x2="28" y2="32" gradientUnits="userSpaceOnUse">
+          <stop stop-color="#fff" />
+          <stop offset="1" stop-color="#f1f7f3" />
+        </linearGradient>
+      </defs>
+      <rect x=".4" y=".4" width="31.2" height="31.2" rx="8" :fill="`url(#${tile})`" stroke="#d7e2da" stroke-width=".8" />
+      <rect x="4.8" y="8" width="14.8" height="9.8" rx="1.8" fill="#3f644d" />
+      <rect x="12.4" y="14.2" width="14.8" height="9.8" rx="1.8" fill="#3f644d" />
+      <path d="M11.8 11.6h3.6V9.8l3.7 3.7-3.7 3.7v-1.8h-3.6z" fill="#fff" />
+      <path d="M23.4 18h-4.2v-1.8L15.5 20l3.7 3.7v-1.8h4.2z" fill="#fff" />
+    </svg>
+    <svg v-else-if="known" viewBox="0 0 32 32" aria-hidden="true">
       <defs>
         <linearGradient :id="tile" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
           <stop :stop-color="colors[provider][0]" />
@@ -46,11 +58,6 @@ const colors: Record<string, [string, string]> = {
           stroke-linejoin="round"
         />
         <circle cx="24.6" cy="8.2" r="2.3" fill="#b9f6de" />
-      </template>
-
-      <template v-else-if="provider === 'qoder'">
-        <circle cx="15.6" cy="15.2" r="7" fill="none" stroke="#fff" stroke-width="3.2" />
-        <path d="M16.8 17.2 23 23.4" stroke="#a6efc4" stroke-width="3.4" stroke-linecap="round" />
       </template>
 
       <template v-else>
