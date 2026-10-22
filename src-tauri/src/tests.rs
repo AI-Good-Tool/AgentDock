@@ -21,6 +21,9 @@ struct Fixture {
     trae_upload_fail: Arc<AtomicBool>,
     trae_plan_mode: Arc<AtomicUsize>,
     trae_stops: Arc<AtomicUsize>,
+    trae_deletes: Arc<AtomicUsize>,
+    trae_cleanup_status: Arc<AtomicUsize>,
+    trae_events: Arc<AtomicUsize>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 impl Drop for Fixture {
@@ -94,9 +97,17 @@ async fn fixture() -> Fixture {
     let plan_mode = trae_plan_mode.clone();
     let trae_stops = Arc::new(AtomicUsize::new(0));
     let stops = trae_stops.clone();
+    let trae_deletes = Arc::new(AtomicUsize::new(0));
+    let deletes = trae_deletes.clone();
+    let trae_cleanup_status = Arc::new(AtomicUsize::new(204));
+    let cleanup_status = trae_cleanup_status.clone();
+    let create_mode = trae_plan_mode.clone();
+    let trae_events = Arc::new(AtomicUsize::new(0));
+    let events_started = trae_events.clone();
     // Trae Remote Agent chain: models → chat_sessions → events (one turn per request).
     let sessions: Arc<std::sync::Mutex<HashMap<String, (String, String)>>> = Arc::default();
     let created = sessions.clone();
+    let delete_sessions = sessions.clone();
     let trae_upstream = Router::new()
         .route(
             "/api/ide/v1/get_resource_upload_url",
@@ -150,7 +161,7 @@ async fn fixture() -> Fixture {
         .route(
             "/api/remote/v1/chat_sessions",
             post(move |Json(body): Json<Value>| {
-                let (tc, created, queries) = (tc.clone(), created.clone(), queries.clone());
+                let (tc, created, queries, create_mode) = (tc.clone(), created.clone(), queries.clone(), create_mode.clone());
                 async move {
                     tc.fetch_add(1, Ordering::SeqCst);
                     let m = &body["initial_message"];
@@ -162,6 +173,12 @@ async fn fixture() -> Fixture {
                         sid.clone(),
                         (m["model_name"].as_str().unwrap().to_owned(), query[0]["data"]["content"].as_str().unwrap().to_owned()),
                     );
+                    if create_mode.load(Ordering::SeqCst) == 5 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    if create_mode.load(Ordering::SeqCst) == 4 {
+                        return Json(json!({"code":0,"data":{"chat_session_id":sid}}));
+                    }
                     Json(json!({"code":0,"data":{"chat_session_id":sid,"message_id":"m1"}}))
                 }
             }),
@@ -171,7 +188,12 @@ async fn fixture() -> Fixture {
             axum::routing::get(move |axum::extract::Path(sid): axum::extract::Path<String>| {
                 let sessions = sessions.clone();
                 let plan_mode = plan_mode.clone();
+                let events_started = events_started.clone();
                 async move {
+                    events_started.fetch_add(1,Ordering::SeqCst);
+                    if plan_mode.load(Ordering::SeqCst) == 6 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
                     let (model, query) = sessions.lock().unwrap().get(&sid).cloned().unwrap();
                     let reply = match query.split_once("\nTools: ") {
                         Some((_, tools)) if !query.contains("[Client tool result]") => {
@@ -210,6 +232,16 @@ async fn fixture() -> Fixture {
                 }
             }),
         )
+        .route("/api/remote/v1/chat_sessions/{sid}", axum::routing::delete(move |axum::extract::Path(sid):axum::extract::Path<String>| {
+            let (deletes, status, sessions) = (deletes.clone(),cleanup_status.clone(),delete_sessions.clone());
+            async move {
+                assert!(sessions.lock().unwrap().contains_key(&sid), "only delete a session created by this fixture request");
+                deletes.fetch_add(1,Ordering::SeqCst);
+                let code = status.load(Ordering::SeqCst) as u16;
+                if code == 204 { sessions.lock().unwrap().remove(&sid); }
+                axum::http::StatusCode::from_u16(code).unwrap()
+            }
+        }))
         .route("/api/remote/v1/chat_sessions/{sid}/stop", post(move || {
             let stops = stops.clone();
             async move {
@@ -245,7 +277,7 @@ async fn fixture() -> Fixture {
     *trae.test_host.lock().unwrap() = Some(trae_url);
     let hub = Hub::assemble(&dir, Settings::default(), KEY, qoder, trae);
     let (url, g_task) = serve(crate::server::router(hub.clone())).await;
-    Fixture { hub, url, qoder_calls, trae_calls, trae_queries, trae_uploads, trae_upload_fail, trae_plan_mode, trae_stops, tasks: vec![q_task, t_task, g_task] }
+    Fixture { hub, url, qoder_calls, trae_calls, trae_queries, trae_uploads, trae_upload_fail, trae_plan_mode, trae_stops, trae_deletes, trae_cleanup_status, trae_events, tasks: vec![q_task, t_task, g_task] }
 }
 
 fn client() -> reqwest::Client {
@@ -418,6 +450,8 @@ async fn delayed_trae_finish_parameters_work_with_large_namespaced_tool_requests
     let logs = wait_logs(&f, 1).await;
     assert_eq!(logs[0].details["upstreamSummary"]["clientTools"], 57);
     assert_eq!(logs[0].outcome, "completed");
+    assert_eq!(logs[0].details["upstreamSummary"]["cloudSessionCleanup"], "deleted");
+    assert_eq!(f.trae_deletes.load(Ordering::SeqCst), 1);
     assert_eq!(f.trae_stops.load(Ordering::SeqCst), 0);
 
     // Mixed-provider rotation still uses the original account order, including
@@ -452,6 +486,7 @@ async fn actual_remote_tools_still_stop_and_incomplete_finish_never_becomes_succ
     assert_eq!(response.status(), 502);
     let logs = wait_logs(&f, 1).await;
     assert_eq!(logs[0].outcome, "remote_tool_execution");
+    assert_eq!(logs[0].details["upstreamSummary"]["cloudSessionCleanup"], "deleted");
     assert_eq!(logs[0].details["upstreamSummary"]["blockedRemoteTool"], "read_file");
     assert_eq!(logs[0].details["upstreamSummary"]["remoteStopConfirmed"], true);
     assert!(!logs[0].details.to_string().contains("PRIVATE_TOOL_ARGUMENT"));
@@ -465,6 +500,113 @@ async fn actual_remote_tools_still_stop_and_incomplete_finish_never_becomes_succ
     assert!(error.to_string().contains("Trae finish 未返回完整 summary"), "{error}");
     let logs = wait_logs(&f, 2).await;
     assert_eq!(logs[0].outcome, "invalid_tool_output");
+    assert_eq!(logs[0].details["upstreamSummary"]["cloudSessionCleanup"], "deleted");
+}
+
+#[tokio::test]
+async fn trae_cleanup_failure_preserves_answer_and_retries_owned_records_only() {
+    let f = fixture().await;
+    f.trae_cleanup_status.store(500, Ordering::SeqCst);
+    let response = post_json(
+        &f,
+        "/trae/v1/responses",
+        json!({"model":"Shared","input":"hello"}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.unwrap();
+    assert!(value.to_string().contains("你好 from shared-real"));
+    let logs = wait_logs(&f, 1).await;
+    assert_eq!(logs[0].outcome, "completed");
+    assert_eq!(
+        logs[0].details["upstreamSummary"]["cloudSessionCleanup"],
+        "failed"
+    );
+    assert_eq!(f.trae_deletes.load(Ordering::SeqCst), 2);
+    f.trae_cleanup_status.store(204, Ordering::SeqCst);
+    f.hub.trae.retry_remote_cleanup().await;
+    assert_eq!(f.trae_deletes.load(Ordering::SeqCst), 3);
+    assert!(f.hub.trae.store.cleanup_snapshot().unwrap()["agentdockRemoteCleanup"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn trae_missing_message_id_and_cancelled_create_still_delete_the_created_session() {
+    let f = fixture().await;
+    f.trae_plan_mode.store(4, Ordering::SeqCst);
+    let response = post_json(
+        &f,
+        "/trae/v1/responses",
+        json!({"model":"Shared","input":"hello"}),
+    )
+    .await;
+    assert_eq!(response.status(), 502);
+    let logs = wait_logs(&f, 1).await;
+    assert_eq!(
+        logs[0].details["upstreamSummary"]["cloudSessionCleanup"],
+        "deleted"
+    );
+    assert_eq!(f.trae_deletes.load(Ordering::SeqCst), 1);
+
+    for mode in [5, 6] {
+        let before_create = f.trae_calls.load(Ordering::SeqCst);
+        let before_events = f.trae_events.load(Ordering::SeqCst);
+        let before_delete = f.trae_deletes.load(Ordering::SeqCst);
+        f.trae_plan_mode.store(mode, Ordering::SeqCst);
+        let hub = f.hub.clone();
+        let account = hub.trae.store.accounts()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let send = tokio::spawn(async move {
+            let input = agentdock_core::provider::SendInput {
+                body: json!({"model":"shared-real","messages":[{"role":"user","content":"hello"}]}),
+                headers: Default::default(),
+                request_id: "cancel-create".into(),
+                session_id: None,
+                effort_input: Value::Null,
+                client_profile: None,
+            };
+            let mut details = agentdock_core::diagnostics::RequestDetails::default();
+            hub.trae
+                .send(
+                    &account,
+                    Some("shared-real".into()),
+                    input,
+                    &mut details,
+                    std::time::Instant::now(),
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while if mode == 5 {
+                f.trae_calls.load(Ordering::SeqCst) == before_create
+            } else {
+                f.trae_events.load(Ordering::SeqCst) == before_events
+            } {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        send.abort();
+        assert!(send.await.is_err());
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while f.trae_deletes.load(Ordering::SeqCst) == before_delete
+                || !f.hub.trae.store.cleanup_snapshot().unwrap()["agentdockRemoteCleanup"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(f.trae_stops.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

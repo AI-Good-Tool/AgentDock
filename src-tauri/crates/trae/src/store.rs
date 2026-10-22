@@ -1,6 +1,7 @@
 //! Encrypted Trae account vault (AES-256-GCM). File layout matches the
 //! standalone Trae Switch: iv(12) | tag(16) | ciphertext, key in `vault.key`.
 use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
+use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -80,6 +81,51 @@ impl Store {
     }
     pub fn snapshot(&self) -> Value {
         self.data.lock().unwrap().clone()
+    }
+    // Separate from the account snapshot: headless check-in processes must not
+    // overwrite cleanup ownership with an older in-memory vault snapshot.
+    pub fn cleanup_snapshot(&self) -> Result<Value, String> {
+        let lock = self.cleanup_lock("queue")?;
+        lock.lock_exclusive().map_err(|_| "无法锁定清理队列")?;
+        self.read_cleanup()
+    }
+    pub(crate) fn update_cleanup<T>(
+        &self,
+        change: impl FnOnce(&mut Value) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let lock = self.cleanup_lock("queue")?;
+        lock.lock_exclusive().map_err(|_| "无法锁定清理队列")?;
+        let mut next = self.read_cleanup()?;
+        let result = change(&mut next)?;
+        let bytes = encrypt(&self.key, &serde_json::to_vec(&next).unwrap())?;
+        let tmp = self.dir.join("remote-cleanup.enc.tmp");
+        crate::client::write_private(&tmp, &bytes)?;
+        fs::rename(&tmp, self.dir.join("remote-cleanup.enc"))
+            .map_err(|_| "无法保存清理队列")?;
+        Ok(result)
+    }
+    fn read_cleanup(&self) -> Result<Value, String> {
+        match fs::read(self.dir.join("remote-cleanup.enc")) {
+            Ok(bytes) => decrypt(&self.key, &bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
+            Err(_) => Err("无法读取清理队列".into()),
+        }
+    }
+    pub(crate) fn cleanup_lock(&self, key: &str) -> Result<fs::File, String> {
+        if key != "queue" && uuid::Uuid::parse_str(key).is_err() {
+            return Err("无效的清理任务标识".into());
+        }
+        let dir = self.dir.join("remote-cleanup-locks");
+        crate::client::write_private_dir(&dir)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(dir.join(format!("{key}.lock")))
+            .map_err(|_| "无法打开清理任务锁".into())
     }
     /// Apply a change and persist it; on a write failure the live state is unchanged.
     pub fn update<T>(&self, change: impl FnOnce(&mut Value) -> Result<T, String>) -> Result<T, String> {

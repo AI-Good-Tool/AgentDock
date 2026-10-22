@@ -20,6 +20,14 @@ const strategyName: Record<string, [string, string]> = {
   Random: ['随机', 'Random'],
 }
 const na = () => t('未提供', 'n/a')
+const cloudCleanup = computed(() => {
+  switch (details.value?.upstreamSummary?.cloudSessionCleanup) {
+    case 'deleted': return t('已删除本次云端会话', 'This cloud session was deleted')
+    case 'failed': return t('清理失败，详见运行日志', 'Cleanup failed; see runtime logs')
+    case 'pending': return t('待清理；若请求已结束，将后台重试', 'Pending; retries in the background after the request ends')
+    default: return ''
+  }
+})
 </script>
 <template>
   <a-drawer :visible="!!record" :width="780" :title="t('请求详情', 'Request details')" :footer="false" @cancel="emit('close')">
@@ -75,6 +83,7 @@ const na = () => t('未提供', 'n/a')
           <a-descriptions-item :label="t('响应字节数', 'Response bytes')">{{ details?.responseBytes ?? na() }}</a-descriptions-item>
           <a-descriptions-item :label="t('结束原因', 'Finish reason')">{{ details?.finishReason || na() }}</a-descriptions-item>
           <a-descriptions-item :label="t('上游结束标记', 'End marker')">{{ details?.streamComplete ? t('已收到', 'Received') : t('未收到 / 不适用', 'Not received / n/a') }}</a-descriptions-item>
+          <a-descriptions-item v-if="cloudCleanup" :label="t('云端会话清理', 'Cloud session cleanup')" :span="2">{{ cloudCleanup }}</a-descriptions-item>
         </a-descriptions>
       </section>
       <section v-if="record.status >= 400">

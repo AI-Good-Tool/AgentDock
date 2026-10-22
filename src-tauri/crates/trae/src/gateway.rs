@@ -15,6 +15,7 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{collections::HashMap, time::{Duration, Instant}};
 mod catalog;
+pub(crate) mod cleanup;
 
 const AGENT: &str = "solo_agent_remote";
 const MODELS_QUERY: &str = "/models?functions=solo_agent_remote%2Csolo_work_remote&show_custom_model=true";
@@ -326,48 +327,6 @@ impl RemotePlans {
     }
 }
 
-/// Stops the upstream turn unless it completed (also when the request is dropped).
-struct StopGuard {
-    url: String,
-    headers: Vec<(&'static str, String)>,
-    body: Value,
-    finished: bool,
-}
-impl StopGuard {
-    async fn stop(&mut self) -> bool {
-        let mut req = http().post(&self.url).timeout(Duration::from_secs(5)).json(&self.body);
-        for (key, value) in &self.headers {
-            req = req.header(*key, value);
-        }
-        let confirmed = match req.send().await {
-            Ok(response) if response.status().is_success() => match response.json::<Value>().await {
-                Ok(data) => data["code"].is_null() || data["code"] == 0 || data["code"] == "0",
-                Err(_) => false,
-            },
-            _ => false,
-        };
-        self.finished = confirmed;
-        confirmed
-    }
-}
-impl Drop for StopGuard {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let (url, headers, body) = (self.url.clone(), self.headers.clone(), self.body.clone());
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move {
-                let mut req = http().post(url).timeout(Duration::from_secs(5)).json(&body);
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-                let _ = req.send().await;
-            });
-        }
-    }
-}
-
 fn fail(details: &mut RequestDetails, status: u16, code: &str, message: &str) -> SendFailure {
     details.local_error("upstream", message);
     SendFailure::local(status, code, message.to_owned())
@@ -380,6 +339,7 @@ pub async fn send(
     details: &mut RequestDetails,
     started: Instant,
     host_override: Option<String>,
+    cleanup: std::sync::Arc<cleanup::Cleanup>,
 ) -> Result<SendOk, SendFailure> {
     let chat = &input.body;
     let context = remote_context(chat).map_err(|e| {
@@ -473,134 +433,156 @@ pub async fn send(
     for (k, v) in &headers {
         req = req.header(*k, v);
     }
-    let r = req.send().await.map_err(|_| fail(details, 502, "upstream_unreachable", "Trae 上游连接失败或超时"))?;
-    let status = r.status().as_u16();
+    // The create task must outlive caller cancellation long enough to acquire
+    // the session ID and record ownership; a dropped result cleans itself up.
+    let create_account = account.clone();
+    let create_base = base.clone();
+    let created = tokio::spawn(async move {
+        let response = req.send().await.map_err(|_| "Trae 上游连接失败或超时")?;
+        let status = response.status().as_u16();
+        let session: Value = response.json().await.map_err(|_| "Trae 会话响应不是 JSON")?;
+        let data = if session["data"].is_object() { &session["data"] } else { &session };
+        let guard = if (200..300).contains(&status) && !session["code"].as_i64().is_some_and(|code| code != 0) {
+            data["chat_session_id"].as_str().filter(|sid| !sid.is_empty()).map(|sid| {
+                cleanup.own(create_account, &create_base, sid, data["message_id"].as_str().map(str::to_owned))
+            }).transpose().map_err(|_| "Trae 云端会话标识无效")?
+        } else { None };
+        Ok::<_, &str>((status, session, guard))
+    }).await.map_err(|_| fail(details, 502, "upstream_unreachable", "Trae 创建会话任务异常"))?
+        .map_err(|message| fail(details, 502, "upstream_unreachable", message))?;
+    let (status, session, mut guard) = created;
     details.upstream_status = Some(status);
-    let session: Value = r.json().await.unwrap_or(Value::Null);
     if !(200..300).contains(&status) || session["code"].as_i64().is_some_and(|c| c != 0) {
         let msg = format!("Trae 创建会话失败（HTTP {status}）");
         let mut f = fail(details, 502, "upstream_http_error", &msg);
-        if let Some(c) = session["code"].as_i64() {
-            f.error = json!({"code": c.to_string()});
-        }
-        if matches!(status, 401 | 403 | 429) {
-            f = f.with_effect(AccountEffect::Cooldown(60));
-        }
+        if let Some(c) = session["code"].as_i64() { f.error = json!({"code":c.to_string()}); }
+        if matches!(status, 401 | 403 | 429) { f = f.with_effect(AccountEffect::Cooldown(60)); }
         return Err(f);
     }
+    let Some(mut guard) = guard.take() else {
+        return Err(fail(details, 502, "upstream_protocol_error", "Trae 会话响应缺少会话 ID"));
+    };
     let data = if session["data"].is_object() { &session["data"] } else { &session };
-    let (Some(sid), Some(mid)) = (data["chat_session_id"].as_str(), data["message_id"].as_str()) else {
-        return Err(fail(details, 502, "upstream_protocol_error", "Trae 会话响应缺少会话或消息 ID"));
-    };
+    let sid = data["chat_session_id"].as_str().unwrap();
     details.upstream_request_id = Some(sid.to_owned());
-    let mut guard = StopGuard {
-        url: format!("{base}/chat_sessions/{sid}/stop"),
-        headers: headers.clone(),
-        body: json!({"chat_session_id": sid, "user_message_id": mid}),
-        finished: false,
-    };
-
-    // 3) Read the turn's events until `done`.
-    let mut req = http()
-        .get(format!("{base}/chat_sessions/{sid}/events"))
-        .query(&[("reply_to_message_id", mid)])
-        .timeout(TURN_TIMEOUT);
-    for (k, v) in &headers {
-        req = req.header(*k, v);
-    }
-    let r = req.send().await.map_err(|_| fail(details, 502, "upstream_unreachable", "Trae 事件流连接失败或超时"))?;
-    if !r.status().is_success() {
-        let msg = format!("Trae 事件流请求失败（HTTP {}）", r.status().as_u16());
-        return Err(fail(details, 502, "upstream_http_error", &msg));
-    }
-    let mut frames = SseFrames::default();
-    let mut stream = r.bytes_stream();
-    let mut plans = RemotePlans::default();
-    let mut usage = None;
-    let (mut confirmed, mut finished) = (false, false);
-    'read: while let Some(part) = stream.next().await {
-        let part = part.map_err(|_| fail(details, 502, "truncated_stream", "Trae 事件流意外中断"))?;
-        if details.first_byte_ms.is_none() {
-            details.first_byte_ms = Some(started.elapsed().as_millis());
+    details.upstream_summary["cloudSessionCleanup"] = json!("pending");
+    let result = async {
+        if guard.persistence_error {
+            return Err(fail(details, 502, "cleanup_state_unavailable", "无法保存 Trae 云端会话清理记录，已终止请求并尝试清理"));
         }
-        details.response_bytes += part.len();
-        for frame in frames.feed(&part).map_err(|e| fail(details, 502, "upstream_protocol_error", &e))? {
-            let Ok(data) = serde_json::from_slice::<Value>(&frame.data) else { continue };
-            let event = frame.event.as_deref().unwrap_or("message");
-            if event == "error" || data["code"].as_i64().is_some_and(|c| c != 0) {
-                let code = data["code"].as_i64().map(|c| c.to_string()).unwrap_or_else(|| "upstream_error".into());
-                let mut f = fail(details, 502, "upstream_business_error", &format!("Trae 上游拒绝请求（{code}）"));
-                f.error = json!({"code": code});
-                return Err(f);
+        let Some(mid) = data["message_id"].as_str().filter(|mid| !mid.is_empty()) else {
+            return Err(fail(details, 502, "upstream_protocol_error", "Trae 会话响应缺少消息 ID"));
+        };
+        let session_url = {
+            let mut url = reqwest::Url::parse(&base).unwrap();
+            url.path_segments_mut().unwrap().push("chat_sessions").push(sid).push("events");
+            url
+        };
+
+        // 3) Read the turn's events until `done`.
+        let mut req = http()
+            .get(session_url)
+            .query(&[("reply_to_message_id", mid)])
+            .timeout(TURN_TIMEOUT);
+        for (k, v) in &headers {
+            req = req.header(*k, v);
+        }
+        let r = req.send().await.map_err(|_| fail(details, 502, "upstream_unreachable", "Trae 事件流连接失败或超时"))?;
+        if !r.status().is_success() {
+            let msg = format!("Trae 事件流请求失败（HTTP {}）", r.status().as_u16());
+            return Err(fail(details, 502, "upstream_http_error", &msg));
+        }
+        let mut frames = SseFrames::default();
+        let mut stream = r.bytes_stream();
+        let mut plans = RemotePlans::default();
+        let mut usage = None;
+        let (mut confirmed, mut finished) = (false, false);
+        'read: while let Some(part) = stream.next().await {
+            let part = part.map_err(|_| fail(details, 502, "truncated_stream", "Trae 事件流意外中断"))?;
+            if details.first_byte_ms.is_none() {
+                details.first_byte_ms = Some(started.elapsed().as_millis());
             }
-            match event {
-                "model_config" => {
-                    if data["config_name"].as_str().is_some_and(|n| n != model_name) {
-                        return Err(fail(details, 502, "upstream_model_mismatch", "上游实际模型与请求模型不一致，已停止该请求"));
-                    }
-                    confirmed = true;
+            details.response_bytes += part.len();
+            for frame in frames.feed(&part).map_err(|e| fail(details, 502, "upstream_protocol_error", &e))? {
+                let Ok(data) = serde_json::from_slice::<Value>(&frame.data) else { continue };
+                let event = frame.event.as_deref().unwrap_or("message");
+                if event == "error" || data["code"].as_i64().is_some_and(|c| c != 0) {
+                    let code = data["code"].as_i64().map(|c| c.to_string()).unwrap_or_else(|| "upstream_error".into());
+                    let mut f = fail(details, 502, "upstream_business_error", &format!("Trae 上游拒绝请求（{code}）"));
+                    f.error = json!({"code": code});
+                    return Err(f);
                 }
-                "plan_item" => {
-                    if let Err(name) = plans.update(&data) {
-                        // Record only an identifier, never upstream tool arguments/results.
-                        let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || "_:-./".contains(*c)).take(128).collect();
-                        details.upstream_summary["blockedRemoteTool"] = json!(name);
-                        details.upstream_summary["remoteStopConfirmed"] = json!(guard.stop().await);
-                        return Err(fail(details, 502, "remote_tool_execution", "上游尝试执行内置工具，已请求停止该会话；详见 blockedRemoteTool"));
+                match event {
+                    "model_config" => {
+                        if data["config_name"].as_str().is_some_and(|n| n != model_name) {
+                            return Err(fail(details, 502, "upstream_model_mismatch", "上游实际模型与请求模型不一致，已停止该请求"));
+                        }
+                        confirmed = true;
                     }
-                }
-                "token_usage" => {
-                    if let (Some(i), Some(o)) = (data["prompt_tokens"].as_u64(), data["completion_tokens"].as_u64()) {
-                        usage = Some(json!({"prompt_tokens": i, "completion_tokens": o, "total_tokens": i + o}));
+                    "plan_item" => {
+                        if let Err(name) = plans.update(&data) {
+                            // Record only an identifier, never upstream tool arguments/results.
+                            let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || "_:-./".contains(*c)).take(128).collect();
+                            details.upstream_summary["blockedRemoteTool"] = json!(name);
+                            details.upstream_summary["remoteStopConfirmed"] = json!(guard.stop().await);
+                            return Err(fail(details, 502, "remote_tool_execution", "上游尝试执行内置工具，已请求停止该会话；详见 blockedRemoteTool"));
+                        }
                     }
-                }
-                "done" => {
-                    if data["status"] != "completed" {
-                        return Err(fail(details, 502, "truncated_stream", "Trae 本轮未正常完成"));
+                    "token_usage" => {
+                        if let (Some(i), Some(o)) = (data["prompt_tokens"].as_u64(), data["completion_tokens"].as_u64()) {
+                            usage = Some(json!({"prompt_tokens": i, "completion_tokens": o, "total_tokens": i + o}));
+                        }
                     }
-                    finished = true;
-                    break 'read;
+                    "done" => {
+                        if data["status"] != "completed" {
+                            return Err(fail(details, 502, "truncated_stream", "Trae 本轮未正常完成"));
+                        }
+                        finished = true;
+                        break 'read;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
-    if !finished || !confirmed {
-        return Err(fail(details, 502, "truncated_stream", "Trae 事件流在完成前结束"));
-    }
-    guard.finished = true;
-    details.stream_complete = true;
-    let text = plans.output().map_err(|message| fail(details, 502, "invalid_tool_output", message))?;
-    if text.is_empty() {
-        return Err(fail(details, 502, "empty_output", "Trae 未返回文本"));
-    }
-    if text.len() > OUTPUT_LIMIT {
-        return Err(fail(details, 502, "output_limit", "上游输出超过 1MB"));
-    }
-    let (clean, calls) = parse_tool_reply(&text, &tools, &choice)
-        .map_err(|_| fail(details, 502, "invalid_tool_output", "上游返回的客户端工具调用格式无效"))?;
-    let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
-    details.finish_reason = Some(finish.into());
+        if !finished || !confirmed {
+            return Err(fail(details, 502, "truncated_stream", "Trae 事件流在完成前结束"));
+        }
+        guard.finished = true;
+        details.stream_complete = true;
+        let text = plans.output().map_err(|message| fail(details, 502, "invalid_tool_output", message))?;
+        if text.is_empty() {
+            return Err(fail(details, 502, "empty_output", "Trae 未返回文本"));
+        }
+        if text.len() > OUTPUT_LIMIT {
+            return Err(fail(details, 502, "output_limit", "上游输出超过 1MB"));
+        }
+        let (clean, calls) = parse_tool_reply(&text, &tools, &choice)
+            .map_err(|_| fail(details, 502, "invalid_tool_output", "上游返回的客户端工具调用格式无效"))?;
+        let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
+        details.finish_reason = Some(finish.into());
 
-    let mut chunks = vec![];
-    if !clean.is_empty() {
-        chunks.push(json!({"choices":[{"index":0,"delta":{"role":"assistant","content":clean},"finish_reason":null}]}));
-    }
-    if !calls.is_empty() {
-        chunks.push(json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}));
-    }
-    let mut last = json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}]});
-    if let Some(u) = usage {
-        last["usage"] = u;
-    }
-    chunks.push(last);
-    let events = futures_util::stream::iter(
-        chunks
-            .into_iter()
-            .map(|c| Ok(UpstreamEvent::Chunk(c)))
-            .chain(std::iter::once(Ok(UpstreamEvent::Done))),
-    );
-    Ok(SendOk { events: Box::pin(events) })
+        let mut chunks = vec![];
+        if !clean.is_empty() {
+            chunks.push(json!({"choices":[{"index":0,"delta":{"role":"assistant","content":clean},"finish_reason":null}]}));
+        }
+        if !calls.is_empty() {
+            chunks.push(json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]}));
+        }
+        let mut last = json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}]});
+        if let Some(u) = usage {
+            last["usage"] = u;
+        }
+        chunks.push(last);
+        let events = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok(UpstreamEvent::Chunk(c)))
+                .chain(std::iter::once(Ok(UpstreamEvent::Done))),
+        );
+        Ok(SendOk { events: Box::pin(events) })
+    }.await;
+    guard.cleanup(details).await;
+    result
 }
 
 #[cfg(test)]

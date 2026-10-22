@@ -219,7 +219,7 @@ function saveQoder() {
                   : t('在任意兼容 OpenAI 的客户端填入地址和本地密钥。', 'Use the base URL and local key in any OpenAI-compatible client.')
           }}
         </p>
-        <p class="hint">{{ t('Trae 原生接口目前只支持纯文本对话；带工具或图片的请求会在调度到 Trae 账号时返回明确错误，不会伪造结果。', 'Trae native chat supports plain text only; tool or image requests routed to Trae fail explicitly.') }}</p>
+        <p class="hint">{{ t('Trae 使用 Remote 云端会话处理请求，结束后自动清理本次会话；支持图片输入，客户端工具通过文本桥接返回。', 'Trae uses a Remote cloud session and cleans up that session afterwards; image input is supported and client tools use a text bridge.') }}</p>
       </section>
     </div>
   </div>

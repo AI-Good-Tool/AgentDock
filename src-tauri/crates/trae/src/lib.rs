@@ -30,6 +30,7 @@ pub struct Provider {
     checkins: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Test-only upstream origin (never set in production builds).
     pub test_host: Mutex<Option<String>>,
+    cleanup: Arc<gateway::cleanup::Cleanup>,
 }
 
 /// Released when an exclusive account operation finishes.
@@ -104,6 +105,7 @@ impl Provider {
     pub fn open(dir: &Path) -> Result<Arc<Self>, String> {
         let store = store::Store::open(dir)?;
         Ok(Arc::new(Self {
+            cleanup: gateway::cleanup::Cleanup::new(store.clone()),
             login: oauth::Login::new(store.clone()),
             store,
             busy: Mutex::new(HashSet::new()),
@@ -402,7 +404,12 @@ impl Provider {
         } else {
             None
         };
-        gateway::send(&a, config_id, input, details, started, host).await
+        gateway::send(&a, config_id, input, details, started, host, self.cleanup.clone()).await
+    }
+    /// Retry only gateway-owned sessions whose previous cleanup was interrupted.
+    pub async fn retry_remote_cleanup(&self) {
+        let host = if cfg!(any(test, feature = "fixtures")) { self.test_host.lock().unwrap().clone() } else { None };
+        self.cleanup.retry(host.as_deref()).await;
     }
 }
 

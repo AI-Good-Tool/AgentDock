@@ -18,6 +18,13 @@ pub async fn spawn_all(hub: Shared) {
     tokio::spawn(workbuddy::switch_bridge::run_local_monitor(hub.wb.clone()));
     // Unified daily check-in / credit claim for all three platforms.
     tokio::spawn(checkin_loop(hub.clone()));
+    let trae = hub.trae.clone();
+    tokio::spawn(async move {
+        loop {
+            trae.retry_remote_cleanup().await;
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    });
     if hub.settings().auto_start {
         let _ = crate::server::start(hub.clone()).await;
     }
