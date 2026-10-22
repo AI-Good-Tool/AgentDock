@@ -50,6 +50,14 @@ export interface CheckinSettings {
   onStartup: boolean
   scheduled: boolean
   intervalMinutes: number
+  schedule?: CheckinSchedule | null
+}
+export interface CheckinSchedule {
+  kind: 'minutes' | 'hours' | 'days' | 'daily' | 'date' | 'weekly'
+  every: number
+  time: string
+  weekdays: number[]
+  date: string
 }
 export interface CheckinStatus {
   running?: boolean

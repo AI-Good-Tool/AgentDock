@@ -361,7 +361,7 @@ pub fn reveal_data_dir(hub: State<'_, Shared>) -> Res {
 }
 
 // ───────────── 系统定时签到（macOS launchd / Windows 任务计划程序） ─────────────
-// Runs `AgentDock --claim` daily at 10:05 and 22:05 without the app open.
+// Wakes once a minute; --claim-due evaluates the same durable plan as the app.
 
 #[cfg(not(windows))]
 fn launchd_plist() -> std::path::PathBuf {
@@ -370,6 +370,8 @@ fn launchd_plist() -> std::path::PathBuf {
 
 #[cfg(windows)]
 const WIN_TASKS: [(&str, &str); 2] = [("AgentDock\\Claim-1005", "10:05"), ("AgentDock\\Claim-2205", "22:05")];
+#[cfg(windows)]
+const WIN_CHECKIN_TASK: &str = "AgentDock\\Checkin";
 
 #[cfg(windows)]
 fn schtasks(args: &[&str]) -> Option<std::process::Output> {
@@ -386,33 +388,43 @@ fn schtasks(args: &[&str]) -> Option<std::process::Output> {
 pub fn launchd_status() -> Value {
     #[cfg(windows)]
     {
-        let installed = WIN_TASKS
+        let legacy = WIN_TASKS
             .iter()
-            .all(|(name, _)| schtasks(&["/Query", "/TN", name]).is_some_and(|o| o.status.success()));
-        json!({"installed": installed, "path": "Task Scheduler\\AgentDock"})
+            .any(|(name, _)| schtasks(&["/Query", "/TN", name]).is_some_and(|o| o.status.success()));
+        let current = schtasks(&["/Query", "/TN", WIN_CHECKIN_TASK]).is_some_and(|o| o.status.success());
+        json!({"installed":current || legacy,"legacy":legacy,"path":"Task Scheduler\\AgentDock"})
     }
     #[cfg(not(windows))]
-    json!({"installed": launchd_plist().exists(), "path": launchd_plist()})
+    {
+        let path = launchd_plist();
+        let installed = path.exists();
+        let current = std::fs::read_to_string(&path).is_ok_and(|text| text.contains(crate::system_checkin::MARKER));
+        json!({"installed":installed,"legacy":installed && !current,"path":path})
+    }
 }
 
 #[cfg(windows)]
 #[tauri::command]
-pub async fn launchd_install(_hub: State<'_, Shared>, install: bool) -> Res {
+pub async fn launchd_install(hub: State<'_, Shared>, install: bool) -> Res {
+    let dir = hub.dir.clone();
     blocking(move || {
-        for (name, _) in WIN_TASKS {
-            let _ = schtasks(&["/Delete", "/TN", name, "/F"]);
-        }
         if !install {
+            for name in std::iter::once(WIN_CHECKIN_TASK).chain(WIN_TASKS.iter().map(|(name, _)| *name)) {
+                if schtasks(&["/Query", "/TN", name]).is_some_and(|o| o.status.success())
+                    && !schtasks(&["/Delete", "/TN", name, "/F"]).is_some_and(|o| o.status.success()) {
+                    return Err("无法移除 Windows 定时任务".into());
+                }
+            }
             return Ok(json!({"installed":false}));
         }
         let exe = std::env::current_exe().map_err(|_| "无法定位应用程序")?;
-        let command = format!("\"{}\" --claim", exe.display());
-        for (name, time) in WIN_TASKS {
-            let ok = schtasks(&["/Create", "/TN", name, "/SC", "DAILY", "/ST", time, "/TR", &command, "/F"])
-                .is_some_and(|o| o.status.success());
-            if !ok {
-                return Err("无法注册 Windows 定时任务".to_string());
-            }
+        let command = crate::system_checkin::windows_command(&exe, &dir);
+        if !schtasks(&["/Create", "/TN", WIN_CHECKIN_TASK, "/SC", "MINUTE", "/MO", "1", "/TR", &command, "/F"])
+            .is_some_and(|o| o.status.success()) {
+            return Err("无法注册 Windows 定时任务".into());
+        }
+        for (name, _) in WIN_TASKS {
+            let _ = schtasks(&["/Delete", "/TN", name, "/F"]);
         }
         Ok(json!({"installed":true,"path":"Task Scheduler\\AgentDock"}))
     })
@@ -424,40 +436,38 @@ pub async fn launchd_install(_hub: State<'_, Shared>, install: bool) -> Res {
 pub async fn launchd_install(hub: State<'_, Shared>, install: bool) -> Res {
     let plist = launchd_plist();
     let uid = String::from_utf8_lossy(&std::process::Command::new("/usr/bin/id").arg("-u").output().map_err(|e| e.to_string())?.stdout).trim().to_owned();
-    let _ = std::process::Command::new("/bin/launchctl").args(["bootout", &format!("gui/{uid}/com.agentdock.claim")]).status();
     if !install {
-        let _ = std::fs::remove_file(&plist);
+        let _ = std::process::Command::new("/bin/launchctl").args(["bootout", &format!("gui/{uid}/com.agentdock.claim")]).output();
+        if let Err(error) = std::fs::remove_file(&plist) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err("无法移除系统定时任务配置".into());
+            }
+        }
         return Ok(json!({"installed":false}));
     }
     let exe = std::env::current_exe().map_err(|_| "无法定位应用程序")?;
-    let log = hub.dir.join("auto-claim.log");
-    let xml = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.agentdock.claim</string>
-  <key>ProgramArguments</key>
-  <array><string>{}</string><string>--claim</string></array>
-  <key>StartCalendarInterval</key>
-  <array>
-    <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>5</integer></dict>
-    <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>5</integer></dict>
-  </array>
-  <key>StandardOutPath</key><string>{}</string>
-  <key>StandardErrorPath</key><string>{}</string>
-</dict>
-</plist>
-"#, exe.display(), log.display(), log.display());
+    let xml = crate::system_checkin::launchd_plist(&exe, &hub.dir);
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent).map_err(|_| "无法创建 LaunchAgents 目录")?;
     }
-    std::fs::write(&plist, xml).map_err(|_| "无法写入定时任务")?;
-    std::process::Command::new("/bin/launchctl")
+    let previous = std::fs::read(&plist).ok();
+    crate::app::write_private(&plist, xml.as_bytes())?;
+    let _ = std::process::Command::new("/bin/launchctl").args(["bootout", &format!("gui/{uid}/com.agentdock.claim")]).output();
+    let loaded = std::process::Command::new("/bin/launchctl")
         .args(["bootstrap", &format!("gui/{uid}")])
         .arg(&plist)
-        .status()
-        .map_err(|_| "无法注册定时任务")?;
-    Ok(json!({"installed":true,"path":plist,"log":log}))
+        .output().is_ok_and(|output| output.status.success());
+    if !loaded {
+        match previous {
+            Some(bytes) => {
+                crate::app::write_private(&plist, &bytes)?;
+                let _ = std::process::Command::new("/bin/launchctl").args(["bootstrap", &format!("gui/{uid}")]).arg(&plist).output();
+            }
+            None => { let _ = std::fs::remove_file(&plist); }
+        }
+        return Err("无法注册定时任务，已尝试恢复原配置".into());
+    }
+    Ok(json!({"installed":true,"path":plist,"log":hub.dir.join("auto-claim.log")}))
 }
 
 // ───────────────────────── WorkBuddy ─────────────────────────

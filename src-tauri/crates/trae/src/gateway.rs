@@ -14,6 +14,7 @@ use agentdock_core::{
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{collections::HashMap, time::{Duration, Instant}};
+mod catalog;
 
 const AGENT: &str = "solo_agent_remote";
 const MODELS_QUERY: &str = "/models?functions=solo_agent_remote%2Csolo_work_remote&show_custom_model=true";
@@ -57,34 +58,11 @@ fn valid_model_name(name: &str) -> bool {
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "._:/-".contains(c))
 }
 
-/// Raw `solo_agent_remote` model entries of the account's official Remote catalog.
-async fn remote_models(account: &Value, host_override: Option<&str>) -> Result<Vec<Value>, String> {
-    let mut req = http()
-        .get(format!("{}{MODELS_QUERY}", remote_base(account, host_override)?))
-        .timeout(Duration::from_secs(20));
-    for (k, v) in remote_headers(account) {
-        req = req.header(k, v);
-    }
-    let r = req.send().await.map_err(|_| "官方 Remote 模型目录连接失败")?;
-    let status = r.status();
-    let j: Value = r.json().await.map_err(|_| "官方 Remote 模型目录响应不是 JSON")?;
-    if !status.is_success() || j["code"].as_i64().is_some_and(|c| c != 0) {
-        return Err(format!("官方 Remote 模型目录查询失败（HTTP {}）", status.as_u16()));
-    }
-    let list = j["data"]["list"].as_array().ok_or("官方 Remote 模型目录格式变化")?;
-    Ok(list
-        .iter()
-        .filter(|g| g["function"] == AGENT)
-        .flat_map(|g| g["models"].as_array().cloned().unwrap_or_default())
-        .filter(|m| m["name"].as_str().is_some_and(valid_model_name))
-        .collect())
-}
-
 /// The account's Remote Agent models, stored on the account as `models`.
 pub async fn model_catalog(account: &Value) -> Result<Vec<Value>, String> {
     let mut seen = std::collections::HashSet::new();
-    let models: Vec<Value> = remote_models(account, None)
-        .await?
+    let models: Vec<Value> = catalog::fetch(account, None, &mut RequestDetails::default())
+        .await.map_err(|error| error.message)?
         .into_iter()
         .filter(|m| seen.insert(m["name"].as_str().unwrap_or("").to_owned()))
         .map(|m| {
@@ -422,13 +400,8 @@ pub async fn send(
     let headers = remote_headers(account);
 
     // 1) Resolve the exact catalog entry (the full object is sent as custom_model).
-    let catalog = remote_models(account, host_override.as_deref()).await.map_err(|e| {
-        let mut f = fail(details, 502, "upstream_http_error", &e);
-        if e.contains("401") || e.contains("403") {
-            f = f.with_effect(AccountEffect::Cooldown(60));
-        }
-        f
-    })?;
+    let catalog = catalog::fetch(account, host_override.as_deref(), details).await?;
+    let catalog_attempts = details.upstream_summary["catalogAttempts"].clone();
     let wanted: Vec<String> = [config_id.clone(), chat["model"].as_str().map(str::to_owned)]
         .into_iter()
         .flatten()
@@ -458,8 +431,14 @@ pub async fn send(
         query.push(json!({"type":"image","data":{"image_id":image_id}}));
     }
     details.upstream_url = Some(format!("{base}/chat_sessions"));
+    // The next HTTP operation has not received a response yet; do not attribute
+    // a successful catalog response to a failed session connection.
+    details.upstream_status = None;
+    details.upstream_request_id = None;
+    details.content_type = None;
     details.upstream_summary = json!({
         "transport": "trae-remote-agent",
+        "catalogAttempts": catalog_attempts,
         "model": model_name,
         "messageCount": chat["messages"].as_array().map_or(0, Vec::len),
         "clientTools": tools.len(),

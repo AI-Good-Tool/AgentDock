@@ -2,8 +2,8 @@
 //! platforms plus WorkBuddy's credit refresh and local client monitor.
 use crate::app::Shared;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use crate::checkin_schedule::{self, Poll, RunLock};
 
 pub async fn spawn_all(hub: Shared) {
     // Debugging aid: inspect the UI without running any scheduled account action.
@@ -24,63 +24,62 @@ pub async fn spawn_all(hub: Shared) {
 }
 
 const STARTUP_DELAY: Duration = Duration::from_secs(10);
-static PASS_RUNNING: AtomicBool = AtomicBool::new(false);
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Startup pass (10 s after launch) and then every `interval_minutes`, both
-/// switchable; settings changes wake the loop so new values apply at once.
+/// The same durable plan is evaluated by the application and system task.
 async fn checkin_loop(hub: Shared) {
     let launched = Instant::now();
     let mut startup_pending = true;
-    let mut last: Option<Instant> = None;
     loop {
-        let c = hub.settings().checkin;
+        let settings = hub.settings();
+        let c = &settings.checkin;
         if !c.on_startup {
             startup_pending = false;
         }
-        let interval = Duration::from_secs(u64::from(c.interval_minutes) * 60);
-        let next = if startup_pending {
-            Some(launched + STARTUP_DELAY)
-        } else if c.scheduled {
-            Some(last.unwrap_or(launched) + interval)
-        } else {
-            None
+        if startup_pending && launched.elapsed() >= STARTUP_DELAY {
+            startup_pending = false;
+            run_pass(&hub, "startup").await;
+            continue;
+        }
+        let now = chrono::Utc::now();
+        let next = match checkin_schedule::poll(&hub.dir, c, &settings.timezone, now) {
+            Ok(Poll::Due { lock, next }) => {
+                hub.checkin.lock().unwrap()["nextRun"] = json!(next);
+                run_locked(&hub, "scheduled", lock).await;
+                continue;
+            }
+            Ok(Poll::Waiting(next)) => next,
+            Ok(Poll::Busy) => hub.checkin.lock().unwrap()["nextRun"].as_i64().filter(|next| *next > now.timestamp_millis()),
+            Err(error) => {
+                agentdock_core::applog::info("checkin", || (error, Value::Null));
+                None
+            }
         };
-        let next_ms = next.map(|at| now_ms() + at.saturating_duration_since(Instant::now()).as_millis() as i64);
-        hub.checkin.lock().unwrap()["nextRun"] = json!(next_ms);
-        match next {
-            Some(at) if at <= Instant::now() => {
-                let trigger = if startup_pending { "startup" } else { "scheduled" };
-                startup_pending = false;
-                last = Some(Instant::now());
-                run_pass(&hub, trigger).await;
-            }
-            Some(at) => {
-                tokio::select! {
-                    _ = tokio::time::sleep_until(at.into()) => {}
-                    _ = hub.checkin_wake.notified() => {}
-                }
-            }
-            None => hub.checkin_wake.notified().await,
+        let startup = startup_pending.then(|| now.timestamp_millis() + (STARTUP_DELAY.saturating_sub(launched.elapsed())).as_millis() as i64);
+        let next = [startup, next].into_iter().flatten().min();
+        hub.checkin.lock().unwrap()["nextRun"] = json!(next);
+        // Re-evaluate wall time after sleep/clock changes and external passes.
+        let delay = next.map(|next| (next - now.timestamp_millis()).clamp(250, 30_000) as u64).unwrap_or(30_000);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
+            _ = hub.checkin_wake.notified() => {}
         }
     }
 }
 
 /// One check-in pass over every enabled platform. Overlapping passes are skipped.
 pub async fn run_pass(hub: &Shared, trigger: &str) -> Value {
-    if PASS_RUNNING.swap(true, Ordering::AcqRel) {
-        return json!({"skipped": "running"});
+    match checkin_schedule::try_run_lock(&hub.dir) {
+        Ok(Some(lock)) => run_locked(hub, trigger, lock).await,
+        Ok(None) => json!({"skipped":"running"}),
+        Err(error) => json!({"ok":false,"message":error}),
     }
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            PASS_RUNNING.store(false, Ordering::Release);
-        }
-    }
-    let _reset = Reset;
+}
+
+async fn run_locked(hub: &Shared, trigger: &str, _lock: RunLock) -> Value {
     let c = hub.settings().checkin;
     hub.checkin.lock().unwrap()["running"] = json!(true);
     agentdock_core::applog::info("checkin", || {
@@ -215,7 +214,15 @@ pub async fn qoder_auto_claim(hub: &Shared) -> Option<Vec<Value>> {
     results
 }
 
-/// `--claim`: one unattended pass for launchd, honoring the per-platform switches.
-pub async fn claim_once(hub: &Shared) -> Value {
-    run_pass(hub, "launchd").await
+/// The system scheduler wakes once per minute; it executes only due slots.
+pub async fn claim_due(hub: &Shared) -> Result<Value, String> {
+    let settings = hub.settings();
+    match checkin_schedule::poll(&hub.dir, &settings.checkin, &settings.timezone, chrono::Utc::now())? {
+        Poll::Due { lock, next } => {
+            hub.checkin.lock().unwrap()["nextRun"] = json!(next);
+            Ok(run_locked(hub, "launchd", lock).await)
+        }
+        Poll::Waiting(next) => Ok(json!({"skipped":"not_due","nextRun":next})),
+        Poll::Busy => Ok(json!({"skipped":"running"})),
+    }
 }

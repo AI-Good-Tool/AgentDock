@@ -7,12 +7,14 @@ pub mod app_update;
 pub mod applog;
 pub mod backup;
 pub mod catalog;
+pub mod checkin_schedule;
 pub mod commands;
 pub mod logs;
 pub mod paths;
 pub mod scheduler;
 pub mod server;
 pub mod settings;
+pub mod system_checkin;
 pub mod tasks;
 #[cfg(test)]
 mod tests;

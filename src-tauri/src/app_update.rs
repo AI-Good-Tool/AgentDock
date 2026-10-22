@@ -526,7 +526,7 @@ pub async fn app_update_download(
                 &value.asset_name,
                 value.size_bytes,
                 Some(value.size_bytes),
-                Some("SHA256 校验通过，等待确认安装"),
+                Some("SHA256 校验通过，准备安装更新"),
             );
             Ok(value)
         }
@@ -590,6 +590,14 @@ pub(super) fn system_command(program: &str) -> Command {
     }
     cmd
 }
+async fn drain_gateway(app: &AppHandle) {
+    let hub = app.state::<crate::app::Shared>().inner().clone();
+    crate::server::stop(&hub);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !hub.active.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
 #[tauri::command]
 pub async fn app_update_install(app: AppHandle, confirmed: bool) -> Result<(), String> {
     if !confirmed {
@@ -605,13 +613,14 @@ pub async fn app_update_install(app: AppHandle, confirmed: bool) -> Result<(), S
         c.installing = true;
         receipt
     };
-    // Stop taking new gateway requests and let in-flight ones finish before the app exits.
-    let hub = app.state::<crate::app::Shared>().inner().clone();
-    crate::server::stop(&hub);
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    while !hub.active.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    // The macOS helper waits for this process to exit, so stage before stopping
+    // the service. Windows installers may terminate the app themselves.
+    #[cfg(windows)]
+    let was_running = {
+        let running = app.state::<crate::app::Shared>().running();
+        drain_gateway(&app).await;
+        running
+    };
     let handle = app.clone();
     let result = tokio::task::spawn_blocking(move || {
         verify_receipt(&receipt, &parse_version(env!("CARGO_PKG_VERSION"))?)?;
@@ -621,6 +630,8 @@ pub async fn app_update_install(app: AppHandle, confirmed: bool) -> Result<(), S
     .map_err(|_| "准备更新安装任务失败".to_string())
     .and_then(|r| r);
     if result.is_ok() {
+        #[cfg(not(windows))]
+        drain_gateway(&app).await;
         app.exit(0);
     }
     if result.is_err() {
@@ -629,6 +640,11 @@ pub async fn app_update_install(app: AppHandle, confirmed: bool) -> Result<(), S
             .lock()
             .map_err(|_| "更新状态锁异常")?
             .installing = false;
+        #[cfg(windows)]
+        if was_running {
+            let hub = app.state::<crate::app::Shared>().inner().clone();
+            crate::server::start(hub).await?;
+        }
     }
     result
 }

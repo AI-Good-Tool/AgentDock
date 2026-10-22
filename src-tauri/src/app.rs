@@ -82,6 +82,7 @@ impl Hub {
         let settings_path = dir.join("settings.json");
         let existed = settings_path.exists();
         let mut settings = read_settings(&settings_path);
+        let migrate_checkin_switches = existed && settings.version < 2;
         let key_path = dir.join("api-key");
         let key = match std::fs::read_to_string(&key_path) {
             Ok(k) if crate::api_key::validate(k.trim()).is_ok() => k.trim().to_owned(),
@@ -95,7 +96,7 @@ impl Hub {
         let qoder = qoder::gateway::Provider::new()?;
         let trae = trae::Provider::open(&dir.join("trae"))?;
         if settings.upgrade() {
-            if existed {
+            if migrate_checkin_switches {
                 // Carry the per-app automatic check-in switches into the unified schedule.
                 settings.checkin.workbuddy = wb.store.lock().unwrap().auto_checkin;
                 settings.checkin.qoder = qoder::qcore::load_settings()["autoClaim"]
@@ -197,6 +198,8 @@ impl Hub {
                 q["autoClaim"] = json!(next.checkin.qoder);
                 qoder::qcore::save_settings(&q);
             }
+        }
+        if next.checkin != previous.checkin || next.timezone != previous.timezone {
             self.checkin_wake.notify_one();
         }
         Ok(next)

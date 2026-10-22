@@ -5,7 +5,7 @@ import { Modal, Message } from '@arco-design/web-vue'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { IconUser, IconCode, IconHeart, IconMessage, IconRefresh, IconDownload, IconLink, IconArrowRight } from '@arco-design/web-vue/es/icon'
 import BrandMark from '../components/BrandMark.vue'
-import { call, desktop, isWindows } from '../api'
+import { call, desktop, isWindows, previewMode } from '../api'
 import { t } from '../i18n'
 import { state } from '../store'
 
@@ -32,7 +32,7 @@ interface Progress {
   totalBytes: number | null
   message: string | null
 }
-const version = computed(() => state.app?.version ?? '1.0.1')
+const version = computed(() => state.app?.version ?? '1.0.2')
 const info = ref<UpdateInfo | null>(null)
 const downloaded = ref<Download | null>(null)
 const checking = ref(false)
@@ -65,7 +65,7 @@ async function open(destination: string) {
   }
 }
 async function check() {
-  if (busy.value || !desktop) return
+  if (busy.value || (!desktop && !previewMode)) return
   checking.value = true
   error.value = ''
   try {
@@ -82,12 +82,13 @@ async function check() {
 function download() {
   const latest = info.value?.latestVersion
   if (!latest || !info.value?.canDownload || busy.value || !listenerReady.value) return
+  if (downloaded.value?.version === latest) return install()
   Modal.confirm({
-    title: t(`下载 AgentDock ${latest}？`, `Download AgentDock ${latest}?`),
-    content: t(
-      `来源：AI-Good-Tool/AgentDock Releases，大小 ${mb(info.value.assetSize)}。下载后会校验 SHA256，不会自动安装，也不会中断当前请求。`,
-      `From AI-Good-Tool/AgentDock Releases, ${mb(info.value.assetSize)}. The SHA256 is verified after download; nothing is installed or interrupted automatically.`
-    ),
+    title: isWindows ? t(`更新至 v${latest}？`, `Update to v${latest}?`) : t(`更新至 v${latest} 并重启？`, `Update to v${latest} and restart?`),
+    content: t(`将从本项目 Releases 下载 ${mb(info.value.assetSize)} 并校验 SHA256。`, `Download ${mb(info.value.assetSize)} from this project's Releases and verify SHA256. `) + (isWindows
+      ? t('下载完成后自动打开安装向导并退出应用。反代将停止，进行中的请求最多等待 15 秒。', 'Once downloaded, the installer opens and the app quits. The gateway stops, allowing up to 15 seconds for active requests.')
+      : t('下载完成后自动安装并重启，失败时保留旧版本以便恢复。安装时反代将停止，进行中的请求最多等待 15 秒。', 'Once downloaded, the update installs and restarts automatically, keeping the previous app for recovery on failure. The gateway stops during installation, allowing up to 15 seconds for active requests.')),
+    okText: t('开始更新', 'Start update'),
     onOk: () => void startDownload(latest),
   })
 }
@@ -99,6 +100,10 @@ async function startDownload(latest: string) {
   progress.value = null
   try {
     downloaded.value = await call<Download>('app_update_download', { expectedVersion: latest, confirmed: true })
+    if (!cancelling.value) {
+      downloading.value = false
+      await startInstall()
+    }
   } catch (e) {
     if (!cancelling.value) error.value = String(e)
   } finally {
@@ -118,24 +123,35 @@ async function cancel() {
 function install() {
   if (!downloaded.value || busy.value) return
   Modal.confirm({
-    title: t('安装更新并退出应用？', 'Install the update and quit?'),
+    title: isWindows ? t('安装更新并退出应用？', 'Install the update and quit?') : t('安装更新并重启？', 'Install and restart?'),
     content: isWindows
       ? t('反代会停止（进行中的请求最多等待 15 秒），然后打开安装向导；安装完成后重新打开 AgentDock。安装包未经开发者证书签名，请按系统提示确认。', 'The gateway stops (in-flight requests get up to 15 s), then the installer opens; reopen AgentDock afterwards. The installer is not code-signed; follow the system prompts.')
       : t('反代会停止（进行中的请求最多等待 15 秒），然后替换已安装的应用并自动重启；失败会自动回滚到当前版本。', 'The gateway stops (in-flight requests get up to 15 s), then the installed app is replaced and restarted; failures roll back to this version.'),
     okText: t('确认安装并退出', 'Install and quit'),
-    onOk: async () => {
-      installing.value = true
-      error.value = ''
-      try {
-        await call('app_update_install', { confirmed: true })
-      } catch (e) {
-        error.value = String(e)
-        installing.value = false
-      }
-    },
+    onOk: () => void startInstall(),
   })
 }
+async function startInstall() {
+  installing.value = true
+  error.value = ''
+  try {
+    await call('app_update_install', { confirmed: true })
+    if (previewMode) {
+      installing.value = false
+      downloaded.value = null
+      info.value = null
+      Message.success(t('预览：已模拟安装与重启，未修改本机应用', 'Preview: installation and restart simulated; no installed app was changed'))
+    }
+  } catch (e) {
+    error.value = String(e)
+    installing.value = false
+  }
+}
 onMounted(async () => {
+  if (previewMode) {
+    listenerReady.value = true
+    return
+  }
   if (!desktop) return
   try {
     unlisten = await listen<Progress>('agentdock-update-progress', (e) => (progress.value = e.payload))
@@ -165,7 +181,7 @@ onUnmounted(() => unlisten?.())
         <span class="about-symbol" :class="l.tone"><component :is="l.icon" /></span>
         <span class="about-text"><strong>{{ l.title }}</strong><small>{{ l.desc }}</small></span>
       </button>
-      <button class="about-card" :disabled="!desktop || busy" @click="check">
+      <button class="about-card" :disabled="(!desktop && !previewMode) || busy" @click="check">
         <span class="about-symbol purple"><IconRefresh :spin="checking" /></span>
         <span class="about-text"
           ><strong>{{ checking ? t('正在检查…', 'Checking…') : t('检查更新', 'Check for updates') }}</strong
@@ -175,8 +191,8 @@ onUnmounted(() => unlisten?.())
       <button class="about-card" :disabled="!info?.canDownload || busy || !listenerReady" @click="download">
         <span class="about-symbol green"><IconDownload /></span>
         <span class="about-text"
-          ><strong>{{ downloading ? t('正在下载…', 'Downloading…') : t('在线更新', 'Update in app') }}</strong
-          ><small>{{ info?.hasUpdate ? t(`下载 v${info.latestVersion}（${mb(info.assetSize)}）`, `Download v${info.latestVersion} (${mb(info.assetSize)})`) : t('检查到新版本后可直接下载并安装', 'Available once a newer version is found') }}</small></span
+          ><strong>{{ installing ? t('正在安装…', 'Installing…') : downloading ? t('正在下载…', 'Downloading…') : t('在线更新', 'Update in app') }}</strong
+          ><small>{{ info?.hasUpdate ? t(`更新至 v${info.latestVersion}（${mb(info.assetSize)}）`, `Update to v${info.latestVersion} (${mb(info.assetSize)})`) : t('检查到新版本后可直接下载并安装', 'Available once a newer version is found') }}</small></span
         >
       </button>
     </div>
@@ -201,12 +217,13 @@ onUnmounted(() => unlisten?.())
       <template v-if="downloaded">
         <p>{{ t(`安装包已下载并通过 SHA256 校验 · v${downloaded.version}`, `Downloaded and SHA256-verified · v${downloaded.version}`) }}</p>
         <small class="update-hash mono">SHA256 {{ downloaded.sha256 }}</small>
-        <a-button type="primary" :loading="installing" :disabled="busy && !installing" @click="install">{{ installing ? t('正在准备安装…', 'Preparing…') : t('安装更新并退出', 'Install and quit') }}</a-button>
+        <p v-if="installing">{{ progress?.status === 'installing' && progress.message ? progress.message : t('正在准备安装，请等待应用重启…', 'Preparing the update; waiting for the app to restart…') }}</p>
+        <a-button v-else type="primary" :disabled="busy" @click="install">{{ isWindows ? t('安装更新并退出', 'Install and quit') : t('安装更新并重启', 'Install and restart') }}</a-button>
       </template>
       <p v-if="error" class="error-text" role="alert">{{ error }}</p>
       <a-button size="small" @click="open('releases')">{{ t('前往 Releases 手动下载', 'Open Releases') }} <IconArrowRight /></a-button>
     </div>
-    <p class="about-note">{{ t('只在点击检查时连接 GitHub，不发送任何账号凭据；检查和下载不会影响反代，安装前需要再次确认。', 'GitHub is contacted only when you check; no account credentials are sent. Checking and downloading never affect the gateway; installing asks again.') }}</p>
+    <p class="about-note">{{ t('只在检查和更新时连接 GitHub，不发送账号凭据。点击在线更新并确认后，将自动下载、校验和安装；macOS 会自动重启应用。', 'GitHub is contacted only for checks and updates; account credentials are never sent. Once confirmed, updates download, verify and install automatically; macOS restarts the app.') }}</p>
   </section>
 </template>
 

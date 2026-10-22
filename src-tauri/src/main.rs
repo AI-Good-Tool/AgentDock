@@ -10,12 +10,18 @@ fn main() {
             .position(|a| a == flag)
             .and_then(|i| args.get(i + n).cloned())
     };
-    if has("--server") || has("--claim") || has("--dump-state") {
+    if let Some(dir) = arg("--data-dir", 1) {
+        std::env::set_var("AGENTDOCK_HOME", dir);
+    }
+    if has("--server") || has("--claim") || has("--claim-due") || has("--dump-state") {
         let runtime = tokio::runtime::Runtime::new().expect("async runtime");
         let result: Result<(), String> = runtime.block_on(async {
             let hub = agentdock::open_hub()?;
-            if has("--claim") {
-                let r = agentdock::tasks::claim_once(&hub).await;
+            if has("--claim") || has("--claim-due") {
+                let r = agentdock::tasks::claim_due(&hub).await?;
+                if r["skipped"].is_string() {
+                    return Ok(());
+                }
                 let text = serde_json::to_string_pretty(&r).unwrap();
                 println!("{text}");
                 // launchd redirects stdout into this log on macOS; Task Scheduler has no such option.

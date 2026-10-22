@@ -1,17 +1,19 @@
 <script setup lang="ts">
 import ProviderMark from '../components/ProviderMark.vue'
-import { computed, ref, onMounted, watch } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
 import { IconCalendar, IconGift, IconDelete, IconPlayArrow, IconClockCircle } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
 import CheckinPage from '../components/workbuddy/CheckinPage.vue'
+import CheckinScheduleEditor from '../components/CheckinScheduleEditor.vue'
+import { defaultCheckinSchedule, describeCheckinSchedule } from '../checkin-schedule'
 import { call, isWindows, type CheckinSettings, type ProviderKey } from '../api'
 import { t, fmtDateTime, fmtNumber } from '../i18n'
 import { state, act, busy, refreshPool, refreshApp } from '../store'
 
 const tab = ref<'workbuddy' | 'qoder' | 'trae'>('workbuddy')
 const progress = ref({ completed: 0, total: 0, failed: 0 })
-const launchd = ref<{ installed: boolean } | null>(null)
+const launchd = ref<{ installed: boolean; legacy?: boolean } | null>(null)
 onMounted(async () => {
   refreshPool()
   launchd.value = await call('launchd_status').catch(() => null)
@@ -26,20 +28,13 @@ const status = computed(() => state.app?.checkin ?? {})
 function setPlan(patch: Partial<CheckinSettings>, success?: string) {
   return act(`checkin:${Object.keys(patch).join(',')}`, () => call('save_settings', { patch: { checkin: patch } }), success ?? t('签到设置已保存', 'Check-in settings saved'), [refreshApp])
 }
-const interval = ref(60)
-watch(() => plan.value.intervalMinutes, (v) => (interval.value = v), { immediate: true })
-function saveInterval() {
-  const v = Math.round(Number(interval.value) || 60)
-  if (v !== plan.value.intervalMinutes) setPlan({ intervalMinutes: v })
-}
-const intervalText = computed(() => {
-  const m = plan.value.intervalMinutes
-  return m % 60 === 0 ? t(`每 ${m / 60} 小时`, `every ${m / 60} h`) : t(`每 ${m} 分钟`, `every ${m} min`)
-})
+const schedule = computed(() => plan.value.schedule ?? (plan.value.intervalMinutes !== 60
+  ? { ...defaultCheckinSchedule(), kind: 'minutes' as const, every: plan.value.intervalMinutes }
+  : defaultCheckinSchedule()))
 const scheduleHint = computed(() => {
   const parts: string[] = []
   if (plan.value.onStartup) parts.push(t('启动后 10 秒', '10 s after launch'))
-  if (plan.value.scheduled) parts.push(intervalText.value)
+  if (plan.value.scheduled) parts.push(describeCheckinSchedule(schedule.value))
   return parts.length ? parts.join(t('，之后', ', then ')) + t('执行', '') : t('仅手动执行', 'Manual only')
 })
 const platformTiles = computed(() => [
@@ -64,8 +59,8 @@ function resultText(key: ProviderKey) {
 async function runNow() {
   await act('checkin-run', () => call('checkin_run_now'), t('签到已执行', 'Check-in pass finished'), [refreshApp, refreshPool])
 }
-function toggleLaunchd() {
-  const install = !launchd.value?.installed
+function toggleLaunchd(forceInstall = false) {
+  const install = forceInstall || !launchd.value?.installed
   return act(
     'launchd',
     async () => {
@@ -74,7 +69,7 @@ function toggleLaunchd() {
       return r
     },
     install
-      ? t('已安装：每天 10:05 和 22:05 运行一次签到（无需打开应用）', 'Installed: runs daily at 10:05 and 22:05 without the app')
+      ? t('已安装：无需打开应用，按上面的签到计划执行', 'Installed: follows the check-in schedule without the app')
       : t('已移除系统定时任务', 'Scheduled task removed'),
     []
   )
@@ -188,14 +183,12 @@ async function traeAll() {
       <div class="control end"><a-switch :model-value="plan.onStartup" @change="(v) => setPlan({ onStartup: !!v })" /></div>
     </div>
     <div class="field-row">
-      <div><b>{{ t('定时签到', 'Scheduled check-in') }}</b><small>{{ t('按间隔重复执行，默认每 1 小时（5–1440 分钟）', 'Repeats at the interval; default every hour (5–1440 minutes)') }}</small></div>
+      <div><b>{{ t('定时签到', 'Scheduled check-in') }}</b><small>{{ t('支持间隔、每天、指定日期和星期，默认每天 07:00', 'Intervals, daily, specific dates or weekdays; defaults to 07:00 daily') }}</small></div>
       <div class="control end">
-        <a-input-number v-model="interval" :min="5" :max="1440" :step="5" :disabled="!plan.scheduled" style="width: 150px" @blur="saveInterval" @press-enter="saveInterval">
-          <template #suffix>{{ t('分钟', 'min') }}</template>
-        </a-input-number>
         <a-switch :model-value="plan.scheduled" @change="(v) => setPlan({ scheduled: !!v })" />
       </div>
     </div>
+    <CheckinScheduleEditor :model-value="schedule" :disabled="!plan.scheduled" :saving="busy('checkin:schedule')" @save="(schedule) => setPlan({ schedule })" />
     <div class="field-row">
       <div><b>{{ t('执行状态', 'Status') }}</b><small>{{ scheduleHint }}</small></div>
       <div class="control end plan-status">
@@ -204,10 +197,11 @@ async function traeAll() {
       </div>
     </div>
     <div class="field-row" style="border-bottom: none">
-      <div><b>{{ isWindows ? t('系统定时任务（任务计划程序）', 'Scheduled task (Task Scheduler)') : t('系统定时任务', 'Scheduled task (launchd)') }}</b><small>{{ t('不开应用也能签到：每天 10:05 / 22:05 按上面的平台开关执行一次', 'Runs daily at 10:05 / 22:05 without the app, honoring the platform switches above') }}</small></div>
+      <div><b>{{ isWindows ? t('系统定时任务（任务计划程序）', 'Scheduled task (Task Scheduler)') : t('系统定时任务', 'Scheduled task (launchd)') }}</b><small>{{ t('不开应用也能签到：每分钟检查上面的计划，按偏好设置时区执行；修改计划无需重新安装', 'Checks the shared schedule every minute without the app; uses the preferred time zone and picks up schedule changes automatically') }}</small></div>
       <div class="control end">
-        <span class="state-pill" :class="{ off: !launchd?.installed }">{{ launchd?.installed ? t('已安装', 'Installed') : t('未安装', 'Not installed') }}</span>
-        <a-button size="small" :loading="busy('launchd')" @click="toggleLaunchd">{{ launchd?.installed ? t('移除', 'Remove') : t('安装', 'Install') }}</a-button>
+        <span class="state-pill" :class="{ off: !launchd?.installed || launchd?.legacy }">{{ launchd?.legacy ? t('需更新', 'Update required') : launchd?.installed ? t('已安装', 'Installed') : t('未安装', 'Not installed') }}</span>
+        <a-button v-if="launchd?.legacy" size="small" type="primary" :loading="busy('launchd')" @click="toggleLaunchd(true)">{{ t('更新任务', 'Update task') }}</a-button>
+        <a-button size="small" :loading="busy('launchd')" @click="toggleLaunchd()">{{ launchd?.installed ? t('移除', 'Remove') : t('安装', 'Install') }}</a-button>
       </div>
     </div>
   </section>
@@ -293,8 +287,8 @@ async function traeAll() {
       <p class="hint">
         {{
           t(
-            '不打开应用也能领取：在上方「自动签到计划」安装系统定时任务（每天 10:05 / 22:05）。',
-            'To claim without the app, install the scheduled task in the schedule above (daily 10:05 / 22:05).'
+            '不打开应用也能领取：在上方「自动签到计划」安装系统定时任务，按同一计划执行。',
+            'To claim without the app, install the system task above; it follows the same schedule.'
           )
         }}
       </p>

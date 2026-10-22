@@ -3,6 +3,7 @@
 const now = Date.now()
 const day = 86400000
 const iso = (t: number) => new Date(t).toISOString()
+let updateCancelled = false
 const settings = {
   port: 24800,
   strategy: 'roundRobin',
@@ -19,9 +20,9 @@ const settings = {
   lang: new URLSearchParams(location.search).get('lang') || 'system',
   timezone: 'system',
   tokenFormat: 'km',
-  checkin: { workbuddy: true, qoder: true, trae: true, onStartup: true, scheduled: true, intervalMinutes: 60 },
+  checkin: { workbuddy: true, qoder: true, trae: true, onStartup: true, scheduled: true, intervalMinutes: 60, schedule: { kind: 'daily', every: 1, time: '07:00', weekdays: [1, 2, 3, 4, 5], date: '' } },
   logging: true,
-  version: 2,
+  version: 3,
 } as Record<string, any>
 const checkinStatus = {
   trigger: 'startup',
@@ -228,6 +229,19 @@ export function preview(command: string, args?: Record<string, any>): unknown {
       return { ok: true, count: 1, message: '已导入 1 个账号' }
     case 'app_update_check':
       return { currentVersion: '1.0.0', latestVersion: '1.1.0', releaseUrl: 'https://github.com/AI-Good-Tool/AgentDock/releases', target: 'aarch64-apple-darwin', assetName: 'AgentDock_1.1.0_aarch64-apple-darwin.dmg', assetSize: 8071168, notes: '- Windows 支持\n- 关于页面与在线更新', hasUpdate: true, canDownload: true, reason: '已找到匹配平台且提供 SHA256 的安装包' }
+    case 'app_update_download':
+      updateCancelled = false
+      return new Promise((resolve, reject) => setTimeout(() => {
+        if (updateCancelled) return reject(new Error('下载已取消'))
+        if (new URLSearchParams(location.search).get('update') === 'download-error') return reject(new Error('预览：模拟下载校验失败'))
+        resolve({ version: '1.1.0', path: '/preview/AgentDock.dmg', sha256: 'a'.repeat(64), sizeBytes: 8071168 })
+      }, new URLSearchParams(location.search).get('update') === 'slow' ? 10000 : 1500))
+    case 'app_update_cancel_download':
+      updateCancelled = true
+      return null
+    case 'app_update_install':
+      if (new URLSearchParams(location.search).get('update') === 'install-error') throw new Error('预览：模拟安装目录不可写')
+      return null
     case 'checkin_run_now':
       return checkinStatus
     case 'pool_snapshot':

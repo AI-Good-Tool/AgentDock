@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 pub const DEFAULT_PORT: u16 = 24800;
 pub const DEFAULT_CONCURRENCY: usize = 4;
 /// Bumped when a default changes in a way saved files should pick up.
-pub const SETTINGS_VERSION: u32 = 2;
+pub const SETTINGS_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -55,9 +55,12 @@ pub struct CheckinSettings {
     pub trae: bool,
     /// Run one pass 10 seconds after AgentDock starts.
     pub on_startup: bool,
-    /// Repeat the pass every `interval_minutes` while the app runs.
+    /// Enable the shared application/system schedule.
     pub scheduled: bool,
+    /// Legacy interval, retained when importing older settings.
     pub interval_minutes: u32,
+    #[serde(default)]
+    pub schedule: Option<crate::checkin_schedule::Schedule>,
 }
 impl Default for CheckinSettings {
     fn default() -> Self {
@@ -68,10 +71,24 @@ impl Default for CheckinSettings {
             on_startup: true,
             scheduled: true,
             interval_minutes: 60,
+            schedule: Some(crate::checkin_schedule::Schedule::default()),
         }
     }
 }
 impl CheckinSettings {
+    pub fn schedule(&self) -> crate::checkin_schedule::Schedule {
+        self.schedule.clone().unwrap_or_else(|| {
+            if self.interval_minutes == 60 {
+                crate::checkin_schedule::Schedule::default()
+            } else {
+                crate::checkin_schedule::Schedule {
+                    kind: crate::checkin_schedule::Kind::Minutes,
+                    every: self.interval_minutes,
+                    ..Default::default()
+                }
+            }
+        })
+    }
     pub fn enabled(&self, provider: ProviderKind) -> bool {
         match provider {
             ProviderKind::Workbuddy => self.workbuddy,
@@ -160,6 +177,9 @@ impl Settings {
                 }
             }
         }
+        if self.version < 3 && self.checkin.schedule.is_none() {
+            self.checkin.schedule = Some(self.checkin.schedule());
+        }
         self.version = SETTINGS_VERSION;
         true
     }
@@ -175,9 +195,8 @@ impl Settings {
                 return Err("单账号并发需为 1–16".into());
             }
         }
-        if !(5..=1440).contains(&self.checkin.interval_minutes) {
-            return Err("定时签到间隔需为 5–1440 分钟".into());
-        }
+        self.checkin.schedule().validate()?;
+        crate::checkin_schedule::validate_zone(&self.timezone)?;
         if !["light", "dark", "system"].contains(&self.theme.as_str()) {
             return Err("主题无效".into());
         }
@@ -188,6 +207,30 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkin_upgrade_defaults_to_seven_and_preserves_custom_intervals() {
+        use crate::checkin_schedule::{Kind, Schedule};
+        for (minutes, kind, every) in [(60, Kind::Daily, 1), (45, Kind::Minutes, 45)] {
+            let mut settings: Settings = serde_json::from_value(serde_json::json!({
+                "version": 2, "checkin": {"intervalMinutes": minutes, "scheduled": false}
+            })).unwrap();
+            assert!(settings.checkin.schedule.is_none());
+            assert!(settings.upgrade());
+            let schedule = settings.checkin.schedule();
+            assert_eq!(schedule.kind, kind);
+            assert_eq!(schedule.every, every);
+            assert_eq!(schedule.time, "07:00");
+            assert!(!settings.checkin.scheduled);
+            settings.validate().unwrap();
+        }
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "version": 2, "checkin": {"schedule": {"kind":"weekly", "time":"09:30", "weekdays":[7]}}
+        })).unwrap();
+        settings.upgrade();
+        assert_eq!(settings.checkin.schedule().kind, Kind::Weekly);
+        assert_eq!(settings.checkin.schedule().weekdays, vec![7]);
+        assert_eq!(Settings::default().checkin.schedule(), Schedule::default());
+    }
     #[test]
     fn defaults_cover_every_provider_and_partial_files_load() {
         let s: Settings = serde_json::from_str(r#"{"port":25000,"strategy":"creditFirst"}"#).unwrap();
@@ -215,7 +258,8 @@ mod tests {
         assert_eq!(Settings::default().scope(ProviderKind::Workbuddy).concurrency, 4);
         assert_eq!(Settings::default().checkin.interval_minutes, 60);
         let mut bad = Settings::default();
-        bad.checkin.interval_minutes = 1;
+        bad.checkin.schedule = None;
+        bad.checkin.interval_minutes = 0;
         assert!(bad.validate().is_err());
     }
 }

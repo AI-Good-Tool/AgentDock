@@ -9,6 +9,7 @@ const outcomes: Record<string, [string, string]> = {
   agent_disabled: ['辅助 Agent 已禁用', 'Auxiliary agent disabled'],
   upstream_rejected: ['上游拒绝', 'Upstream rejected'],
   upstream_unreachable: ['上游连接失败', 'Upstream unreachable'],
+  upstream_timeout: ['上游请求超时', 'Upstream timeout'],
   upstream_http_error: ['上游 HTTP 错误', 'Upstream HTTP error'],
   upstream_protocol_error: ['上游协议异常', 'Upstream protocol error'],
   runtime_unavailable: ['本机协议运行时不可用', 'Local runtime unavailable'],
@@ -65,6 +66,7 @@ const stages: Record<string, [string, string]> = {
   runtime: ['本机协议运行时', 'Local runtime'],
   official_transport: ['本机官方运行时／设备 SDK', 'Official runtime / device SDK'],
   upstream: ['官方上游', 'Upstream'],
+  upstream_catalog: ['Trae 模型目录', 'Trae model catalog'],
   stream: ['流传输', 'Streaming'],
   aggregation: ['非流式聚合', 'Aggregation'],
 }
@@ -82,6 +84,8 @@ export function logError(record: RequestLog) {
 }
 export function logExplanation(record: RequestLog) {
   const p = providerLabel(record.provider)
+  if (record.details?.errorStage === 'upstream_catalog')
+    return t('请求在查询 Trae Remote 模型目录时失败，尚未创建对话会话或调用模型。目录 GET 遇到暂时性连接错误、超时或 HTTP 502/503/504 时最多重试一次；不会重放对话或更换账号。', 'The Trae Remote model catalog failed before a conversation or model call was created. Catalog GET requests retry transient connection errors, timeouts and HTTP 502/503/504 once; conversations are never replayed and accounts are not changed.')
   if (record.outcome === 'request_too_large')
     return t('请求体或转换后的请求超过本地大小限制，未发送到上游。请缩短会话历史或减少附件；不会静默截断上下文或自动重试。', 'The request exceeded the local size limit and was not sent. Shorten the history or attachments; context is never silently truncated or retried.')
   if (record.outcome === 'official_transport_unavailable')
