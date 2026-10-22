@@ -86,3 +86,57 @@ jobs:
           path: ci-packages/*
           if-no-files-found: error
           retention-days: 14
+
+  publish:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: AgentDock-*
+          path: release-artifacts
+      - name: Verify every installer before publishing
+        run: node scripts/prepare-release.mjs
+      - name: Upload draft, check GitHub digests, then publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n\n' "AgentDock $RELEASE_TAG"
+            printf '%s\n' '| 平台 Platform | 安装包 Installer |' '| --- | --- |'
+            for f in release-files/*.exe release-files/*.dmg; do
+              case "$f" in
+                *windows*) p='Windows x64' ;; *aarch64-apple*) p='macOS Apple Silicon' ;; *) p='macOS Intel' ;;
+              esac
+              printf '| %s | `%s` |\n' "$p" "$(basename "$f")"
+            done
+            printf '\n%s\n' '应用内「关于 → 检查更新 / 在线更新」会自动下载匹配当前系统的安装包并校验 SHA256。' 'Use About → Check for updates / Update in app to download the matching installer with SHA256 verification.'
+            printf '\n%s\n' '安装包未经开发者证书签名或公证：macOS 首次打开请右键 → 打开；Windows 如遇 SmartScreen 请选择“仍要运行”。安装包不包含任何账号、密钥或官方 SDK。' 'Installers are not code-signed or notarized. They contain no accounts, keys or official SDKs.'
+          } > release-notes.md
+          gh release create "$RELEASE_TAG" --draft --verify-tag --title "AgentDock $RELEASE_TAG" --notes-file release-notes.md release-files/*
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > release-upload.json || gh api "repos/$GH_REPO/releases" --jq "[.[] | select(.tag_name == \"$RELEASE_TAG\")][0]" > release-upload.json
+          node --input-type=module <<'JS'
+          import { readFile } from 'node:fs/promises';
+          const release = JSON.parse(await readFile('release-upload.json', 'utf8'));
+          const sums = (await readFile('release-files/SHA256SUMS.txt', 'utf8')).trim().split('\n');
+          for (const line of sums) {
+            const [sha, name] = line.split('  ');
+            const matches = release.assets.filter((a) => a.name === name && a.state === 'uploaded');
+            if (matches.length !== 1 || matches[0].digest !== `sha256:${sha}`) throw Error(`GitHub digest mismatch or missing: ${name}`);
+          }
+          JS
+          gh release edit "$RELEASE_TAG" --draft=false --latest

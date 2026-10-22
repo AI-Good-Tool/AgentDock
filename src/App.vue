@@ -2,6 +2,7 @@
 import ProviderMark from './components/ProviderMark.vue'
 import BrandMark from './components/BrandMark.vue'
 import { computed, onMounted, watch } from 'vue'
+import { Message } from '@arco-design/web-vue'
 import {
   IconApps,
   IconUserGroup,
@@ -16,6 +17,7 @@ import {
   IconPoweroff,
   IconPlayArrow,
   IconFile,
+  IconInfoCircle,
 } from '@arco-design/web-vue/es/icon'
 import { t, isZh } from './i18n'
 import { state, page, startPolling, act, refreshApp } from './store'
@@ -31,6 +33,7 @@ import Sessions from './pages/Sessions.vue'
 import Access from './pages/Access.vue'
 import Preferences from './pages/Preferences.vue'
 import Logs from './pages/Logs.vue'
+import About from './pages/About.vue'
 
 const nav = computed(() => [
   { id: 'overview', label: t('工作台', 'Overview'), icon: IconApps },
@@ -54,6 +57,7 @@ const nav = computed(() => [
   { id: 'access', label: t('接入设置', 'API Access'), icon: IconLink },
   ...(logging.value ? [{ id: 'logs', label: t('运行日志', 'Runtime Log'), icon: IconFile }] : []),
   { id: 'settings', label: t('偏好设置', 'Preferences'), icon: IconSettings },
+  { id: 'about', label: t('关于', 'About'), icon: IconInfoCircle },
 ])
 const logging = computed(() => state.app?.settings.logging ?? true)
 // Leave the Logs page when its menu is switched off.
@@ -81,6 +85,7 @@ const pages: Record<string, any> = {
   access: Access,
   settings: Preferences,
   logs: Logs,
+  about: About,
 }
 const running = computed(() => !!state.app?.running)
 function toggle() {
@@ -93,7 +98,18 @@ function toggle() {
     [refreshApp]
   )
 }
-onMounted(startPolling)
+onMounted(async () => {
+  startPolling()
+  if (!desktop) return
+  // After an in-app update: confirm the new version started, then surface any install error.
+  try {
+    await call('app_update_confirm_restart')
+    const installError = await call<string | null>('app_update_take_install_error')
+    if (installError) Message.error({ content: installError, duration: 10000 })
+  } catch (e) {
+    Message.error(String(e))
+  }
+})
 </script>
 
 <template>

@@ -226,6 +226,8 @@ export function preview(command: string, args?: Record<string, any>): unknown {
       return { format: 'agentdock-account', version: 1, provider: args?.provider, region: 'cn', exportedAt: iso(now), account: { id: 'c7d1-preview', uid: '07efe4fd-a82c-4270-a2f2-27b1b16f0c11', nickname: '大飞龙', access_token: 'eyJhbGciOiJIUzI1NiJ9.preview.signature', refresh_token: 'rt-preview-0000000000', domain: 'www.workbuddy.cn', variant: 'cn', expiresAt: now + 20 * day, enterpriseId: null, verified: true, plan: { name: 'Pro', credits: 1200.5 } } }
     case 'account_json_import':
       return { ok: true, count: 1, message: '已导入 1 个账号' }
+    case 'app_update_check':
+      return { currentVersion: '1.0.0', latestVersion: '1.1.0', releaseUrl: 'https://github.com/AI-Good-Tool/AgentDock/releases', target: 'aarch64-apple-darwin', assetName: 'AgentDock_1.1.0_aarch64-apple-darwin.dmg', assetSize: 8071168, notes: '- Windows 支持\n- 关于页面与在线更新', hasUpdate: true, canDownload: true, reason: '已找到匹配平台且提供 SHA256 的安装包' }
     case 'checkin_run_now':
       return checkinStatus
     case 'pool_snapshot':

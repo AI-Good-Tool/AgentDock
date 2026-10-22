@@ -3,6 +3,7 @@
 pub mod account_json;
 pub mod api_key;
 pub mod app;
+pub mod app_update;
 pub mod applog;
 pub mod backup;
 pub mod catalog;
@@ -29,6 +30,7 @@ pub fn run_desktop() {
     let hub = open_hub().expect("初始化 AgentDock 数据目录失败");
     tauri::Builder::default()
         .manage(hub.clone())
+        .manage(app_update::Updater::default())
         .setup(move |_| {
             let hub = hub.clone();
             tauri::async_runtime::spawn(async move { tasks::spawn_all(Arc::clone(&hub)).await });
@@ -51,6 +53,13 @@ pub fn run_desktop() {
             commands::request_logs,
             commands::clear_logs,
             commands::checkin_run_now,
+            commands::open_about_link,
+            app_update::app_update_check,
+            app_update::app_update_download,
+            app_update::app_update_cancel_download,
+            app_update::app_update_install,
+            app_update::app_update_confirm_restart,
+            app_update::app_update_take_install_error,
             commands::account_json,
             commands::account_json_save,
             commands::account_json_import,

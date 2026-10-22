@@ -336,6 +336,20 @@ pub async fn open_url(url: String) -> Res {
     Ok(json!({"ok":true}))
 }
 
+/// Fixed links of the About page (never a caller-supplied URL).
+#[tauri::command]
+pub async fn open_about_link(destination: String) -> Res {
+    let url = match destination.as_str() {
+        "author" => "https://github.com/vs2pk0",
+        "repository" => "https://github.com/AI-Good-Tool/AgentDock",
+        "sponsor" => "https://github.com/vs2pk0/codex-switcher/blob/main/doc/sponsor.md",
+        "issues" => "https://github.com/AI-Good-Tool/AgentDock/issues",
+        "releases" => crate::app_update::RELEASES_URL,
+        _ => return Err("未知的关于页面链接".into()),
+    };
+    open_url(url.into()).await
+}
+
 #[tauri::command]
 pub fn reveal_data_dir(hub: State<'_, Shared>) -> Res {
     // Finder / Explorer; `explorer.exe` exits 1 even on success, so only spawn errors count.
