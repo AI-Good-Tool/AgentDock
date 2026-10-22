@@ -19,7 +19,7 @@ mod tests;
 
 use std::sync::Arc;
 
-/// Open the data directory (migrating legacy apps once) and every provider.
+/// Open the data directory and every provider.
 pub fn open_hub() -> Result<app::Shared, String> {
     let dir = paths::data_dir();
     paths::prepare(&dir)?;

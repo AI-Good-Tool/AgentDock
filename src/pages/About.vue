@@ -32,7 +32,7 @@ interface Progress {
   totalBytes: number | null
   message: string | null
 }
-const version = computed(() => state.app?.version ?? '1.0.0')
+const version = computed(() => state.app?.version ?? '1.0.1')
 const info = ref<UpdateInfo | null>(null)
 const downloaded = ref<Download | null>(null)
 const checking = ref(false)

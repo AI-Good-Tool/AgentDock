@@ -111,7 +111,7 @@ function saveQoder() {
   <div v-if="draft" class="split-2">
     <div>
       <section class="box">
-        <div class="box-head"><div><h2>{{ t('网关与调度', 'Gateway and scheduling') }}</h2><p>{{ t('仅监听 127.0.0.1；每个请求只调用一个账号，失败不自动换号重放。', 'Loopback only; each request uses exactly one account and is never replayed on another.') }}</p></div></div>
+        <div class="box-head"><div><h2>{{ t('网关与调度', 'Gateway and scheduling') }}</h2><p>{{ t('仅监听 127.0.0.1；每个请求调用一个账号。仅当 Qoder 在输出前明确拒绝（401/403/429）或排队时，才换下一个可用账号重试，最多 3 个；已开始输出的请求不会重放。', 'Loopback only; one account per request. Only an explicit Qoder rejection (401/403/429) or queue notice before any output moves the request to the next eligible account, at most 3; started output is never replayed.') }}</p></div></div>
         <div class="field-row">
           <div><b>{{ t('监听端口', 'Port') }}</b><small>{{ t('修改端口需先停止服务', 'Stop the gateway to change it') }}</small></div>
           <div class="control"><a-input-number v-model="draft.port" :min="1024" :max="65535" :disabled="state.app?.running" style="width: 140px" @change="touch" /></div>

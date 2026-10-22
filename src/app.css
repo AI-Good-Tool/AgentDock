@@ -963,19 +963,6 @@ body[arco-theme='dark'] {
 .backup-summary-row + .backup-summary-row {
   border-top: 1px solid var(--line);
 }
-.migration-list {
-  display: grid;
-  grid-template-columns: minmax(150px, max-content) max-content max-content;
-  justify-content: end;
-  gap: 8px 28px;
-  font-size: 12.5px;
-  color: var(--text-2);
-  text-align: right;
-}
-.migration-list > span:nth-child(3n + 1) {
-  text-align: left;
-}
-
 /* Daily rewards: unified schedule. */
 .plan-tiles {
   display: grid;

@@ -104,7 +104,6 @@ export interface AppSnapshot {
   error: string
   settings: Settings
   active: RequestLog[]
-  migration?: any
   checkin?: CheckinStatus
 }
 export interface Target {

@@ -6,6 +6,7 @@ pub mod api;
 pub mod client;
 pub mod credits;
 pub mod gateway;
+mod images;
 pub mod keys;
 pub mod oauth;
 pub mod store;
@@ -354,7 +355,7 @@ impl Provider {
                         name: name.into(),
                         // Client tools run through the Remote text bridge.
                         supports_tools: Some(true),
-                        supports_images: Some(false),
+                        supports_images: Some(true),
                         config,
                         ..UpstreamModel::default()
                     });

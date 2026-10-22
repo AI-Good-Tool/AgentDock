@@ -84,7 +84,6 @@ function summaryText(s: any, p: Provider) {
   if (v.settings) parts.push(t('设置', 'settings'))
   return parts.join(' · ') || '—'
 }
-const migration = computed(() => state.app?.migration)
 </script>
 
 <template>
@@ -236,17 +235,6 @@ const migration = computed(() => state.app?.migration)
       </div>
     </div>
 
-    <div v-if="migration" class="field-row" style="border-bottom: none">
-      <div>
-        <b>{{ t('旧应用数据迁移', 'Legacy data migration') }}</b>
-        <small>{{ t('首次启动时从原应用复制，原数据未改动', 'Copied once from the original apps; originals untouched') }}</small>
-      </div>
-      <div class="migration-list">
-        <template v-if="migration.workbuddy"><span class="platform-opt"><ProviderMark provider="workbuddy" />WorkBuddy API</span><span>{{ migration.workbuddy.files }} {{ t('个文件', 'files') }}</span><span>{{ migration.workbuddy.usageRows }} {{ t('条用量', 'usage rows') }}</span></template>
-        <template v-if="migration.qoder"><span class="platform-opt"><ProviderMark provider="qoder" />Qoder Switch</span><span>{{ migration.qoder.files }} {{ t('个文件', 'files') }}</span><span>{{ migration.qoder.usageRows }} {{ t('条用量', 'usage rows') }}</span></template>
-        <template v-if="migration.trae"><span class="platform-opt"><ProviderMark provider="trae" />Trae Switch</span><span>{{ migration.trae.files }} {{ t('个文件', 'files') }}</span><span>{{ migration.trae.requests }} {{ t('条请求', 'requests') }}</span></template>
-      </div>
-    </div>
   </section>
 
   <section class="box">

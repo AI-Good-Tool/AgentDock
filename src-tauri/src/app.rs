@@ -255,8 +255,7 @@ impl Hub {
                 .chat_eligibility(&account.id, &target.id)
                 .map(Exec::Qoder),
             ProviderKind::Trae => {
-                // The Remote chain carries text and client tools; images go to other providers.
-                trae::gateway::validate(body).map_err(|_| "Trae 暂不支持图片输入")?;
+                trae::gateway::validate(body)?;
                 self.trae
                     .chat_eligibility(&account.id, &target.id)
                     .map(Exec::Trae)

@@ -1,5 +1,5 @@
 //! Qoder 核心逻辑：safeStorage 解密、设备标识、Qoder API、账号库、切换与领取。
-//! 数据目录默认 ~/.agentdock/qoder/（首次启动从 ~/.qoder-switch/ 迁移），账号库格式兼容。
+//! 数据目录默认 ~/.agentdock/qoder/，账号库格式与 Qoder Switch 备份兼容。
 #![allow(non_snake_case)]
 // The keychain / AES-CBC helpers serve macOS safeStorage; Windows uses platform.rs (DPAPI + GCM).
 #![cfg_attr(windows, allow(dead_code))]
@@ -123,11 +123,6 @@ pub fn switch_dir() -> PathBuf {
         .get()
         .cloned()
         .unwrap_or_else(|| home().join(".agentdock").join("qoder"))
-}
-
-/// The standalone Qoder Switch data directory (migration source only).
-pub fn legacy_dir() -> PathBuf {
-    home().join(".qoder-switch")
 }
 
 fn accounts_file() -> PathBuf {

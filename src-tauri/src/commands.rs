@@ -32,7 +32,6 @@ pub fn app_snapshot(hub: State<'_, Shared>) -> Value {
         "error": *hub.error.lock().unwrap(),
         "settings": settings,
         "active": active,
-        "migration": std::fs::read(hub.dir.join("migration.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
         "checkin": *hub.checkin.lock().unwrap(),
     })
 }

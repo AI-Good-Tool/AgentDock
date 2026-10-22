@@ -6,7 +6,7 @@ use axum::{routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
-    sync::{atomic::{AtomicUsize, Ordering}, Arc},
+    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc},
 };
 
 const KEY: &str = "fixture-local-key-0123456789";
@@ -16,6 +16,11 @@ struct Fixture {
     url: String,
     qoder_calls: Arc<AtomicUsize>,
     trae_calls: Arc<AtomicUsize>,
+    trae_queries: Arc<std::sync::Mutex<Vec<Value>>>,
+    trae_uploads: Arc<AtomicUsize>,
+    trae_upload_fail: Arc<AtomicBool>,
+    trae_plan_mode: Arc<AtomicUsize>,
+    trae_stops: Arc<AtomicUsize>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 impl Drop for Fixture {
@@ -79,10 +84,59 @@ async fn fixture() -> Fixture {
     );
     let trae_calls = Arc::new(AtomicUsize::new(0));
     let tc = trae_calls.clone();
+    let trae_queries: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let queries = trae_queries.clone();
+    let trae_uploads = Arc::new(AtomicUsize::new(0));
+    let uploads = trae_uploads.clone();
+    let trae_upload_fail = Arc::new(AtomicBool::new(false));
+    let upload_fail = trae_upload_fail.clone();
+    let trae_plan_mode = Arc::new(AtomicUsize::new(0));
+    let plan_mode = trae_plan_mode.clone();
+    let trae_stops = Arc::new(AtomicUsize::new(0));
+    let stops = trae_stops.clone();
     // Trae Remote Agent chain: models → chat_sessions → events (one turn per request).
     let sessions: Arc<std::sync::Mutex<HashMap<String, (String, String)>>> = Arc::default();
     let created = sessions.clone();
     let trae_upstream = Router::new()
+        .route(
+            "/api/ide/v1/get_resource_upload_url",
+            post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Cloud-IDE-JWT never-real");
+                assert_eq!(body["biz_type"], "image");
+                assert_eq!(body["scale_param"], json!({"width":16,"height":16}));
+                let host = headers["host"].to_str().unwrap();
+                Json(json!({"code":0,"data":{
+                    "upload_hosts":[format!("http://{host}")],
+                    "store_infos":[{"store_uri":"fixture-image","override_resource_id":"remote-image-1","auth":"scoped-upload-token"}],
+                    "session_key":"upload-session",
+                }}))
+            }),
+        )
+        .route(
+            "/fixture-image",
+            axum::routing::put(move |headers: axum::http::HeaderMap, bytes: axum::body::Bytes| {
+                let (uploads, upload_fail) = (uploads.clone(), upload_fail.clone());
+                async move {
+                    assert_eq!(headers["authorization"], "scoped-upload-token");
+                    assert_eq!(headers["content-type"], "image/png");
+                    assert_eq!(headers["content-crc32"], "3187ef75");
+                    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+                    uploads.fetch_add(1, Ordering::SeqCst);
+                    if upload_fail.load(Ordering::SeqCst) {
+                        axum::http::StatusCode::BAD_GATEWAY
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/ide/v1/commit_resource_upload_result",
+            post(|Json(body): Json<Value>| async move {
+                assert_eq!(body, json!({"oids":["fixture-image"],"success_oids":["fixture-image"],"session_key":"upload-session","biz_type":"image"}));
+                Json(json!({"code":0}))
+            }),
+        )
         .route(
             "/api/remote/v1/models",
             axum::routing::get(|| async {
@@ -96,12 +150,13 @@ async fn fixture() -> Fixture {
         .route(
             "/api/remote/v1/chat_sessions",
             post(move |Json(body): Json<Value>| {
-                let (tc, created) = (tc.clone(), created.clone());
+                let (tc, created, queries) = (tc.clone(), created.clone(), queries.clone());
                 async move {
                     tc.fetch_add(1, Ordering::SeqCst);
                     let m = &body["initial_message"];
                     assert_eq!(m["custom_model"]["name"], m["model_name"], "the full catalog entry is sent");
                     let query: Value = serde_json::from_str(m["query"].as_str().unwrap()).unwrap();
+                    queries.lock().unwrap().push(query.clone());
                     let sid = uuid::Uuid::new_v4().simple().to_string();
                     created.lock().unwrap().insert(
                         sid.clone(),
@@ -115,6 +170,7 @@ async fn fixture() -> Fixture {
             "/api/remote/v1/chat_sessions/{sid}/events",
             axum::routing::get(move |axum::extract::Path(sid): axum::extract::Path<String>| {
                 let sessions = sessions.clone();
+                let plan_mode = plan_mode.clone();
                 async move {
                     let (model, query) = sessions.lock().unwrap().get(&sid).cloned().unwrap();
                     let reply = match query.split_once("\nTools: ") {
@@ -124,13 +180,29 @@ async fn fixture() -> Fixture {
                         }
                         _ => format!("你好 from {model}"),
                     };
-                    let wire = [
+                    let mut events = vec![
                         ("model_config", json!({"config_name": model})),
                         ("plan_item", json!({"id":"p1","thought":"thinking"})),
-                        ("plan_item", json!({"id":"p2","tool_call_info":{"name":"finish","params":{"summary": reply}}})),
+                    ];
+                    let mode = plan_mode.load(Ordering::SeqCst);
+                    if mode == 2 {
+                        events.push(("plan_item", json!({"id":"p3","tool_call_info":{"name":"read_file","params":{"path":"PRIVATE_TOOL_ARGUMENT"}}})));
+                    }
+                    if mode == 1 || mode == 3 {
+                        events.push(("plan_item", json!({"id":"p2","tool_call_info":{"id":"finish-1","name":"finish","params":{}}})));
+                    }
+                    if mode != 3 {
+                        events.push(("plan_item", if mode == 1 {
+                            json!({"id":"p2","tool_call_info":{"id":"finish-1","params":{"summary":reply}}})
+                        } else {
+                            json!({"id":"p2","tool_call_info":{"name":"finish","params":{"summary":reply}}})
+                        }));
+                    }
+                    events.extend([
                         ("token_usage", json!({"prompt_tokens":3,"completion_tokens":2})),
                         ("done", json!({"status":"completed"})),
-                    ]
+                    ]);
+                    let wire = events
                     .iter()
                     .map(|(e, d)| format!("event: {e}\ndata: {d}\n\n"))
                     .collect::<String>();
@@ -138,7 +210,13 @@ async fn fixture() -> Fixture {
                 }
             }),
         )
-        .route("/api/remote/v1/chat_sessions/{sid}/stop", post(|| async { Json(json!({"code":0})) }));
+        .route("/api/remote/v1/chat_sessions/{sid}/stop", post(move || {
+            let stops = stops.clone();
+            async move {
+                stops.fetch_add(1, Ordering::SeqCst);
+                Json(json!({"code":0}))
+            }
+        }));
     let (qoder_url, q_task) = serve(qoder_upstream).await;
     let (trae_url, t_task) = serve(trae_upstream).await;
     let dir = std::env::temp_dir().join(format!("agentdock-e2e-{}", uuid::Uuid::new_v4()));
@@ -167,7 +245,7 @@ async fn fixture() -> Fixture {
     *trae.test_host.lock().unwrap() = Some(trae_url);
     let hub = Hub::assemble(&dir, Settings::default(), KEY, qoder, trae);
     let (url, g_task) = serve(crate::server::router(hub.clone())).await;
-    Fixture { hub, url, qoder_calls, trae_calls, tasks: vec![q_task, t_task, g_task] }
+    Fixture { hub, url, qoder_calls, trae_calls, trae_queries, trae_uploads, trae_upload_fail, trae_plan_mode, trae_stops, tasks: vec![q_task, t_task, g_task] }
 }
 
 fn client() -> reqwest::Client {
@@ -309,10 +387,126 @@ async fn tools_roundtrip_on_every_provider_including_the_trae_text_bridge() {
     let v: Value = post_json(&f, "/trae/v1/messages", follow).await.json().await.unwrap();
     assert_eq!(v["stop_reason"], "end_turn", "{v}");
     assert!(v["content"][0]["text"].as_str().unwrap().contains("你好 from shared-real"));
-    // Images are still refused before any Trae traffic.
+    // Invalid image bytes must not create a Remote session.
     let image = json!({"model":"Shared","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]});
     let before = f.trae_calls.load(Ordering::SeqCst);
-    let _ = post_json(&f, "/trae/v1/messages", image).await;
+    let response = post_json(&f, "/trae/v1/messages", image).await;
+    assert_eq!(response.status(), 400);
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), before);
+}
+
+const IMAGE_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=";
+
+#[tokio::test]
+async fn delayed_trae_finish_parameters_work_with_large_namespaced_tool_requests() {
+    let f = fixture().await;
+    f.trae_plan_mode.store(1, Ordering::SeqCst);
+    let tools: Vec<Value> = (0..15).map(|index| {
+        let names = if index < 12 { & ["read_file", "run_command", "finish", "list_files"][..] }
+            else { & ["read_file", "run_command", "finish"][..] };
+        json!({"type":"namespace","name":format!("ns_{index}"),"tools":names.iter().map(|name| {
+            json!({"type":"function","name":name,"parameters":{"type":"object","properties":{}}})
+        }).collect::<Vec<_>>()})
+    }).collect();
+    let body = json!({"model":"Shared","input":[{"role":"user","content":"long external conversation ".repeat(4000)}],"tools":tools});
+    let response = post_json(&f, "/trae/v1/responses", body).await;
+    assert_eq!(response.status(), 200);
+    let value: Value = response.json().await.unwrap();
+    assert_eq!(value["output"][0]["type"], "function_call", "{value}");
+    assert_eq!(value["output"][0]["name"], "read_file");
+    assert_eq!(value["output"][0]["namespace"], "ns_0");
+    let logs = wait_logs(&f, 1).await;
+    assert_eq!(logs[0].details["upstreamSummary"]["clientTools"], 57);
+    assert_eq!(logs[0].outcome, "completed");
+    assert_eq!(f.trae_stops.load(Ordering::SeqCst), 0);
+
+    // Mixed-provider rotation still uses the original account order, including
+    // under concurrent requests with different request-local tool catalogs.
+    let results = futures_util::future::join_all((0..6).map(|index| {
+        let f = &f;
+        async move {
+            let name = format!("caller_tool_{index}");
+            let response = post_json(f, "/v1/responses", json!({"model":"Shared","input":"use the external tool",
+                "tools":[{"type":"function","name":name,"parameters":{"type":"object","properties":{}}}]})).await;
+            assert_eq!(response.status(), 200);
+            let value: Value = response.json().await.unwrap();
+            assert_eq!(value["output"][0]["name"], name, "{value}");
+        }
+    })).await;
+    assert_eq!(results.len(), 6);
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(f.qoder_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(f.hub.runtime.lock().unwrap().in_flight.values().sum::<usize>(), 0);
+
+    let response = post_json(&f, "/trae/v1/responses", json!({"model":"Shared","input":"hello","stream":true})).await;
+    assert_eq!(response.status(), 200);
+    let stream = response.text().await.unwrap();
+    assert!(stream.contains("response.completed"), "{stream}");
+}
+
+#[tokio::test]
+async fn actual_remote_tools_still_stop_and_incomplete_finish_never_becomes_success() {
+    let f = fixture().await;
+    f.trae_plan_mode.store(2, Ordering::SeqCst);
+    let response = post_json(&f, "/trae/v1/responses", json!({"model":"Shared","input":"hello"})).await;
+    assert_eq!(response.status(), 502);
+    let logs = wait_logs(&f, 1).await;
+    assert_eq!(logs[0].outcome, "remote_tool_execution");
+    assert_eq!(logs[0].details["upstreamSummary"]["blockedRemoteTool"], "read_file");
+    assert_eq!(logs[0].details["upstreamSummary"]["remoteStopConfirmed"], true);
+    assert!(!logs[0].details.to_string().contains("PRIVATE_TOOL_ARGUMENT"));
+    assert_eq!(f.trae_stops.load(Ordering::SeqCst), 1);
+    assert_eq!(f.qoder_calls.load(Ordering::SeqCst), 0);
+
+    f.trae_plan_mode.store(3, Ordering::SeqCst);
+    let response = post_json(&f, "/trae/v1/responses", json!({"model":"Shared","input":"hello"})).await;
+    assert_eq!(response.status(), 502);
+    let error: Value = response.json().await.unwrap();
+    assert!(error.to_string().contains("Trae finish 未返回完整 summary"), "{error}");
+    let logs = wait_logs(&f, 2).await;
+    assert_eq!(logs[0].outcome, "invalid_tool_output");
+}
+
+#[tokio::test]
+async fn trae_images_cross_all_protocols_and_upload_failures_never_drop_images() {
+    let f = fixture().await;
+    let url = format!("data:image/png;base64,{IMAGE_DATA}");
+    let requests = [
+        ("/trae/v1/messages", json!({"model":"Shared","max_tokens":32,"messages":[
+            {"role":"user","content":[{"type":"text","text":"Describe this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":IMAGE_DATA}}]},
+        ]})),
+        ("/trae/v1/chat/completions", json!({"model":"Shared","messages":[
+            {"role":"user","content":[{"type":"text","text":"Describe this"},{"type":"image_url","image_url":{"url":url}}]},
+            {"role":"assistant","content":"previous reply"},
+            {"role":"user","content":"continue"},
+        ]})),
+        ("/trae/v1/responses", json!({"model":"Shared","input":[
+            {"role":"user","content":[{"type":"input_text","text":"Describe this"},{"type":"input_image","image_url":url}]},
+        ]})),
+        ("/trae/v1/messages", json!({"model":"Shared","max_tokens":32,"messages":[
+            {"role":"assistant","content":[{"type":"tool_use","id":"image-tool","name":"read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"image-tool","content":[
+                {"type":"text","text":"Describe this"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":IMAGE_DATA}},
+            ]}]},
+        ]})),
+    ];
+    for (index, (path, body)) in requests.iter().enumerate() {
+        let response = post_json(&f, path, body.clone()).await;
+        assert_eq!(response.status(), 200, "{path}: {}", response.text().await.unwrap());
+        assert_eq!(f.trae_uploads.load(Ordering::SeqCst), index + 1);
+        let queries = f.trae_queries.lock().unwrap();
+        let query = queries.last().unwrap();
+        assert_eq!(query[2], json!({"type":"image","data":{"image_id":"remote-image-1"}}));
+        assert!(query[0]["data"]["content"].as_str().unwrap().contains("[Attached image 1]"));
+        assert!(!query.to_string().contains("base64"));
+    }
+    // Failed uploads fail explicitly; never send an image-free substitute prompt.
+    f.trae_upload_fail.store(true, Ordering::SeqCst);
+    let before = f.trae_calls.load(Ordering::SeqCst);
+    let response = post_json(&f, requests[0].0, requests[0].1.clone()).await;
+    assert_eq!(response.status(), 502);
+    let error: Value = response.json().await.unwrap();
+    assert!(error["error"]["message"].as_str().unwrap().contains("Trae 图片上传失败"), "{error}");
     assert_eq!(f.trae_calls.load(Ordering::SeqCst), before);
 }
 

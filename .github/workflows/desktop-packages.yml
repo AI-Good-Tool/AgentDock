@@ -56,7 +56,6 @@ jobs:
       CARGO_INCREMENTAL: '0'
       # Tests must never touch real client data or start background account actions.
       AGENTDOCK_NO_TASKS: '1'
-      AGENTDOCK_SKIP_MIGRATION: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -117,6 +116,10 @@ jobs:
           set -euo pipefail
           {
             printf '%s\n\n' "AgentDock $RELEASE_TAG"
+            if [ -f "docs/releases/$RELEASE_TAG.md" ]; then
+              cat "docs/releases/$RELEASE_TAG.md"
+              printf '\n\n'
+            fi
             printf '%s\n' '| 平台 Platform | 安装包 Installer |' '| --- | --- |'
             for f in release-files/*.exe release-files/*.dmg; do
               case "$f" in
