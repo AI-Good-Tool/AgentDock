@@ -1,6 +1,7 @@
 //! Cross-provider account selection. Every account of every provider and
 //! region that can serve the requested model joins one pool; the configured
-//! strategy then picks exactly one account per request (never a retry).
+//! strategy picks one account per attempt. The server only asks for another
+//! attempt after an explicit pre-output rejection, excluding tried accounts.
 use crate::settings::{Settings, Strategy};
 use agentdock_core::provider::{PoolAccount, UpstreamModel};
 use serde_json::Value;
@@ -22,6 +23,9 @@ pub struct Runtime {
     pub in_flight: HashMap<String, usize>,
     /// Account key -> excluded until (ms).
     pub cooldown: HashMap<String, i64>,
+    /// (account key, real model id) -> excluded until (ms); the account
+    /// still serves its other models.
+    pub model_cooldown: HashMap<(String, String), i64>,
     /// Excluded until the user re-enables the account.
     pub auth_failed: HashSet<String>,
     /// Round-robin position per route.
@@ -49,6 +53,22 @@ pub fn select(
     pinned: Option<&str>,
     now: i64,
     eligible: &Eligibility,
+) -> Result<Pick, String> {
+    select_excluding(accounts, targets, settings, rt, route_id, pinned, now, eligible, &HashSet::new())
+}
+
+/// [`select`] without the accounts already tried for this request.
+#[allow(clippy::too_many_arguments)]
+pub fn select_excluding(
+    accounts: &[PoolAccount],
+    targets: &[&UpstreamModel],
+    settings: &Settings,
+    rt: &mut Runtime,
+    route_id: &str,
+    pinned: Option<&str>,
+    now: i64,
+    eligible: &Eligibility,
+    excluded: &HashSet<String>,
 ) -> Result<Pick, String> {
     if let Some(key) = pinned {
         if !accounts.iter().any(|a| a.key() == key) {
@@ -79,7 +99,9 @@ pub fn select(
             .iter()
             .find(|t| t.provider() == a.provider && t.region == a.region)
         {
-            if !a.enabled {
+            if excluded.contains(&a.key()) {
+                Err("本次请求已尝试")
+            } else if !a.enabled {
                 Err("未启用反代")
             } else if a.blocked.is_some() {
                 Err("登录凭证不可用")
@@ -87,6 +109,8 @@ pub fn select(
                 Err("登录已过期")
             } else if rt.cooldown.get(&a.key()).is_some_and(|t| *t > now) {
                 Err("账号冷却中")
+            } else if rt.model_cooldown.get(&(a.key(), target.id.clone())).is_some_and(|t| *t > now) {
+                Err("该模型冷却中")
             } else if rt.auth_failed.contains(&a.key()) {
                 Err("鉴权已失败")
             } else if rt.in_flight.get(&a.key()).copied().unwrap_or(0) >= scope.concurrency {
@@ -261,6 +285,27 @@ mod tests {
         // Qoder lacks the model, so it is not reported as skipped.
         assert_eq!(p.skipped.len(), 1);
         assert_eq!(p.skipped.get(&("trae".into(), "cn".into(), "Trae 仅支持纯文本对话")), Some(&2));
+    }
+    #[test]
+    fn retries_skip_tried_accounts_and_model_cooldown_is_per_model() {
+        use ProviderKind::*;
+        let accounts = vec![acct(Qoder, "a", "cn", None, None), acct(Qoder, "b", "cn", None, None)];
+        let (x, y) = (m(Qoder, "cn", "x"), m(Qoder, "cn", "y"));
+        let s = Settings::default();
+        let mut rt = Runtime::default();
+        let tried = HashSet::from(["qoder/a".to_owned()]);
+        for _ in 0..2 {
+            let p = select_excluding(&accounts, &[&x], &s, &mut rt, "r", None, 0, &ok, &tried).unwrap();
+            assert_eq!(p.account.id, "b");
+            *rt.in_flight.get_mut("qoder/b").unwrap() -= 1;
+        }
+        let all = HashSet::from(["qoder/a".to_owned(), "qoder/b".to_owned()]);
+        let err = select_excluding(&accounts, &[&x], &s, &mut rt, "r", None, 0, &ok, &all).err().unwrap();
+        assert!(err.contains("本次请求已尝试 2 个"), "{err}");
+        rt.model_cooldown.insert(("qoder/a".into(), "x".into()), 10);
+        assert_eq!(pick(&accounts, &[&x], &s, &mut rt, "x"), "b");
+        assert_eq!(pick(&accounts, &[&x], &s, &mut rt, "x"), "b");
+        assert_eq!(pick(&accounts, &[&y], &s, &mut rt, "y"), "a");
     }
     #[test]
     fn pins_cannot_widen_the_model_pool() {

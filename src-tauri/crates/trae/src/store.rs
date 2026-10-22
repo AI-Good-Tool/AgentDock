@@ -169,6 +169,15 @@ impl Store {
         })
     }
     pub fn event(&self, kind: &str, message: &str) {
+        agentdock_core::applog::emit(
+            if kind == "error" {
+                agentdock_core::applog::Level::Warn
+            } else {
+                agentdock_core::applog::Level::Info
+            },
+            "trae",
+            || (format!("[{kind}] {message}"), serde_json::Value::Null),
+        );
         let _ = self.update(|data| {
             let events = data["events"].as_array_mut().unwrap();
             events.insert(

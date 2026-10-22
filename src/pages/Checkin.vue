@@ -1,34 +1,96 @@
 <script setup lang="ts">
 import ProviderMark from '../components/ProviderMark.vue'
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref, onMounted, watch } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
-import { IconCalendar, IconGift, IconDelete } from '@arco-design/web-vue/es/icon'
+import { IconCalendar, IconGift, IconDelete, IconPlayArrow, IconClockCircle } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
 import CheckinPage from '../components/workbuddy/CheckinPage.vue'
-import { call } from '../api'
+import { call, isWindows, type CheckinSettings, type ProviderKey } from '../api'
 import { t, fmtDateTime, fmtNumber } from '../i18n'
-import { state, act, busy, refreshPool } from '../store'
+import { state, act, busy, refreshPool, refreshApp } from '../store'
 
 const tab = ref<'workbuddy' | 'qoder' | 'trae'>('workbuddy')
 const progress = ref({ completed: 0, total: 0, failed: 0 })
-onMounted(refreshPool)
+const launchd = ref<{ installed: boolean } | null>(null)
+onMounted(async () => {
+  refreshPool()
+  launchd.value = await call('launchd_status').catch(() => null)
+})
+
+// Unified schedule (all three platforms)
+const plan = computed<CheckinSettings>(
+  () => state.app?.settings.checkin ?? { workbuddy: true, qoder: true, trae: true, onStartup: true, scheduled: true, intervalMinutes: 60 }
+)
+const status = computed(() => state.app?.checkin ?? {})
+// Partial patches (merged server-side) with a key per field, so quick toggles never drop or revert each other.
+function setPlan(patch: Partial<CheckinSettings>, success?: string) {
+  return act(`checkin:${Object.keys(patch).join(',')}`, () => call('save_settings', { patch: { checkin: patch } }), success ?? t('签到设置已保存', 'Check-in settings saved'), [refreshApp])
+}
+const interval = ref(60)
+watch(() => plan.value.intervalMinutes, (v) => (interval.value = v), { immediate: true })
+function saveInterval() {
+  const v = Math.round(Number(interval.value) || 60)
+  if (v !== plan.value.intervalMinutes) setPlan({ intervalMinutes: v })
+}
+const intervalText = computed(() => {
+  const m = plan.value.intervalMinutes
+  return m % 60 === 0 ? t(`每 ${m / 60} 小时`, `every ${m / 60} h`) : t(`每 ${m} 分钟`, `every ${m} min`)
+})
+const scheduleHint = computed(() => {
+  const parts: string[] = []
+  if (plan.value.onStartup) parts.push(t('启动后 10 秒', '10 s after launch'))
+  if (plan.value.scheduled) parts.push(intervalText.value)
+  return parts.length ? parts.join(t('，之后', ', then ')) + t('执行', '') : t('仅手动执行', 'Manual only')
+})
+const platformTiles = computed(() => [
+  { key: 'workbuddy' as ProviderKey, name: 'WorkBuddy', desc: t('国内版中已开启签到的账号', 'China accounts with check-in on') },
+  { key: 'qoder' as ProviderKey, name: 'Qoder', desc: t('每日积分活动（有可领时才领取）', 'Daily credit campaigns, only when claimable') },
+  { key: 'trae' as ProviderKey, name: 'Trae', desc: t('国内版中已开启自动签到的账号', 'China accounts with auto check-in on') },
+])
+const triggerName: Record<string, [string, string]> = {
+  startup: ['启动后自动', 'At launch'],
+  scheduled: ['定时', 'Scheduled'],
+  manual: ['手动', 'Manual'],
+  launchd: ['系统定时任务', 'launchd'],
+}
+function resultText(key: ProviderKey) {
+  const rows = status.value.results?.[key]
+  if (rows === 'disabled') return t('已关闭', 'Off')
+  if (!Array.isArray(rows)) return '—'
+  if (!rows.length) return t('无需处理', 'Nothing due')
+  const failed = rows.filter((r: any) => r.ok === false || r.phase === 'error' || r.phase === 'login_required').length
+  return failed ? t(`${rows.length - failed} 成功 · ${failed} 失败`, `${rows.length - failed} ok · ${failed} failed`) : t(`${rows.length} 个已处理`, `${rows.length} done`)
+}
+async function runNow() {
+  await act('checkin-run', () => call('checkin_run_now'), t('签到已执行', 'Check-in pass finished'), [refreshApp, refreshPool])
+}
+function toggleLaunchd() {
+  const install = !launchd.value?.installed
+  return act(
+    'launchd',
+    async () => {
+      const r = await call('launchd_install', { install })
+      launchd.value = await call('launchd_status')
+      return r
+    },
+    install
+      ? t('已安装：每天 10:05 和 22:05 运行一次签到（无需打开应用）', 'Installed: runs daily at 10:05 and 22:05 without the app')
+      : t('已移除系统定时任务', 'Scheduled task removed'),
+    []
+  )
+}
 const wb = computed(() => state.pool?.workbuddy ?? { accounts: [] })
 const pendingIds = computed(() => [...state.pending].map((k) => k.replace(/^wb:/, '')))
 
 // WorkBuddy
 function wbToggleAuto(enabled: boolean) {
-  const apply = () =>
-    act(
-      'auto-checkin',
-      () => call('wb_set_auto_checkin', { enabled }),
-      t('自动签到设置已保存', 'Auto check-in saved')
-    )
+  const apply = () => setPlan({ workbuddy: enabled }, t('自动签到设置已保存', 'Auto check-in saved'))
   if (!enabled) return apply()
   Modal.confirm({
     title: t('开启每日自动签到', 'Enable daily auto check-in'),
     content: t(
-      '应用运行期间，在设置的上海时间窗口内为已开启签到的国内版账号分散执行状态核验与签到；失败会限频重试。与反代开关独立，可能触发官方限流。',
-      'While the app runs, opted-in China accounts are checked in within the configured Shanghai-time window, spread out, with throttled retries. Independent of the proxy switch; may hit official rate limits.'
+      '应用运行期间按签到计划（启动后 / 定时）为已开启签到的国内版账号核验状态并签到，已签到的账号不会重复提交。与反代开关独立，可能触发官方限流。',
+      'While the app runs, opted-in China accounts are checked and checked in on the schedule (at launch / interval); accounts already checked in are skipped. Independent of the proxy switch; may hit official rate limits.'
     ),
     onOk: apply,
   })
@@ -97,11 +159,59 @@ async function traeAll() {
     :title="t('签到与领取', 'Daily Rewards')"
     :desc="
       t(
-        'WorkBuddy 每日签到、Qoder 每日积分领取与 Trae 国内版签到，各自保留原有的规则与记录。',
-        'WorkBuddy check-in, Qoder daily credits and Trae CN check-in, each with its original rules and history.'
+        'WorkBuddy 每日签到、Qoder 每日积分领取与 Trae 国内版签到：统一的自动签到计划，各平台独立开关与记录。',
+        'WorkBuddy check-in, Qoder daily credits and Trae CN check-in: one schedule, a switch and history per platform.'
       )
     "
   />
+  <section class="box checkin-plan">
+    <div class="box-head">
+      <div>
+        <h2>{{ t('自动签到计划', 'Auto check-in schedule') }}</h2>
+        <p>{{ t('三个平台共用一个计划，分别开关。应用运行期间执行；已签到 / 已领取的账号不会重复提交。', 'One schedule for all three platforms, each with its own switch. Runs while the app is open; accounts already done are skipped.') }}</p>
+      </div>
+      <a-button type="primary" :loading="busy('checkin-run') || !!status.running" @click="runNow"><template #icon><IconPlayArrow /></template>{{ t('立即执行一次', 'Run now') }}</a-button>
+    </div>
+    <div class="plan-tiles">
+      <div v-for="p in platformTiles" :key="p.key" class="plan-tile" :class="{ off: !plan[p.key] }">
+        <ProviderMark :provider="p.key" />
+        <div>
+          <b>{{ p.name }}</b>
+          <small>{{ p.desc }}</small>
+          <small class="plan-result">{{ t('上次：', 'Last: ') }}{{ resultText(p.key) }}</small>
+        </div>
+        <a-switch :model-value="plan[p.key]" :loading="busy(`checkin:${p.key}`)" @change="(v) => setPlan({ [p.key]: !!v })" />
+      </div>
+    </div>
+    <div class="field-row">
+      <div><b>{{ t('启动后自动签到', 'Check in at launch') }}</b><small>{{ t('AgentDock 启动 10 秒后执行一次', 'Runs once 10 seconds after AgentDock starts') }}</small></div>
+      <div class="control end"><a-switch :model-value="plan.onStartup" @change="(v) => setPlan({ onStartup: !!v })" /></div>
+    </div>
+    <div class="field-row">
+      <div><b>{{ t('定时签到', 'Scheduled check-in') }}</b><small>{{ t('按间隔重复执行，默认每 1 小时（5–1440 分钟）', 'Repeats at the interval; default every hour (5–1440 minutes)') }}</small></div>
+      <div class="control end">
+        <a-input-number v-model="interval" :min="5" :max="1440" :step="5" :disabled="!plan.scheduled" style="width: 150px" @blur="saveInterval" @press-enter="saveInterval">
+          <template #suffix>{{ t('分钟', 'min') }}</template>
+        </a-input-number>
+        <a-switch :model-value="plan.scheduled" @change="(v) => setPlan({ scheduled: !!v })" />
+      </div>
+    </div>
+    <div class="field-row">
+      <div><b>{{ t('执行状态', 'Status') }}</b><small>{{ scheduleHint }}</small></div>
+      <div class="control end plan-status">
+        <span><IconClockCircle /> {{ t('上次', 'Last') }}：{{ status.lastRun ? fmtDateTime(status.lastRun) : t('尚未执行', 'Not yet') }}<template v-if="status.trigger && triggerName[status.trigger]">（{{ t(...triggerName[status.trigger]) }}）</template></span>
+        <span>{{ t('下次', 'Next') }}：{{ status.running ? t('执行中…', 'Running…') : status.nextRun ? fmtDateTime(status.nextRun) : t('未计划', 'Not scheduled') }}</span>
+      </div>
+    </div>
+    <div class="field-row" style="border-bottom: none">
+      <div><b>{{ isWindows ? t('系统定时任务（任务计划程序）', 'Scheduled task (Task Scheduler)') : t('系统定时任务', 'Scheduled task (launchd)') }}</b><small>{{ t('不开应用也能签到：每天 10:05 / 22:05 按上面的平台开关执行一次', 'Runs daily at 10:05 / 22:05 without the app, honoring the platform switches above') }}</small></div>
+      <div class="control end">
+        <span class="state-pill" :class="{ off: !launchd?.installed }">{{ launchd?.installed ? t('已安装', 'Installed') : t('未安装', 'Not installed') }}</span>
+        <a-button size="small" :loading="busy('launchd')" @click="toggleLaunchd">{{ launchd?.installed ? t('移除', 'Remove') : t('安装', 'Install') }}</a-button>
+      </div>
+    </div>
+  </section>
+
   <a-radio-group v-model="tab" type="button" style="margin-bottom: 18px">
     <a-radio value="workbuddy"
       ><ProviderMark provider="workbuddy" style="margin-right: 6px" />WorkBuddy</a-radio
@@ -114,7 +224,8 @@ async function traeAll() {
 
   <CheckinPage
     v-if="tab === 'workbuddy'"
-    :snapshot="wb as any"
+    :snapshot="{ ...(wb as any), autoCheckin: plan.workbuddy }"
+    :auto-hint="scheduleHint"
     :pending-ids="pendingIds"
     :progress="progress"
     :now="state.now"
@@ -167,15 +278,10 @@ async function traeAll() {
       <div class="field-row">
         <div>
           <b>{{ t('应用内自动领取', 'Auto-claim in app') }}</b
-          ><small>{{
-            t('应用运行时每 10 分钟检查一次可领活动', 'Checks every 10 minutes while running')
-          }}</small>
+          ><small>{{ scheduleHint }}</small>
         </div>
         <div class="control">
-          <a-switch
-            :model-value="q.settings?.autoClaim !== false"
-            @change="(v) => act('qauto', () => call('qoder_set_auto_claim', { enabled: !!v }))"
-          />
+          <a-switch :model-value="plan.qoder" @change="(v) => setPlan({ qoder: !!v })" />
         </div>
       </div>
       <div class="field-row">
@@ -187,8 +293,8 @@ async function traeAll() {
       <p class="hint">
         {{
           t(
-            '不打开应用也能领取：在「偏好设置」安装系统定时任务（每天 10:05 / 22:05）。',
-            'To claim without the app, install the scheduled task in Preferences (daily 10:05 / 22:05).'
+            '不打开应用也能领取：在上方「自动签到计划」安装系统定时任务（每天 10:05 / 22:05）。',
+            'To claim without the app, install the scheduled task in the schedule above (daily 10:05 / 22:05).'
           )
         }}
       </p>
@@ -233,8 +339,8 @@ async function traeAll() {
           <p>
             {{
               t(
-                '先查询服务端状态，已领取时不会重复请求；按北京时间判断签到日。开启自动签到的账号在启动时补签，此后每 10 分钟检查一次，需要保持应用运行。国际版没有相同签到入口。',
-                'Status is queried first, so claimed days are never re-submitted; days follow Beijing time. Opted-in accounts catch up at launch and every 10 minutes while the app runs. International has no check-in.'
+                '先查询服务端状态，已领取时不会重复请求；按北京时间判断签到日。开启「自动」的账号按上方签到计划执行，需要保持应用运行。国际版没有相同签到入口。',
+                'Status is queried first, so claimed days are never re-submitted; days follow Beijing time. Accounts with “Auto” on follow the schedule above while the app runs. International has no check-in.'
               )
             }}
           </p>

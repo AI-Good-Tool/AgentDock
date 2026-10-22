@@ -43,6 +43,10 @@ pub struct RequestLog {
     pub upstream_code: Option<String>,
     pub strategy: String,
     pub stream: bool,
+    /// 1-based account attempt within one client request (0 = legacy log).
+    pub attempt: u32,
+    /// Id of the first attempt; shared by every attempt of one request.
+    pub request_group: String,
     pub details: Value,
 }
 impl RequestLog {
@@ -126,6 +130,35 @@ impl LogStore {
     }
     /// Newest first in memory; persisted as an append-only, periodically compacted file.
     pub fn push(&self, log: RequestLog) {
+        agentdock_core::applog::emit(
+            if log.status >= 500 {
+                agentdock_core::applog::Level::Error
+            } else if log.status >= 400 {
+                agentdock_core::applog::Level::Warn
+            } else {
+                agentdock_core::applog::Level::Info
+            },
+            if log.protocol == "internal" { "internal" } else { "gateway" },
+            || {
+                (
+                    format!(
+                        "{} {} → {} · {} ms",
+                        if log.model.is_empty() { &log.requested_model } else { &log.model },
+                        log.provider,
+                        log.status,
+                        log.duration_ms
+                    ),
+                    serde_json::json!({
+                        "requestId": log.id,
+                        "account": log.account_name,
+                        "region": log.region,
+                        "realModel": log.real_model,
+                        "outcome": log.outcome,
+                        "message": log.message,
+                    }),
+                )
+            },
+        );
         {
             let mut logs = self.logs.lock().unwrap();
             logs.retain(|l| l.id != log.id);

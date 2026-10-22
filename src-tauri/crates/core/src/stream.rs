@@ -22,6 +22,10 @@ pub struct StreamFailure {
     pub message: String,
     pub code: Option<String>,
     pub error: Value,
+    /// Business HTTP-like status reported inside the stream (e.g. 401/403/429).
+    pub status: Option<u16>,
+    /// Set when the upstream asked to queue: wait this long, then retry.
+    pub retry_after: Option<u64>,
 }
 impl StreamFailure {
     pub fn new(message: impl Into<String>) -> Self {

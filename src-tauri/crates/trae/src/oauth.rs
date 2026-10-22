@@ -162,10 +162,7 @@ impl Login {
         if url.scheme() != "https" {
             return Err("客户端登录地址必须是 HTTPS".into());
         }
-        std::process::Command::new("/usr/bin/open")
-            .arg(url.as_str())
-            .status()
-            .map_err(|_| "无法打开浏览器")?;
+        crate::platform::open_url(url.as_str())?;
         Ok(json!({"status":"waiting","expiresIn":300}))
     }
 }

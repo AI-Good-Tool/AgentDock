@@ -33,7 +33,55 @@ pub fn app_snapshot(hub: State<'_, Shared>) -> Value {
         "settings": settings,
         "active": active,
         "migration": std::fs::read(hub.dir.join("migration.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()),
+        "checkin": *hub.checkin.lock().unwrap(),
     })
+}
+
+// ── unified check-in ──
+#[tauri::command]
+pub async fn checkin_run_now(hub: State<'_, Shared>) -> Res {
+    let r = crate::tasks::run_pass(hub.inner(), "manual").await;
+    if r["skipped"] == "running" {
+        return Err("签到正在执行中，请稍后再试".into());
+    }
+    Ok(r)
+}
+
+// ── runtime log ──
+#[tauri::command]
+pub fn app_logs(hub: State<'_, Shared>, filter: Option<Value>) -> Value {
+    let mut v = hub.applog.query(&filter.unwrap_or_default());
+    v["enabled"] = json!(agentdock_core::applog::enabled());
+    v
+}
+#[tauri::command]
+pub fn clear_app_logs(hub: State<'_, Shared>) -> Value {
+    hub.applog.clear();
+    json!({"ok": true})
+}
+
+// ── all-platform backup ──
+#[tauri::command]
+pub async fn backup_export(hub: State<'_, Shared>, parts: Option<crate::backup::Parts>) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || crate::backup::export(&hub, &parts.unwrap_or_default())).await?
+}
+#[tauri::command]
+pub async fn backup_inspect(path: String) -> Res {
+    blocking(move || {
+        let path = crate::backup::expand(&path);
+        crate::backup::read(&path).map(|b| json!({"path": path, "summary": crate::backup::summary(&b)}))
+    })
+    .await?
+}
+#[tauri::command]
+pub async fn backup_import(hub: State<'_, Shared>, path: String, parts: Option<crate::backup::Parts>) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || {
+        let bundle = crate::backup::read(&crate::backup::expand(&path))?;
+        crate::backup::import(&hub, &bundle, &parts.unwrap_or_default())
+    })
+    .await?
 }
 
 #[tauri::command]
@@ -58,7 +106,15 @@ pub async fn save_settings(hub: State<'_, Shared>, patch: Value) -> Res {
                 if k == "routes" {
                     continue;
                 }
-                value[k] = v.clone();
+                // `checkin` accepts partial patches so concurrent switches never clobber each other.
+                match (value[k].as_object_mut(), v.as_object()) {
+                    (Some(dst), Some(src)) if k == "checkin" => {
+                        for (field, x) in src {
+                            dst.insert(field.clone(), x.clone());
+                        }
+                    }
+                    _ => value[k] = v.clone(),
+                }
             }
             *s = serde_json::from_value(value).map_err(|e| format!("设置格式无效：{e}"))?;
             Ok(())
@@ -276,33 +332,81 @@ pub async fn open_url(url: String) -> Res {
     if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("仅允许打开 HTTPS 链接".into());
     }
-    std::process::Command::new("/usr/bin/open")
-        .arg(parsed.as_str())
-        .status()
-        .map_err(|_| "打开浏览器失败，请复制链接")?;
+    qoder::platform::open_url(parsed.as_str()).map_err(|_| "打开浏览器失败，请复制链接")?;
     Ok(json!({"ok":true}))
 }
 
 #[tauri::command]
 pub fn reveal_data_dir(hub: State<'_, Shared>) -> Res {
-    std::process::Command::new("/usr/bin/open")
-        .arg(&hub.dir)
-        .status()
-        .map_err(|_| "无法打开数据目录")?;
+    // Finder / Explorer; `explorer.exe` exits 1 even on success, so only spawn errors count.
+    #[cfg(windows)]
+    let opened = std::process::Command::new("explorer.exe").arg(&hub.dir).spawn().map(|_| ());
+    #[cfg(not(windows))]
+    let opened = std::process::Command::new("/usr/bin/open").arg(&hub.dir).status().map(|_| ());
+    opened.map_err(|_| "无法打开数据目录")?;
     Ok(json!({"ok":true}))
 }
 
-// ───────────────────────── 每日自动领取（launchd） ─────────────────────────
+// ───────────── 系统定时签到（macOS launchd / Windows 任务计划程序） ─────────────
+// Runs `AgentDock --claim` daily at 10:05 and 22:05 without the app open.
 
+#[cfg(not(windows))]
 fn launchd_plist() -> std::path::PathBuf {
     dirs::home_dir().unwrap_or_default().join("Library/LaunchAgents/com.agentdock.claim.plist")
 }
 
+#[cfg(windows)]
+const WIN_TASKS: [(&str, &str); 2] = [("AgentDock\\Claim-1005", "10:05"), ("AgentDock\\Claim-2205", "22:05")];
+
+#[cfg(windows)]
+fn schtasks(args: &[&str]) -> Option<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    let root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into());
+    std::process::Command::new(root.join("System32\\schtasks.exe"))
+        .args(args)
+        .creation_flags(0x0800_0000)
+        .output()
+        .ok()
+}
+
 #[tauri::command]
 pub fn launchd_status() -> Value {
+    #[cfg(windows)]
+    {
+        let installed = WIN_TASKS
+            .iter()
+            .all(|(name, _)| schtasks(&["/Query", "/TN", name]).is_some_and(|o| o.status.success()));
+        json!({"installed": installed, "path": "Task Scheduler\\AgentDock"})
+    }
+    #[cfg(not(windows))]
     json!({"installed": launchd_plist().exists(), "path": launchd_plist()})
 }
 
+#[cfg(windows)]
+#[tauri::command]
+pub async fn launchd_install(_hub: State<'_, Shared>, install: bool) -> Res {
+    blocking(move || {
+        for (name, _) in WIN_TASKS {
+            let _ = schtasks(&["/Delete", "/TN", name, "/F"]);
+        }
+        if !install {
+            return Ok(json!({"installed":false}));
+        }
+        let exe = std::env::current_exe().map_err(|_| "无法定位应用程序")?;
+        let command = format!("\"{}\" --claim", exe.display());
+        for (name, time) in WIN_TASKS {
+            let ok = schtasks(&["/Create", "/TN", name, "/SC", "DAILY", "/ST", time, "/TR", &command, "/F"])
+                .is_some_and(|o| o.status.success());
+            if !ok {
+                return Err("无法注册 Windows 定时任务".to_string());
+            }
+        }
+        Ok(json!({"installed":true,"path":"Task Scheduler\\AgentDock"}))
+    })
+    .await?
+}
+
+#[cfg(not(windows))]
 #[tauri::command]
 pub async fn launchd_install(hub: State<'_, Shared>, install: bool) -> Res {
     let plist = launchd_plist();
@@ -397,8 +501,16 @@ pub async fn wb_open_oauth_link(url: String) -> Res {
 }
 #[tauri::command]
 pub async fn wb_set_auto_checkin(hub: State<'_, Shared>, enabled: bool) -> Res {
-    let wb = hub.wb.clone();
-    blocking(move || wb.set_auto_checkin(enabled).map(|_| json!({"ok":true}))).await?
+    let hub = hub.inner().clone();
+    blocking(move || {
+        hub.wb.set_auto_checkin(enabled)?;
+        hub.update_settings(|s| {
+            s.checkin.workbuddy = enabled;
+            Ok(())
+        })?;
+        Ok(json!({"ok":true}))
+    })
+    .await?
 }
 #[tauri::command]
 pub async fn wb_set_checkin_config(hub: State<'_, Shared>, config: workbuddy::checkin::Config) -> Res {
@@ -448,7 +560,12 @@ pub async fn wb_switch_client(hub: State<'_, Shared>, id: String, target: String
 }
 #[tauri::command]
 pub async fn wb_checkin(hub: State<'_, Shared>, id: String, submit: bool) -> Res {
-    workbuddy::proxy::checkin(hub.wb.clone(), id, submit).await
+    let r = workbuddy::proxy::checkin(hub.wb.clone(), id.clone(), submit).await;
+    if submit && r.is_ok() {
+        // The reward lands in the credit balance: refresh it so the pool and check-in views agree.
+        let _ = workbuddy::settings::refresh_accounts(hub.wb.clone(), vec![id]).await;
+    }
+    r
 }
 #[tauri::command]
 pub async fn wb_credit_statistics(hub: State<'_, Shared>) -> Res {
@@ -521,7 +638,7 @@ pub fn qoder_build_state(hub: &Shared) -> Value {
             }
         }
         current.insert(ed.key.to_string(), uid.clone());
-        editions.insert(ed.key.into(), json!({"label":ed.label,"installed":installed,"running":installed && qc::app_running(ed.key),"currentUid":uid,"currentName":uname}));
+        editions.insert(ed.key.into(), json!({"label":ed.label,"installed":installed,"running":installed && qoder_running_cached(ed.key),"currentUid":uid,"currentName":uname}));
     }
     let credits = hub.qoder.credit_cache();
     let config = hub.qoder.config();
@@ -645,22 +762,42 @@ pub async fn qoder_delete_account(hub: State<'_, Shared>, id: String) -> Res {
     .await
 }
 #[tauri::command]
-pub async fn qoder_set_auto_claim(enabled: bool) -> Res {
+pub async fn qoder_set_auto_claim(hub: State<'_, Shared>, enabled: bool) -> Res {
+    let hub = hub.inner().clone();
     blocking(move || {
         let mut s = qoder::qcore::load_settings();
         s["autoClaim"] = json!(enabled);
         qoder::qcore::save_settings(&s);
-        json!({"ok":true,"message":format!("自动领取已{}", if enabled {"开启"} else {"关闭"})})
+        hub.update_settings(|s| {
+            s.checkin.qoder = enabled;
+            Ok(())
+        })?;
+        Ok(json!({"ok":true,"message":format!("自动领取已{}", if enabled {"开启"} else {"关闭"})}))
     })
-    .await
+    .await?
 }
+/// Status-only check, reused for 3 s: on Windows each check launches PowerShell.
+/// Switching and session writes keep calling `app_running` directly.
+fn qoder_running_cached(key: &str) -> bool {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Vec<(String, std::time::Instant, bool)>> = Mutex::new(Vec::new());
+    if let Some((_, _, v)) = CACHE.lock().unwrap().iter().find(|(k, at, _)| k == key && at.elapsed().as_secs() < 3) {
+        return *v;
+    }
+    let v = qoder::qcore::app_running(key);
+    let mut cache = CACHE.lock().unwrap();
+    cache.retain(|(k, _, _)| k != key);
+    cache.push((key.to_owned(), std::time::Instant::now(), v));
+    v
+}
+
 #[tauri::command]
 pub async fn qoder_open_app(edition: String) -> Res {
     blocking(move || {
-        qoder::qcore::launch_app(&edition);
-        json!({"ok":true,"message":"已启动"})
+        qoder::qcore::launch_app(&edition)?;
+        Ok(json!({"ok":true,"message":"已启动"}))
     })
-    .await
+    .await?
 }
 #[tauri::command]
 pub async fn qoder_export_accounts() -> Res {
@@ -843,4 +980,134 @@ pub async fn trae_import(hub: State<'_, Shared>, variant: String, account: Value
 pub async fn trae_delete(hub: State<'_, Shared>, id: String) -> Res {
     let t = hub.trae.clone();
     blocking(move || t.delete(&id).map(|_| json!({"ok":true}))).await?
+}
+
+// ── WorkBuddy sessions (WorkBuddy Switch session core) ──
+fn wb_variant(v: &str) -> Result<wb_switch_core::modules::variant::WbVariant, String> {
+    use wb_switch_core::modules::variant::WbVariant;
+    match v {
+        "cn" => Ok(WbVariant::Cn),
+        "ai" | "intl" => Ok(WbVariant::Ai),
+        _ => Err("不支持的 WorkBuddy 版本".into()),
+    }
+}
+/// Switch-library accounts of one variant, plus the client's current login when it is not in the library.
+fn wb_session_account_list(variant: wb_switch_core::modules::variant::WbVariant) -> (Vec<Value>, Option<String>) {
+    use wb_switch_core::modules::{account, session};
+    let current = session::current_user_uid(variant);
+    let mut list: Vec<Value> = account::load_accounts()
+        .into_iter()
+        .filter(|a| account::variant_of(a) == variant && a["uid"].as_str().is_some_and(|s| !s.is_empty()))
+        .collect();
+    if let Some(uid) = &current {
+        if !list.iter().any(|a| a["uid"] == uid.as_str()) {
+            list.insert(0, json!({"id": "", "uid": uid, "nickname": "当前登录账号", "variant": variant.as_str()}));
+        }
+    }
+    (list, current)
+}
+fn wb_session_account(variant: &str, uid: &str) -> Result<Value, String> {
+    let (list, _) = wb_session_account_list(wb_variant(variant)?);
+    list.into_iter()
+        .find(|a| a["uid"] == uid)
+        .ok_or_else(|| "账号库中找不到该账号；请先在账号池导入或在客户端登录".into())
+}
+#[tauri::command]
+pub async fn wb_session_accounts(variant: String) -> Res {
+    blocking(move || {
+        let v = wb_variant(&variant)?;
+        let (list, current) = wb_session_account_list(v);
+        let accounts: Vec<Value> = list
+            .iter()
+            .map(|a| {
+                json!({
+                    "uid": a["uid"],
+                    "name": a["nickname"].as_str().or(a["email"].as_str()).or(a["uid"].as_str()).unwrap_or(""),
+                    "current": current.as_deref() == a["uid"].as_str(),
+                    "inLibrary": a["id"].as_str().is_some_and(|s| !s.is_empty()),
+                })
+            })
+            .collect();
+        Ok(json!({
+            "variant": v.as_str(),
+            "current": current,
+            "running": wb_switch_core::modules::process::is_workbuddy_running(v),
+            "accounts": accounts,
+        }))
+    })
+    .await?
+}
+#[tauri::command]
+pub async fn wb_list_sessions(variant: String, uid: String) -> Res {
+    blocking(move || {
+        let v = wb_variant(&variant)?;
+        Ok(json!({"sessions": wb_switch_core::modules::session::list_sessions_for_user(v, &uid)}))
+    })
+    .await?
+}
+/// Copy sessions to another account (either version). With `quit`, a running
+/// target WorkBuddy is closed first; the core refuses to write while it runs.
+#[tauri::command]
+pub async fn wb_copy_sessions(
+    variant: String,
+    uid: String,
+    target_variant: String,
+    target_uid: String,
+    session_ids: Vec<String>,
+    quit: bool,
+) -> Res {
+    blocking(move || {
+        if session_ids.is_empty() {
+            return Err("请选择要复制的会话".to_string());
+        }
+        let source = wb_session_account(&variant, &uid)?;
+        let target = wb_session_account(&target_variant, &target_uid)?;
+        let tv = wb_variant(&target_variant)?;
+        if quit && wb_switch_core::modules::process::is_workbuddy_running(tv) {
+            wb_switch_core::modules::process::close_workbuddy(tv, 15)?;
+        }
+        let report = wb_switch_core::modules::session::copy_sessions_cross(&source, &target, &session_ids)?;
+        agentdock_core::applog::info("workbuddy.session", || {
+            (format!("已复制 {} 个会话到 {}", session_ids.len(), target_uid), report.clone())
+        });
+        Ok(report)
+    })
+    .await?
+}
+#[tauri::command]
+pub async fn wb_session_groups() -> Res {
+    use wb_switch_core::modules::session_groups::{list, SessionClient};
+    blocking(|| list(SessionClient::Workbuddy, None)).await?
+}
+#[tauri::command]
+pub async fn wb_session_group_detail(group_id: String) -> Res {
+    use wb_switch_core::modules::session_groups::{detail, SessionClient};
+    blocking(move || detail(SessionClient::Workbuddy, None, &group_id)).await?
+}
+#[tauri::command]
+pub async fn wb_sync_session_group(group_id: String) -> Res {
+    use wb_switch_core::modules::session_groups::{sync_safe_batch, SessionClient};
+    blocking(move || sync_safe_batch(SessionClient::Workbuddy, None, &group_id, false)).await?
+}
+#[tauri::command]
+pub async fn wb_unlink_session_group(group_id: String) -> Res {
+    use wb_switch_core::modules::session_groups::{delete_group, SessionClient};
+    blocking(move || delete_group(SessionClient::Workbuddy, None, &group_id)).await?
+}
+
+// ── per-account JSON ──
+#[tauri::command]
+pub async fn account_json(hub: State<'_, Shared>, provider: String, id: String) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || crate::account_json::export(&hub, &provider, &id)).await?
+}
+#[tauri::command]
+pub async fn account_json_save(hub: State<'_, Shared>, provider: String, id: String) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || crate::account_json::save(&hub, &provider, &id)).await?
+}
+#[tauri::command]
+pub async fn account_json_import(hub: State<'_, Shared>, provider: String, region: Option<String>, json: Value) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || crate::account_json::import(&hub, &provider, region.as_deref(), &json)).await?
 }

@@ -3,9 +3,17 @@ import { computed, ref, watch, onMounted } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
 import { IconRefresh, IconCopy, IconDelete, IconSync } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
+import ProviderMark from '../components/ProviderMark.vue'
+import WorkbuddySessions from '../components/WorkbuddySessions.vue'
 import { call } from '../api'
 import { t, fmtShort } from '../i18n'
 
+const provider = ref<'qoder' | 'workbuddy'>('qoder')
+const wbRef = ref<InstanceType<typeof WorkbuddySessions> | null>(null)
+function refresh() {
+  if (provider.value === 'workbuddy') wbRef.value?.load()
+  else load()
+}
 const edition = ref<'cn' | 'intl'>('cn')
 const query = ref('')
 const filter = ref<'all' | 'linked' | 'consistent' | 'modified'>('all')
@@ -64,9 +72,15 @@ function remove(s: any) {
 </script>
 
 <template>
-  <PageHead eyebrow="QODER SESSIONS" :title="t('会话管理', 'Sessions')" :desc="t('管理 Qoder 各版本本地会话：复制副本、关联同步、删除（写操作会自动退出对应应用并先备份）。', 'Manage local Qoder sessions: copy, link and sync, delete (writes quit the app and back up first).')">
-    <a-button :loading="loading" @click="load"><template #icon><IconRefresh /></template>{{ t('刷新', 'Refresh') }}</a-button>
+  <PageHead eyebrow="SESSIONS" :title="t('会话管理', 'Sessions')" :desc="t('管理各客户端的本地会话：复制到其他账号、关联同步与删除。写操作会先备份，必要时自动退出对应客户端。', 'Manage local client sessions: copy to other accounts, link and sync, delete. Writes back up first and quit the client when needed.')">
+    <a-button :loading="loading" @click="refresh"><template #icon><IconRefresh /></template>{{ t('刷新', 'Refresh') }}</a-button>
   </PageHead>
+  <a-radio-group v-model="provider" type="button" style="margin-bottom: 16px">
+    <a-radio value="qoder"><ProviderMark provider="qoder" style="margin-right: 6px" />Qoder</a-radio>
+    <a-radio value="workbuddy"><ProviderMark provider="workbuddy" style="margin-right: 6px" />WorkBuddy</a-radio>
+  </a-radio-group>
+  <WorkbuddySessions v-if="provider === 'workbuddy'" ref="wbRef" />
+  <template v-else>
   <div class="filter-bar">
     <a-radio-group v-model="edition" type="button">
       <a-radio value="cn">Qoder CN</a-radio>
@@ -111,4 +125,5 @@ function remove(s: any) {
       </div>
     </div>
   </div>
+  </template>
 </template>

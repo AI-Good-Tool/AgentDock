@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { isWindows } from '../../api'
 import { t, fmtDateTime } from '../../i18n'
 import { ref, watch } from 'vue'
 import { InputNumber as AInputNumber, Modal, Message } from '@arco-design/web-vue'
@@ -35,7 +36,9 @@ function save() {
     title: t('确认运行设置', 'Confirm runtime settings'),
     content: [
       settings.useDeviceSdk
-        ? t('设备 SDK 开启：启动反代时预热设备令牌，可能触发 macOS 钥匙串密码授权；不保存系统密码，失败不自动降级。', 'Device SDK on: the device token is prepared when the gateway starts and may trigger a macOS Keychain prompt; no system password is stored and failures never downgrade silently.')
+        ? isWindows
+          ? t('设备 SDK 开启：启动反代时预热设备令牌；不保存系统密码，失败不自动降级。', 'Device SDK on: the device token is prepared when the gateway starts; no system password is stored and failures never downgrade silently.')
+          : t('设备 SDK 开启：启动反代时预热设备令牌，可能触发 macOS 钥匙串密码授权；不保存系统密码，失败不自动降级。', 'Device SDK on: the device token is prepared when the gateway starts and may trigger a macOS Keychain prompt; no system password is stored and failures never downgrade silently.')
         : t('设备 SDK 关闭：不获取设备令牌，上游可能拒绝。', 'Device SDK off: no device token is sent; the upstream may reject requests.'),
       settings.accountRefreshEnabled
         ? t(`定时刷新开启：每 ${settings.accountRefreshMinutes} 分钟向官方查询所有启用账号的积分与积分包，首次在一个完整间隔后执行；使用现有凭据，不刷新登录令牌，可能遇到限流。`, `Scheduled refresh on: every ${settings.accountRefreshMinutes} minutes, credits and packs of enabled accounts are queried (first run after one full interval), with existing credentials and no token refresh; rate limits may apply.`)
@@ -111,7 +114,7 @@ function save() {
         <p>
           {{ t('关闭时不加载原生设备 SDK、不获取或发送设备令牌，仍使用本机 Node 进行 gzip 压缩与传输。', 'When off, the native device SDK is not loaded and no device token is sent; the local Node runtime still compresses and transports requests.') }}
         </p>
-        <small>{{ t('开启可能触发 macOS 钥匙串授权。关闭后上游可能拒绝请求；不会伪造令牌或自动重新开启。保存后对新请求生效，进行中的请求不受影响。', 'Turning it on may prompt for Keychain access. When off the upstream may reject requests; tokens are never forged or re-enabled automatically. Applies to new requests.') }}</small>
+        <small>{{ isWindows ? '' : t('开启可能触发 macOS 钥匙串授权。', 'Turning it on may prompt for Keychain access. ') }}{{ t('关闭后上游可能拒绝请求；不会伪造令牌或自动重新开启。保存后对新请求生效，进行中的请求不受影响。', 'When off the upstream may reject requests; tokens are never forged or re-enabled automatically. Applies to new requests.') }}</small>
       </div>
       <a-switch v-model="draft.useDeviceSdk" />
     </div>

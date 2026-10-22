@@ -1,11 +1,13 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 
 export const desktop = isTauri()
+/** Windows build (wording and OS integrations differ from macOS). */
+export const isWindows = /Windows/i.test(navigator.userAgent)
 
 export const previewMode = !desktop && import.meta.env.DEV && new URLSearchParams(location.search).has('preview')
 
 export function call<T = any>(command: string, args?: Record<string, unknown>): Promise<T> {
-  if (previewMode) return import('./dev/preview').then((m) => m.preview(command) as T)
+  if (previewMode) return import('./dev/preview').then((m) => m.preview(command, args) as T)
   if (!desktop) return Promise.reject(new Error('请在 AgentDock 桌面应用中使用 / Please use the AgentDock desktop app'))
   return invoke<T>(command, args)
 }
@@ -37,6 +39,32 @@ export interface Settings {
   lang: 'system' | 'zh' | 'en'
   timezone: string
   tokenFormat: string
+  checkin: CheckinSettings
+  logging: boolean
+  version?: number
+}
+export interface CheckinSettings {
+  workbuddy: boolean
+  qoder: boolean
+  trae: boolean
+  onStartup: boolean
+  scheduled: boolean
+  intervalMinutes: number
+}
+export interface CheckinStatus {
+  running?: boolean
+  trigger?: string
+  lastRun?: number | null
+  nextRun?: number | null
+  results?: Record<ProviderKey, any[] | 'disabled'>
+}
+export interface AppLogEntry {
+  seq: number
+  time: number
+  level: 'debug' | 'info' | 'warn' | 'error'
+  source: string
+  message: string
+  fields?: any
 }
 export interface RequestLog {
   id: string
@@ -61,6 +89,10 @@ export interface RequestLog {
   upstreamCode?: string | null
   strategy: string
   stream: boolean
+  /** 1-based account attempt within one client request. */
+  attempt?: number
+  /** Id of the first attempt; shared by every attempt of one request. */
+  requestGroup?: string
   details?: any
 }
 export interface AppSnapshot {
@@ -73,6 +105,7 @@ export interface AppSnapshot {
   settings: Settings
   active: RequestLog[]
   migration?: any
+  checkin?: CheckinStatus
 }
 export interface Target {
   key: string

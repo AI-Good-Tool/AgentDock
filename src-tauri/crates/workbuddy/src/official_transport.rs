@@ -16,9 +16,10 @@ struct Worker {
     _stdin: ChildStdin,
     client: reqwest::Client,
     directory: PathBuf,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     socket: PathBuf,
     key: String,
+    local_url: Option<String>,
     drain: tokio::task::JoinHandle<()>,
 }
 impl Drop for Worker {
@@ -26,7 +27,9 @@ impl Drop for Worker {
         let _ = self.child.start_kill();
         self.drain.abort();
         // Both paths are uniquely created and owned by this worker.
-        let _ = std::fs::remove_dir_all(&self.directory);
+        if !self.directory.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
     }
 }
 impl Worker {
@@ -111,11 +114,11 @@ impl Worker {
         }
         Ok(executable)
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     async fn start() -> Result<Self, String> {
         Self::launch(SCRIPT).await
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     async fn launch(script: &str) -> Result<Self, String> {
         use std::os::unix::fs::DirBuilderExt;
         let directory = PathBuf::from(format!("/tmp/wb-api-{}", Uuid::new_v4().simple()));
@@ -152,6 +155,9 @@ impl Worker {
             Ok(child) => child,
             Err(_) => {
                 let _ = std::fs::remove_dir_all(&directory);
+                agentdock_core::applog::error("workbuddy.sdk", || {
+                    ("无法启动官方 Node 运行时（未安装 WorkBuddy？）".into(), serde_json::Value::Null)
+                });
                 return Err(
                     "请安装已验证的 WorkBuddy 5.8.3，以获取官方 Node 运行时与设备 SDK".into(),
                 );
@@ -183,6 +189,7 @@ impl Worker {
             #[cfg(test)]
             socket,
             key,
+            local_url: None,
             drain,
         };
         if !matches!(ready, Ok(Ok(_)))
@@ -190,13 +197,112 @@ impl Worker {
                 .ok()
                 .is_none_or(|v| v["ready"] != true)
         {
+            agentdock_core::applog::error("workbuddy.sdk", || {
+                ("官方传输进程未就绪（版本/运行时/设备 SDK 不匹配）".into(), serde_json::Value::Null)
+            });
             return Err("本机 WorkBuddy 版本、Node 运行时或设备 SDK 与已验证配置不匹配".into());
         }
+        agentdock_core::applog::info("workbuddy.sdk", || {
+            ("官方传输进程已启动".into(), serde_json::Value::Null)
+        });
         Ok(worker)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     async fn start() -> Result<Self, String> {
-        Err("当前系统尚未接入官方设备 SDK 传输".into())
+        use wb_switch_core::modules::{process, variant::WbVariant};
+        let executable = tokio::task::spawn_blocking(|| {
+            process::windows_workbuddy_exe_path(WbVariant::Cn)
+                .or_else(|| process::windows_workbuddy_exe_path(WbVariant::Ai))
+        })
+        .await
+        .map_err(|_| "查找 WorkBuddy 安装路径失败")?
+        .ok_or("请安装 WorkBuddy 5.8.3；也可在 Switch 中设置其自定义安装路径")?;
+        let key = Uuid::new_v4().simple().to_string();
+        // Windows uses an ephemeral loopback listener plus a process-private random secret.
+        // No unauthenticated bridge, named-pipe pathname or command-shell interpolation.
+        let mut child = Command::new(executable)
+            .args(["-e", SCRIPT])
+            .env("ELECTRON_RUN_AS_NODE", "1")
+            .env("WB_OFFICIAL_BRIDGE", "1")
+            .env("WB_OFFICIAL_TCP", "1")
+            .env("WB_OFFICIAL_KEY", &key)
+            .env_remove("WB_OFFICIAL_SOCKET")
+            .env_remove("NODE_OPTIONS")
+            .env_remove("NODE_EXTRA_CA_CERTS")
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| "无法启动已安装 WorkBuddy 的 Node 运行时")?;
+        let stdin = child.stdin.take().ok_or("本机传输初始化失败")?;
+        let stdout = child.stdout.take().ok_or("本机传输初始化失败")?;
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let ready =
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line)).await;
+        if !matches!(ready, Ok(Ok(n)) if n > 0) {
+            return Err("后台传输启动超时，请检查 WorkBuddy 安装版本".into());
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&line).map_err(|_| "后台传输未返回有效启动状态")?;
+        let port = bridge_port(&value)?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(200))
+            .build()
+            .map_err(|_| "本机传输初始化失败")?;
+        let drain = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
+        });
+        Ok(Self {
+            child,
+            _stdin: stdin,
+            client,
+            directory: PathBuf::new(),
+            key,
+            local_url: Some(format!("http://127.0.0.1:{port}")),
+            drain,
+        })
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    async fn start() -> Result<Self, String> {
+        Err("当前系统不支持本机官方传输".into())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn bridge_port(value: &serde_json::Value) -> Result<u16, String> {
+    if value["ready"] != true {
+        return Err("WorkBuddy 版本或运行时与已验证配置不匹配".into());
+    }
+    value["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+        .filter(|p| *p > 0)
+        .ok_or_else(|| "后台传输返回无效的本地端口".into())
+}
+#[cfg(test)]
+mod portable_tests {
+    #[test]
+    fn private_bridge_startup_rejects_invalid_ports_and_failure() {
+        use serde_json::json;
+        assert_eq!(
+            super::bridge_port(&json!({"ready":true,"port":12345})).unwrap(),
+            12345
+        );
+        for value in [
+            json!({"ready":false,"port":12345}),
+            json!({"ready":true}),
+            json!({"ready":true,"port":0}),
+            json!({"ready":true,"port":65536}),
+            json!({"ready":true,"port":"12345"}),
+        ] {
+            assert!(super::bridge_port(&value).is_err());
+        }
     }
 }
 
@@ -371,6 +477,8 @@ upstream.listen(0,'127.0.0.1',()=>{{
         .unwrap();
         let dynamic = [
             "authorization",
+            "x-stainless-arch",
+            "x-stainless-os",
             "x-user-id",
             "x-domain",
             "x-device-token",
@@ -422,14 +530,36 @@ impl Transport {
             *slot = Some(Worker::start().await?);
         }
         let worker = slot.as_ref().unwrap();
+        let started = std::time::Instant::now();
         let response = worker
             .client
-            .post("http://localhost/_device/prepare")
+            .post(format!(
+                "{}/_device/prepare",
+                worker.local_url.as_deref().unwrap_or("http://localhost")
+            ))
+            .header("host", "localhost")
             .header("x-wb-bridge-key", &worker.key)
             .send()
             .await
-            .map_err(|_| "设备 SDK 启动授权失败，请重试")?;
-        if response.status() != 204 {
+            .map_err(|_| {
+                agentdock_core::applog::error("workbuddy.sdk", || {
+                    ("设备 SDK 启动授权请求失败".into(), serde_json::Value::Null)
+                });
+                "设备 SDK 启动授权失败，请重试"
+            })?;
+        let status = response.status().as_u16();
+        let level = if status == 204 {
+            agentdock_core::applog::Level::Info
+        } else {
+            agentdock_core::applog::Level::Warn
+        };
+        agentdock_core::applog::emit(level, "workbuddy.sdk", || {
+            (
+                if status == 204 { "设备 SDK 已取得设备令牌" } else { "设备 SDK 未取得设备令牌" }.into(),
+                serde_json::json!({"status": status, "durationMs": started.elapsed().as_millis() as u64}),
+            )
+        });
+        if status != 204 {
             return Err(
                 "设备 SDK 未取得有效令牌，请完成系统授权后重新启动反代；也可关闭设备 SDK".into(),
             );
@@ -450,7 +580,7 @@ impl Transport {
         {
             return Err("官方传输地址不受支持".into());
         }
-        let (client, key) = {
+        let (client, key, local_url) = {
             let mut slot = self.0.lock().await;
             if let Some(worker) = slot.as_mut() {
                 if worker
@@ -466,12 +596,25 @@ impl Transport {
                 *slot = Some(Worker::start().await?);
             }
             let worker = slot.as_ref().unwrap();
-            (worker.client.clone(), worker.key.clone())
+            (
+                worker.client.clone(),
+                worker.key.clone(),
+                worker.local_url.clone(),
+            )
         };
+        let official_host = request.url().host_str().unwrap().to_owned();
+        if let Some(base) = local_url {
+            *request.url_mut() = reqwest::Url::parse(&format!("{base}/v2/chat/completions"))
+                .map_err(|_| "本机传输地址无效")?;
+        } else {
+            request
+                .url_mut()
+                .set_scheme("http")
+                .map_err(|_| "本机传输地址无效")?;
+        }
         request
-            .url_mut()
-            .set_scheme("http")
-            .map_err(|_| "本机传输地址无效")?;
+            .headers_mut()
+            .insert("host", official_host.parse().map_err(|_| "官方主机名无效")?);
         request.headers_mut().insert(
             "x-wb-bridge-key",
             key.parse().map_err(|_| "本机传输凭据无效")?,
@@ -483,9 +626,30 @@ impl Transport {
             if use_device_sdk { "1" } else { "0" }.parse().unwrap(),
         );
         // Never retry a sent request: its upstream outcome may be unknown.
-        client
-            .execute(request)
-            .await
-            .map_err(|_| "无法连接本机官方传输；请稍后重试".into())
+        let started = std::time::Instant::now();
+        let result = client.execute(request).await;
+        agentdock_core::applog::emit(
+            if result.as_ref().is_ok_and(|r| r.status().is_success()) {
+                agentdock_core::applog::Level::Debug
+            } else {
+                agentdock_core::applog::Level::Warn
+            },
+            "workbuddy.sdk",
+            || {
+                let status = result.as_ref().ok().map(|r| r.status().as_u16());
+                (
+                    match status {
+                        Some(_) => "官方传输已转发对话请求".into(),
+                        None => "官方传输连接失败".into(),
+                    },
+                    serde_json::json!({
+                        "status": status,
+                        "deviceSdk": use_device_sdk,
+                        "firstByteMs": started.elapsed().as_millis() as u64,
+                    }),
+                )
+            },
+        );
+        result.map_err(|_| "无法连接本机官方传输；请稍后重试".into())
     }
 }

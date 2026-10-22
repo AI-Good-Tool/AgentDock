@@ -36,6 +36,11 @@ pub struct Hub {
     pub server: Mutex<Option<ServerHandle>>,
     pub error: Mutex<String>,
     pub qoder_scheduler: Mutex<Value>,
+    pub applog: Arc<crate::applog::AppLog>,
+    /// Unified check-in scheduler status (last/next run, per-platform results).
+    pub checkin: Mutex<Value>,
+    /// Wakes the check-in scheduler after its settings change.
+    pub checkin_wake: tokio::sync::Notify,
 }
 
 pub fn read_settings(path: &Path) -> Settings {
@@ -74,7 +79,9 @@ impl Hub {
     /// Open every provider under `dir` (created and migrated by `paths`).
     pub fn open(dir: &Path) -> Result<Shared, String> {
         qoder::qcore::set_data_dir(dir.join("qoder"));
-        let settings = read_settings(&dir.join("settings.json"));
+        let settings_path = dir.join("settings.json");
+        let existed = settings_path.exists();
+        let mut settings = read_settings(&settings_path);
         let key_path = dir.join("api-key");
         let key = match std::fs::read_to_string(&key_path) {
             Ok(k) if crate::api_key::validate(k.trim()).is_ok() => k.trim().to_owned(),
@@ -87,6 +94,18 @@ impl Hub {
         let wb = workbuddy::pool::AppState::new(dir.join("workbuddy/store.json"))?;
         let qoder = qoder::gateway::Provider::new()?;
         let trae = trae::Provider::open(&dir.join("trae"))?;
+        if settings.upgrade() {
+            if existed {
+                // Carry the per-app automatic check-in switches into the unified schedule.
+                settings.checkin.workbuddy = wb.store.lock().unwrap().auto_checkin;
+                settings.checkin.qoder = qoder::qcore::load_settings()["autoClaim"]
+                    .as_bool()
+                    .unwrap_or(true);
+            }
+            // Upgraded values still apply in memory if the file cannot be rewritten.
+            let _ = write_private(&settings_path, &serde_json::to_vec_pretty(&settings).unwrap());
+        }
+        let applog = crate::applog::AppLog::install(dir, settings.logging);
         let logs = Arc::new(LogStore::open(dir));
         let sink_logs = logs.clone();
         *wb.log_sink.lock().unwrap() = Some(Arc::new(move |log: &workbuddy::pool::RequestLog| {
@@ -106,6 +125,9 @@ impl Hub {
             server: Mutex::new(None),
             error: Mutex::new(String::new()),
             qoder_scheduler: Mutex::new(json!({"lastRun":null,"lastResults":[]})),
+            applog,
+            checkin: Mutex::new(json!({})),
+            checkin_wake: tokio::sync::Notify::new(),
         }))
     }
     /// Test assembly with fixture providers and no migration.
@@ -132,6 +154,9 @@ impl Hub {
             server: Mutex::new(None),
             error: Mutex::new(String::new()),
             qoder_scheduler: Mutex::new(json!({})),
+            applog: crate::applog::AppLog::new(dir),
+            checkin: Mutex::new(json!({})),
+            checkin_wake: tokio::sync::Notify::new(),
         })
     }
     pub fn settings(&self) -> Settings {
@@ -161,6 +186,19 @@ impl Hub {
             &serde_json::to_vec_pretty(&next).unwrap(),
         )?;
         *self.settings.lock().unwrap() = next.clone();
+        agentdock_core::applog::set_enabled(next.logging);
+        if next.checkin != previous.checkin {
+            // Keep the per-app switches (WorkBuddy store, Qoder settings) in step.
+            if self.wb.store.lock().unwrap().auto_checkin != next.checkin.workbuddy {
+                let _ = self.wb.set_auto_checkin(next.checkin.workbuddy);
+            }
+            let mut q = qoder::qcore::load_settings();
+            if q["autoClaim"].as_bool() != Some(next.checkin.qoder) {
+                q["autoClaim"] = json!(next.checkin.qoder);
+                qoder::qcore::save_settings(&q);
+            }
+            self.checkin_wake.notify_one();
+        }
         Ok(next)
     }
 
@@ -217,8 +255,8 @@ impl Hub {
                 .chat_eligibility(&account.id, &target.id)
                 .map(Exec::Qoder),
             ProviderKind::Trae => {
-                // The native endpoint is text-only: leave tool/image requests to other providers.
-                trae::gateway::native_body(body, None).map_err(|_| "Trae 仅支持纯文本对话（请求含工具或图片）")?;
+                // The Remote chain carries text and client tools; images go to other providers.
+                trae::gateway::validate(body).map_err(|_| "Trae 暂不支持图片输入")?;
                 self.trae
                     .chat_eligibility(&account.id, &target.id)
                     .map(Exec::Trae)

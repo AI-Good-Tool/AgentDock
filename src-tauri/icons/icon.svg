@@ -1,1 +1,48 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><rect x="32" y="32" width="960" height="960" rx="240" fill="#19aa82"/><path d="M210 340l95 365h105l102-215 102 215h105l95-365H695l-54 235-100-220h-58L383 575l-54-235z" fill="#fff"/><circle cx="775" cy="250" r="57" fill="#a4f0ce"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- AgentDock: three provider routes merging into one gateway port (macOS 824px icon grid). -->
+  <defs>
+    <linearGradient id="bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#23C795"/>
+      <stop offset="0.55" stop-color="#109A73"/>
+      <stop offset="1" stop-color="#075E47"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.12"/>
+      <stop offset="0.5" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="lane" gradientUnits="userSpaceOnUse" x1="250" y1="0" x2="640" y2="0">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.82"/>
+      <stop offset="1" stop-color="#FFFFFF"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="14"/>
+      <feOffset dy="12" result="blur"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.28"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="glyph" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10"/>
+      <feOffset dy="8"/>
+      <feComponentTransfer><feFuncA type="linear" slope="0.22"/></feComponentTransfer>
+      <feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <g filter="url(#shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+    <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#gloss)"/>
+  </g>
+  <g filter="url(#glyph)" fill="none" stroke-linecap="round">
+    <!-- routes -->
+    <path d="M280 344 C 460 344 492 512 640 512" stroke="url(#lane)" stroke-width="56"/>
+    <path d="M280 512 H 640" stroke="url(#lane)" stroke-width="56"/>
+    <path d="M280 680 C 460 680 492 512 640 512" stroke="url(#lane)" stroke-width="56"/>
+    <!-- provider nodes -->
+    <circle cx="280" cy="344" r="46" fill="#FFFFFF"/>
+    <circle cx="280" cy="512" r="46" fill="#B9F5DF"/>
+    <circle cx="280" cy="680" r="46" fill="#FFFFFF"/>
+    <!-- gateway port -->
+    <circle cx="704" cy="512" r="114" fill="#FFFFFF"/>
+    <circle cx="704" cy="512" r="54" fill="#0F8A68"/>
+    <circle cx="704" cy="512" r="20" fill="#B9F5DF"/>
+  </g>
+</svg>

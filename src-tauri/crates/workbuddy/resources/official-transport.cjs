@@ -7,6 +7,10 @@ const path = require('node:path');
 const zlib = require('node:zlib');
 const { pipeline } = require('node:stream');
 
+function runtimeHeaders(platform, arch) {
+  return { 'x-stainless-os': ({ darwin: 'MacOS', win32: 'Windows', linux: 'Linux' })[platform] || 'Unknown',
+    'x-stainless-arch': arch };
+}
 function encode(body) {
   return zlib.gzipSync(Buffer.from(JSON.stringify(body)));
 }
@@ -97,9 +101,21 @@ function initializeBackgroundCocoa(koffi) {
   return cocoaPolicy();
 }
 
+function installedRoot(platform, executable) {
+  if (platform === 'darwin') return '/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked';
+  if (platform === 'win32') return path.win32.join(path.win32.dirname(executable), 'resources', 'app.asar.unpacked');
+  throw new Error('unsupported_runtime');
+}
+
+// Windows cannot use Unix sockets; the port is assigned by the OS, never predicted.
+function listenBridge(server, { socket, tcp }, ready) {
+  if (tcp) return server.listen(0, '127.0.0.1', () => ready({ port: server.address().port }));
+  if (!socket) throw new Error('missing_configuration');
+  return server.listen(socket, () => { fs.chmodSync(socket, 0o600); ready({}); });
+}
 function installedProfile() {
-  if (process.platform !== 'darwin' || process.version !== 'v22.21.1') throw new Error('unsupported_runtime');
-  const root = '/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked';
+  if (!['darwin', 'win32'].includes(process.platform) || process.version !== 'v22.21.1') throw new Error('unsupported_runtime');
+  const root = installedRoot(process.platform, process.execPath);
   const product = JSON.parse(fs.readFileSync(path.join(root, 'cli/product.json'), 'utf8'));
   const cli = JSON.parse(fs.readFileSync(path.join(root, 'cli/package.json'), 'utf8'));
   const variant = product.isOversea ? 'overseas' : 'domestic';
@@ -108,15 +124,18 @@ function installedProfile() {
   return { variant, load() {
     const sdkVariant = JSON.parse(fs.readFileSync(path.join(root, 'native/turing-sdk/build/Release/turing-sdk-variant.json'), 'utf8')).variant;
     if (!Number.isInteger(channel) || channel <= 0 || channel > 2147483647 || sdkVariant !== variant) throw new Error('unsupported_sdk');
-    const koffi = require(path.join(root, 'node_modules/koffi'));
-    if (initializeBackgroundCocoa(koffi) !== 2) throw new Error('background_policy_unavailable');
-    const loop = createMacRunLoop(koffi);
+    let loop;
+    if (process.platform === 'darwin') {
+      const koffi = require(path.join(root, 'node_modules/koffi'));
+      if (initializeBackgroundCocoa(koffi) !== 2) throw new Error('background_policy_unavailable');
+      loop = createMacRunLoop(koffi);
+    }
     try {
       const sdk = require(path.join(root, 'native/turing-sdk/index.cjs'));
       if (!sdk.isSupported()) throw new Error('sdk_unavailable');
-      sdk.configure(channel, product.applicationName || product.productName, product.productVersion || product.genieVersion, true);
-      return { fetchDeviceToken: options => sdk.fetchDeviceToken(options), startRunLoop: () => loop.start() };
-    } catch (error) { loop.close(); throw error; }
+      sdk.configure(channel, product.applicationName || product.productName, product.productVersion || product.genieVersion, process.platform === 'darwin');
+      return { fetchDeviceToken: options => sdk.fetchDeviceToken(options), startRunLoop: () => loop?.start() };
+    } catch (error) { loop?.close(); throw error; }
   }};
 }
 
@@ -181,7 +200,7 @@ function createBridge({ key, tokens, variant, connect = https.request }) {
         'x-root-request-id', 'x-agent-type', 'content-encoding', 'traceparent', 'b3', 'x-b3-traceid',
         'x-b3-parentspanid', 'x-b3-spanid', 'x-b3-sampled', 'x-trace-id', 'x-product', 'user-agent',
         'authorization', 'x-user-id', 'x-domain', 'x-enterprise-id', 'x-tenant-id', 'content-length', 'accept-encoding'];
-      const source = { ...req.headers, 'x-device-token': device, 'content-encoding': 'gzip', 'content-length': wire.length };
+      const source = { ...req.headers, ...runtimeHeaders(process.platform, process.arch), 'x-device-token': device, 'content-encoding': 'gzip', 'content-length': wire.length };
       const headers = {};
       for (const name of order) if (source[name] !== undefined) headers[name] = source[name];
       outbound = connect({ protocol: 'https:', hostname: allowed, path: req.url, method: 'POST', headers }, upstream => {
@@ -207,15 +226,15 @@ if (require.main === module || process.env.WB_OFFICIAL_BRIDGE === '1') {
     const profile = installedProfile();
     const socket = process.env.WB_OFFICIAL_SOCKET;
     const key = process.env.WB_OFFICIAL_KEY;
-    if (!socket || !key) throw new Error('missing_configuration');
+    const tcp = process.platform === 'win32' && process.env.WB_OFFICIAL_TCP === '1';
+    if ((!socket && !tcp) || !key) throw new Error('missing_configuration');
     const server = createBridge({ key, tokens: new DeviceTokens(profile.load), variant: profile.variant });
     server.on('error', () => process.exit(1));
-    server.listen(socket, () => {
-      fs.chmodSync(socket, 0o600);
-      process.stdout.write(JSON.stringify({ ready: true, node: process.version, variant: profile.variant }) + '\n');
+    listenBridge(server, { socket, tcp }, endpoint => {
+      process.stdout.write(JSON.stringify({ ready: true, node: process.version, variant: profile.variant, ...endpoint }) + '\n');
     });
     process.stdin.resume();
     process.stdin.on('end', () => { server.closeAllConnections(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1000).unref(); });
   } catch { process.stdout.write('{"ready":false}\n'); process.exitCode = 1; }
 }
-module.exports = { encode, DeviceTokens, createBridge, installedProfile, createMacRunLoop, initializeBackgroundCocoa };
+module.exports = { runtimeHeaders, installedRoot, listenBridge, encode, DeviceTokens, createBridge, installedProfile, createMacRunLoop, initializeBackgroundCocoa };

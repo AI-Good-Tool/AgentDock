@@ -107,7 +107,7 @@ pub fn purpose(headers: &HeaderMap, allow_auxiliary: bool) -> Result<String, &'s
     Ok(value.into())
 }
 
-fn agent_type(purpose: &str) -> &'static str {
+pub(crate) fn agent_type(purpose: &str) -> &'static str {
     match purpose {
         "context_compact" | "context_summary_pre_message" | "context_summary_max_token" => {
             "compaction"
@@ -164,7 +164,14 @@ pub fn chat_request_with_context(
             },
         )
         .header("X-Stainless-Lang", "js")
-        .header("X-Stainless-OS", "MacOS")
+        .header(
+            "X-Stainless-OS",
+            match std::env::consts::OS {
+                "windows" => "Windows",
+                "macos" => "MacOS",
+                _ => "Linux",
+            },
+        )
         .header("X-Stainless-Package-Version", "6.25.0")
         .header("X-Stainless-Retry-Count", "0")
         .header("X-Stainless-Runtime", "node")
@@ -389,6 +396,24 @@ mod tests {
         assert_ne!(headers["x-root-request-id"], headers["x-request-id"]);
         assert_eq!(headers["content-encoding"], "gzip");
         assert_eq!(headers["x-stainless-runtime-version"], "v22.21.1");
+        assert_eq!(
+            headers["x-stainless-os"],
+            if cfg!(windows) {
+                "Windows"
+            } else if cfg!(target_os = "macos") {
+                "MacOS"
+            } else {
+                "Linux"
+            }
+        );
+        assert_eq!(
+            headers["x-stainless-arch"],
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x64"
+            }
+        );
         assert_eq!(headers["x-ide-version"], "5.8.3");
         assert_eq!(headers["x-b3-traceid"], headers["x-trace-id"]);
         assert_eq!(
@@ -406,6 +431,8 @@ mod tests {
         .unwrap();
         let dynamic = [
             "host",
+            "x-stainless-os",
+            "x-stainless-arch",
             "connection",
             "content-length",
             "authorization",

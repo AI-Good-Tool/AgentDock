@@ -1,47 +1,200 @@
-//! Background schedulers carried over from the three applications. Each one
-//! keeps its original opt-in rules; nothing new runs without the user's switch.
+//! Background schedulers: the unified check-in schedule for all three
+//! platforms plus WorkBuddy's credit refresh and local client monitor.
 use crate::app::Shared;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub async fn spawn_all(hub: Shared) {
     // Debugging aid: inspect the UI without running any scheduled account action.
     if std::env::var_os("AGENTDOCK_NO_TASKS").is_some() {
         return;
     }
-    // WorkBuddy: daily check-in window, scheduled credit refresh, local client monitor.
-    tokio::spawn(workbuddy::proxy::run_checkin_scheduler(hub.wb.clone()));
+    agentdock_core::applog::info("app", || {
+        (format!("AgentDock {} 已启动", env!("CARGO_PKG_VERSION")), Value::Null)
+    });
+    // WorkBuddy: scheduled credit refresh and local client monitor.
     tokio::spawn(workbuddy::settings::run_scheduler(hub.wb.clone()));
     tokio::spawn(workbuddy::switch_bridge::run_local_monitor(hub.wb.clone()));
-    // Qoder: daily credits auto-claim (checks every 10 minutes, first after 30 s).
-    let q = hub.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        loop {
-            qoder_auto_claim(&q).await;
-            tokio::time::sleep(Duration::from_secs(600)).await;
-        }
-    });
-    // Trae: startup catch-up, then every 10 minutes for opted-in CN accounts.
-    let t = hub.trae.clone();
-    tokio::spawn(async move {
-        loop {
-            t.auto_checkin_tick().await;
-            tokio::time::sleep(Duration::from_secs(600)).await;
-        }
-    });
+    // Unified daily check-in / credit claim for all three platforms.
+    tokio::spawn(checkin_loop(hub.clone()));
     if hub.settings().auto_start {
         let _ = crate::server::start(hub.clone()).await;
     }
 }
 
+const STARTUP_DELAY: Duration = Duration::from_secs(10);
+static PASS_RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Startup pass (10 s after launch) and then every `interval_minutes`, both
+/// switchable; settings changes wake the loop so new values apply at once.
+async fn checkin_loop(hub: Shared) {
+    let launched = Instant::now();
+    let mut startup_pending = true;
+    let mut last: Option<Instant> = None;
+    loop {
+        let c = hub.settings().checkin;
+        if !c.on_startup {
+            startup_pending = false;
+        }
+        let interval = Duration::from_secs(u64::from(c.interval_minutes) * 60);
+        let next = if startup_pending {
+            Some(launched + STARTUP_DELAY)
+        } else if c.scheduled {
+            Some(last.unwrap_or(launched) + interval)
+        } else {
+            None
+        };
+        let next_ms = next.map(|at| now_ms() + at.saturating_duration_since(Instant::now()).as_millis() as i64);
+        hub.checkin.lock().unwrap()["nextRun"] = json!(next_ms);
+        match next {
+            Some(at) if at <= Instant::now() => {
+                let trigger = if startup_pending { "startup" } else { "scheduled" };
+                startup_pending = false;
+                last = Some(Instant::now());
+                run_pass(&hub, trigger).await;
+            }
+            Some(at) => {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(at.into()) => {}
+                    _ = hub.checkin_wake.notified() => {}
+                }
+            }
+            None => hub.checkin_wake.notified().await,
+        }
+    }
+}
+
+/// One check-in pass over every enabled platform. Overlapping passes are skipped.
+pub async fn run_pass(hub: &Shared, trigger: &str) -> Value {
+    if PASS_RUNNING.swap(true, Ordering::AcqRel) {
+        return json!({"skipped": "running"});
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PASS_RUNNING.store(false, Ordering::Release);
+        }
+    }
+    let _reset = Reset;
+    let c = hub.settings().checkin;
+    hub.checkin.lock().unwrap()["running"] = json!(true);
+    agentdock_core::applog::info("checkin", || {
+        (
+            format!("开始签到（{}）", trigger_label(trigger)),
+            json!({"workbuddy": c.workbuddy, "qoder": c.qoder, "trae": c.trae}),
+        )
+    });
+    let workbuddy = if c.workbuddy { json!(workbuddy_pass(hub).await) } else { json!("disabled") };
+    let qoder = if c.qoder { qoder_pass(hub).await } else { json!("disabled") };
+    let trae = if c.trae { json!(hub.trae.auto_checkin_tick().await) } else { json!("disabled") };
+    for (source, rows) in [("checkin.workbuddy", &workbuddy), ("checkin.qoder", &qoder), ("checkin.trae", &trae)] {
+        for row in rows.as_array().into_iter().flatten() {
+            let ok = row["ok"] != false && row["phase"] != "error" && row["phase"] != "login_required";
+            agentdock_core::applog::emit(
+                if ok { agentdock_core::applog::Level::Info } else { agentdock_core::applog::Level::Warn },
+                source,
+                || {
+                    let detail = row["message"]
+                        .as_str()
+                        .or(row["msg"].as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| match (row["phase"].as_str(), row["credits"].as_f64()) {
+                            (Some(phase), Some(c)) if c > 0.0 => format!("{phase} +{c}"),
+                            (Some(phase), _) => phase.to_owned(),
+                            _ => String::new(),
+                        });
+                    (
+                        format!("{}：{detail}", row["name"].as_str().unwrap_or("账号")),
+                        row.clone(),
+                    )
+                },
+            );
+        }
+    }
+    let result = json!({
+        "trigger": trigger,
+        "lastRun": now_ms(),
+        "results": {"workbuddy": workbuddy, "qoder": qoder, "trae": trae},
+    });
+    {
+        let mut status = hub.checkin.lock().unwrap();
+        let next = status["nextRun"].clone();
+        *status = result.clone();
+        status["nextRun"] = next;
+        status["running"] = json!(false);
+    }
+    result
+}
+
+fn trigger_label(trigger: &str) -> &'static str {
+    match trigger {
+        "startup" => "启动后自动执行",
+        "scheduled" => "定时执行",
+        "launchd" => "系统定时任务",
+        _ => "手动执行",
+    }
+}
+
+/// Opted-in WorkBuddy CN accounts whose official status is not yet "checked
+/// in today" (Shanghai day); each check queries status before submitting.
+async fn workbuddy_pass(hub: &Shared) -> Vec<Value> {
+    let shanghai = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    let today = chrono::Utc::now().with_timezone(&shanghai).date_naive();
+    let due: Vec<(String, String)> = {
+        let store = hub.wb.store.lock().unwrap();
+        store
+            .accounts
+            .iter()
+            .filter(|a| a.checkin_enabled && a.variant == "cn")
+            .filter(|a| {
+                let state = store.checkin_states.get(&a.id);
+                let done = state.is_some_and(|s| {
+                    s.status.as_ref().is_some_and(|v| v["today_checked_in"] == true)
+                        && s.updated_at
+                            .and_then(chrono::DateTime::from_timestamp_millis)
+                            .is_some_and(|t| t.with_timezone(&shanghai).date_naive() == today)
+                });
+                !done
+            })
+            .map(|a| (a.id.clone(), if a.note.is_empty() { a.name.clone() } else { a.note.clone() }))
+            .collect()
+    };
+    let mut out = vec![];
+    let mut done = vec![];
+    for (id, name) in due {
+        let r = workbuddy::proxy::checkin(hub.wb.clone(), id.clone(), true).await;
+        if r.is_ok() {
+            done.push(id.clone());
+        }
+        out.push(match r {
+            Ok(_) => json!({"id": id, "name": name, "ok": true, "message": "签到状态已确认"}),
+            Err(e) => json!({"id": id, "name": name, "ok": false, "message": e}),
+        });
+    }
+    if !done.is_empty() {
+        // Rewards land in the credit balance shown by the pool and check-in pages.
+        let _ = workbuddy::settings::refresh_accounts(hub.wb.clone(), done).await;
+    }
+    out
+}
+
+async fn qoder_pass(hub: &Shared) -> Value {
+    match qoder_auto_claim(hub).await {
+        Some(results) => json!(results),
+        None => json!([]),
+    }
+}
+
 /// Claim only when a campaign is claimable (or a token needs refreshing).
-pub async fn qoder_auto_claim(hub: &Shared) {
+pub async fn qoder_auto_claim(hub: &Shared) -> Option<Vec<Value>> {
     let results = tokio::task::spawn_blocking(|| {
         use qoder::qcore as qc;
-        if !qc::load_settings()["autoClaim"].as_bool().unwrap_or(true) {
-            return None;
-        }
         let accounts = qc::load_accounts();
         let need = accounts.iter().filter(|a| !a.token.is_empty()).any(|acc| {
             let (status, data) = qc::get_campaigns(acc);
@@ -53,38 +206,16 @@ pub async fn qoder_auto_claim(hub: &Shared) {
     .await
     .ok()
     .flatten();
-    if let Some(results) = results {
+    if let Some(results) = &results {
         *hub.qoder_scheduler.lock().unwrap() = json!({
             "lastRun": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             "lastResults": results,
         });
     }
+    results
 }
 
-/// `--claim`: one unattended pass for launchd (Qoder campaigns, Trae and
-/// WorkBuddy opted-in check-ins). Returns printable results.
+/// `--claim`: one unattended pass for launchd, honoring the per-platform switches.
 pub async fn claim_once(hub: &Shared) -> Value {
-    let qoder = tokio::task::spawn_blocking(|| qoder::qcore::claim_all(None, false))
-        .await
-        .unwrap_or_default();
-    hub.trae.auto_checkin_tick().await;
-    let mut workbuddy = vec![];
-    let ids: Vec<String> = {
-        let store = hub.wb.store.lock().unwrap();
-        if store.auto_checkin {
-            store
-                .accounts
-                .iter()
-                .filter(|a| a.checkin_enabled && a.variant == "cn")
-                .map(|a| a.id.clone())
-                .collect()
-        } else {
-            vec![]
-        }
-    };
-    for id in ids {
-        let r = workbuddy::proxy::checkin(hub.wb.clone(), id.clone(), true).await;
-        workbuddy.push(json!({"id":id,"ok":r.is_ok(),"error":r.err()}));
-    }
-    json!({"qoder":qoder,"workbuddy":workbuddy,"trae":"checked opted-in accounts"})
+    run_pass(hub, "launchd").await
 }

@@ -33,6 +33,12 @@ uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
 async-stream = "0.3"
 http = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+getrandom = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+aes-gcm = "0.10"
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 axum = "0.8"

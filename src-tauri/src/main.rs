@@ -16,7 +16,16 @@ fn main() {
             let hub = agentdock::open_hub()?;
             if has("--claim") {
                 let r = agentdock::tasks::claim_once(&hub).await;
-                println!("{}", serde_json::to_string_pretty(&r).unwrap());
+                let text = serde_json::to_string_pretty(&r).unwrap();
+                println!("{text}");
+                // launchd redirects stdout into this log on macOS; Task Scheduler has no such option.
+                #[cfg(windows)]
+                {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(hub.dir.join("auto-claim.log")) {
+                        let _ = writeln!(f, "[{}] {text}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+                    }
+                }
                 return Ok(());
             }
             if has("--dump-state") {

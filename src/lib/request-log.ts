@@ -5,6 +5,7 @@ import { providerLabel } from '../store'
 const outcomes: Record<string, [string, string]> = {
   completed: ['成功', 'Success'],
   running: ['进行中', 'Running'],
+  retried: ['已换号重试', 'Retried'],
   agent_disabled: ['辅助 Agent 已禁用', 'Auxiliary agent disabled'],
   upstream_rejected: ['上游拒绝', 'Upstream rejected'],
   upstream_unreachable: ['上游连接失败', 'Upstream unreachable'],
@@ -87,6 +88,8 @@ export function logExplanation(record: RequestLog) {
     return t('请求在 WorkBuddy 本机官方传输或设备 SDK 阶段停止。请检查 WorkBuddy 安装版本、区域和设备令牌状态。', 'Stopped in the WorkBuddy local transport or device SDK. Check the installed version, region and device token.')
   if (String(record.details?.error?.code) === '11128')
     return t('官方业务码 11128：来自未获批准渠道的 API 调用。请求已分配账号并到达官方；此错误不表示号池未启用或没有余额。不会自动重试、换账号或换模型。', 'Official code 11128: API call from an unapproved channel. The request reached the official service; it is not a pool or balance problem. No automatic retry or account/model change.')
+  if (record.outcome === 'retried')
+    return t(`${p} 在开始生成前明确拒绝（401/403/429）或返回排队通知，本次尝试未向客户端输出任何内容，已自动换下一个可用账号重试（同一请求最多 3 个账号）。同组请求见请求组 ${record.requestGroup || record.id}。`, `${p} explicitly rejected (401/403/429) or queued the request before any output, so nothing reached the client and the next eligible account was tried (at most 3 per request). Group: ${record.requestGroup || record.id}.`)
   if (record.outcome === 'agent_disabled')
     return t('请求在本地 Agent 策略检查阶段停止，未向上游发送。可在接入设置中调整辅助 Agent 开关。', 'Stopped by the local agent policy before reaching the upstream. Adjust the auxiliary-agent switch in API Access.')
   if (record.outcome === 'upstream_rejected')

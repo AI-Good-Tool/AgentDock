@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { revealPhones } from '../../store'
 import { computed } from 'vue'
-import {
+import { IconMobile,
   IconCalendar,
   IconClockCircle,
   IconThunderbolt,
@@ -14,7 +15,7 @@ import {
   IconArrowRight,
 } from '@arco-design/web-vue/es/icon'
 import type { Account, Snapshot } from '../../wb-api'
-import {
+import { phoneText,
   accountName,
   credits,
   resourceRows,
@@ -40,6 +41,7 @@ const emit = defineEmits<{
   info: []
   resources: []
   switch: [string]
+  json: []
 }>()
 const name = computed(() => accountName(props.account))
 const rows = computed(() => resourceRows(props.account.credit?.resources, props.now))
@@ -86,6 +88,7 @@ const targets = computed(() => [
       <div class="switch-identity">
         <h3 :title="name">{{ name }}</h3>
         <p :title="uid">UID · {{ uid }}</p>
+        <p v-if="account.presentation?.phoneNumber" class="switch-contact mono"><IconMobile /> {{ phoneText(account.presentation.phoneNumber, revealPhones) }}</p>
         <div class="switch-badges">
           <a-tooltip
             :content="
@@ -139,6 +142,7 @@ const targets = computed(() => [
           ><a-doption @click="emit('refresh')"><IconRefresh /> {{ t('刷新积分', 'Refresh credits') }}</a-doption
           ><a-doption @click="emit('checkin')" :disabled="account.variant !== 'cn'"
             ><IconCalendar /> {{ t('查询签到状态', 'Check-in status') }}</a-doption
+          ><a-doption @click="emit('json')"><IconCode /> {{ t('查看 JSON', 'View JSON') }}</a-doption
           ></template
         ></a-dropdown
       >
@@ -244,7 +248,7 @@ const targets = computed(() => [
             :loading="busy"
             @change="(v) => emit('checkinEnable', !!v)" /></label
         ><span :title="t(`后台管理查询 ${account.managementInFlight ?? 0} 个，不占用聊天并发`, `${account.managementInFlight ?? 0} management queries (separate from chat)`)"
-          >{{ account.inFlight }} / {{ account.concurrency ?? 2 }} {{ t('并发', 'active') }}</span
+          >{{ account.inFlight }} / {{ account.concurrency ?? 4 }} {{ t('并发', 'active') }}</span
         >
       </div>
     </footer>

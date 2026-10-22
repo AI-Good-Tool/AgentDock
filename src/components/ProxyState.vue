@@ -24,6 +24,6 @@ async function clear() {
     <a-switch size="small" :aria-label="t('参与反代', 'Use in proxy')" :model-value="rt?.enabled ?? true" :loading="state.pending.has(`enable:${key}`)" @change="(v) => toggle(!!v)" />
     <span v-if="rt?.authFailed" class="state-pill bad" @click="clear" style="cursor: pointer" :title="t('点击解除', 'Click to clear')">{{ t('鉴权失效', 'Auth failed') }}</span>
     <span v-else-if="cooling" class="state-pill warn" @click="clear" style="cursor: pointer" :title="t('点击解除', 'Click to clear')">{{ t('冷却', 'Cooldown') }} · {{ relative(rt?.cooldownUntil, state.now) }}</span>
-    <span class="muted">{{ rt?.inFlight ?? 0 }} / {{ rt?.concurrency ?? 2 }} {{ t('并发', 'active') }}</span>
+    <span class="muted">{{ rt?.inFlight ?? 0 }} / {{ rt?.concurrency ?? 4 }} {{ t('并发', 'active') }}</span>
   </div>
 </template>

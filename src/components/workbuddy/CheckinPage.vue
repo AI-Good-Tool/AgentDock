@@ -17,6 +17,8 @@ const props = defineProps<{
   pendingIds: string[]
   now: number
   progress: { completed: number; total: number; failed: number }
+  /** Unified schedule description shown under the auto switch. */
+  autoHint?: string
 }>()
 const emit = defineEmits<{
   toggleAuto: [enabled: boolean]
@@ -134,7 +136,7 @@ const configuredWindow = computed(() => {
         <div>
           <strong>{{ t('自动签到', 'Auto check-in') }}</strong
           ><small>{{
-            snapshot.autoCheckin ? t(configuredWindow + ' 内分散执行', 'Spread within ' + configuredWindow) : t('已关闭，默认不自动提交', 'Off; nothing is submitted automatically')
+            snapshot.autoCheckin ? autoHint || t(configuredWindow + ' 内分散执行', 'Spread within ' + configuredWindow) : t('已关闭，不自动提交', 'Off; nothing is submitted automatically')
           }}</small>
         </div>
         <a-switch
@@ -166,7 +168,7 @@ const configuredWindow = computed(() => {
     <div class="summary-bottom">
       <span><IconCheck /> {{ t('先查询再签到；签到与反代开关独立，国际版不参与。', 'Status is queried before checking in; independent of the proxy switch; international accounts are excluded.') }}</span>
       <div>
-        <a-button size="small" @click="settingsOpen = !settingsOpen"
+        <a-button v-if="!autoHint" size="small" @click="settingsOpen = !settingsOpen"
           ><template #icon><IconSettings /></template>{{ t('签到设置', 'Settings') }}</a-button
         >
         <a-button size="small" @click="historyOpen = !historyOpen">{{ t('操作记录', 'History') }}</a-button>
@@ -283,16 +285,20 @@ const configuredWindow = computed(() => {
       <div class="ca-metrics">
         <div>
           <span>{{ t('连续签到', 'Streak') }}</span
-          ><strong
-            >{{ freshCheckin(a, now) ? (a.checkin?.streak_days ?? '—') : '—'
-            }}<small>{{ t('天', 'd') }}</small></strong
+          ><strong :class="{ cached: !freshCheckin(a, now) }"
+            >{{ a.checkin?.streak_days ?? '—' }}<small>{{ t('天', 'd') }}</small></strong
           >
         </div>
         <div>
-          <span>{{ t('今日奖励', 'Today') }}</span
-          ><strong
-            >{{ freshCheckin(a, now) ? credits(a.checkin?.today_credit) : '—'
-            }}<small>{{ t('积分', 'credits') }}</small></strong
+          <span>{{ freshCheckin(a, now) || !a.checkin ? t('今日奖励', 'Today') : t('上次奖励', 'Last reward') }}</span
+          ><strong :class="{ cached: !freshCheckin(a, now) }"
+            >{{ a.checkin ? credits(a.checkin.today_credit ?? a.checkin.daily_credit) : '—' }}<small>{{ t('积分', 'credits') }}</small></strong
+          >
+        </div>
+        <div>
+          <span>{{ t('积分余额', 'Balance') }}</span
+          ><strong :class="{ cached: a.credit?.stale }" :title="a.credit?.updatedAt ? t('号池积分，更新于 ', 'Pool credits, updated ') + time(a.credit.updatedAt) : ''"
+            >{{ a.credit?.ok ? credits(a.credit.totalRemaining) : '—' }}<small>{{ t('积分', 'credits') }}</small></strong
           >
         </div>
       </div>
@@ -301,7 +307,9 @@ const configuredWindow = computed(() => {
           status(a) === 'error'
             ? a.checkinError
             : status(a) === 'unknown'
-              ? t('今日尚未查询，历史状态不计入今日汇总。', 'Not queried today; past status is not counted.')
+              ? a.checkin
+                ? t(`今日尚未查询；灰色数值为 ${time(a.checkinUpdatedAt)} 的缓存，不计入今日汇总。`, `Not queried today; gray values are cached from ${time(a.checkinUpdatedAt)} and not counted today.`)
+                : t('今日尚未查询，查询后显示连续签到与奖励。', 'Not queried today; query to see streak and reward.')
               : status(a) === 'inactive'
                 ? t('官方活动尚未开放，不会提交签到。', 'The official campaign is not open; nothing is submitted.')
                 : status(a) === 'done'
@@ -597,7 +605,7 @@ h3 {
 }
 .ca-metrics {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 0.9fr) minmax(0, 1.3fr);
   gap: 16px;
   margin: 24px 0 14px;
 }
@@ -607,10 +615,16 @@ h3 {
 }
 .ca-metrics strong {
   display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--c-3b5143);
-  font-size: 25px;
+  font-size: 22px;
   margin-top: 7px;
   font-weight: 600;
+}
+.ca-metrics strong.cached {
+  color: var(--c-859b8d);
 }
 .ca-metrics small {
   color: var(--c-859b8d);

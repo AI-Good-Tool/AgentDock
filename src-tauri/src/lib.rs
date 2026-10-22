@@ -1,7 +1,10 @@
 //! AgentDock: one local workspace and model gateway for WorkBuddy, Qoder and
 //! Trae (domestic and international editions).
+pub mod account_json;
 pub mod api_key;
 pub mod app;
+pub mod applog;
+pub mod backup;
 pub mod catalog;
 pub mod commands;
 pub mod logs;
@@ -47,6 +50,22 @@ pub fn run_desktop() {
             commands::reset_route,
             commands::request_logs,
             commands::clear_logs,
+            commands::checkin_run_now,
+            commands::account_json,
+            commands::account_json_save,
+            commands::account_json_import,
+            commands::wb_session_accounts,
+            commands::wb_list_sessions,
+            commands::wb_copy_sessions,
+            commands::wb_session_groups,
+            commands::wb_session_group_detail,
+            commands::wb_sync_session_group,
+            commands::wb_unlink_session_group,
+            commands::app_logs,
+            commands::clear_app_logs,
+            commands::backup_export,
+            commands::backup_inspect,
+            commands::backup_import,
             commands::proxy_statistics,
             commands::open_url,
             commands::reveal_data_dir,

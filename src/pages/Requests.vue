@@ -30,9 +30,9 @@ const rows = computed(() => {
       (result.value === 'all' ||
         (result.value === 'success'
           ? l.outcome === 'completed'
-          : result.value === 'running'
-            ? l.outcome === 'running'
-            : l.outcome !== 'completed' && l.outcome !== 'running')) &&
+          : result.value === 'running' || result.value === 'retried'
+            ? l.outcome === result.value
+            : !['completed', 'running', 'retried'].includes(l.outcome))) &&
       (!q ||
         `${l.model} ${l.requestedModel} ${l.realModel} ${l.accountName} ${l.protocol} ${l.provider}`
           .toLowerCase()
@@ -117,6 +117,7 @@ function rowClass(record: any) {
       <a-radio value="all">{{ t('全部结果', 'All') }}</a-radio>
       <a-radio value="success">{{ t('成功', 'Success') }}</a-radio>
       <a-radio value="failed">{{ t('失败', 'Failed') }}</a-radio>
+      <a-radio value="retried">{{ t('已换号重试', 'Retried') }}</a-radio>
       <a-radio value="running">{{ t('进行中', 'Running') }}</a-radio>
     </a-radio-group>
     <a-checkbox v-model="showInternal">{{
@@ -197,8 +198,8 @@ function rowClass(record: any) {
               <span
                 class="state-pill"
                 :class="{
-                  bad: record.outcome !== 'completed' && record.outcome !== 'running',
-                  warn: record.outcome === 'running',
+                  bad: !['completed', 'running', 'retried'].includes(record.outcome),
+                  warn: record.outcome === 'running' || record.outcome === 'retried',
                 }"
                 >{{ record.status && record.outcome !== 'running' ? record.status + ' · ' : ''
                 }}{{ outcomeName(record.outcome) }}</span

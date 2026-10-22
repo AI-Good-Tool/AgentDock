@@ -248,12 +248,7 @@ pub fn ms_to_iso(v: &Value) -> String {
 }
 
 pub fn hostname() -> String {
-    std::process::Command::new("/bin/hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "localhost".into())
+    crate::platform::hostname()
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! OpenAI Responses, Chat Completions), bounded diagnostics and the
 //! provider-neutral streaming contract used by every upstream integration.
 pub mod anthropic;
+pub mod applog;
 pub mod custom_tools;
 pub mod diagnostics;
 pub mod provider;

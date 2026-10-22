@@ -1,10 +1,27 @@
 <script setup lang="ts">
-import ProviderMark from './ProviderMark.vue'
-import { computed, ref } from 'vue'
-import { IconMore, IconRefresh, IconSwap, IconGift } from '@arco-design/web-vue/es/icon'
-import { t, fmtNumber, fmtTime, fmtDate } from '../i18n'
-import { state } from '../store'
-import ProxyState from './ProxyState.vue'
+// Qoder account card in the WorkBuddy card layout.
+import { computed } from 'vue'
+import {
+  IconMore,
+  IconRefresh,
+  IconSwap,
+  IconGift,
+  IconStar,
+  IconClockCircle,
+  IconArrowRight,
+  IconCheck,
+  IconInfoCircle,
+  IconEdit,
+  IconLock,
+  IconCode,
+  IconDelete,
+  IconMobile,
+  IconEmail,
+} from '@arco-design/web-vue/es/icon'
+import { t, fmtDate } from '../i18n'
+import { state, revealPhones } from '../store'
+import { credits, updated, phoneText } from '../lib/account-display'
+import CardProxyRow from './CardProxyRow.vue'
 const props = defineProps<{ account: any; compact?: boolean }>()
 const emit = defineEmits<{
   switch: []
@@ -14,164 +31,96 @@ const emit = defineEmits<{
   note: []
   refreshToken: []
   remove: []
+  json: []
 }>()
-const reveal = ref(false)
 const a = computed(() => props.account)
-const name = computed(
-  () => a.value.note || a.value.name || a.value.email || a.value.phone || t('未命名', 'Unnamed')
-)
-const contact = computed(() => {
-  if (a.value.email) return a.value.email
-  const p = String(a.value.phone || '')
-  if (!p) return ''
-  return reveal.value
-    ? p
-    : p.length >= 8
-      ? p.slice(0, 3) + '****' + p.slice(-4)
-      : p.replace(/./g, '*')
-})
+const name = computed(() => a.value.note || a.value.name || a.value.email || a.value.phone || t('未命名', 'Unnamed'))
+const phone = computed(() => phoneText(a.value.phone, revealPhones.value))
 const usage = computed(() => a.value.credit?.usage)
-const parts = computed(() => [
-  [t('订阅额度', 'Subscription'), usage.value?.userQuota],
-  [t('个人资源包', 'Bonus packs'), usage.value?.addOnQuota],
-])
-const known = computed(() =>
-  parts.value.some(([, q]: any) => q && Number.isFinite(Number(q.remaining)))
-)
-const total = computed(() =>
-  parts.value.reduce((s, [, q]: any) => s + (Number(q?.remaining) || 0), 0)
-)
-const expiry = computed(() => {
-  const d = Number(a.value.expiresAt ? Date.parse(a.value.expiresAt) : NaN)
-  if (!Number.isFinite(d)) return { cls: 'off', text: t('有效期未知', 'Expiry unknown') }
-  const days = (d - state.now) / 864e5
-  if (days <= 0) return { cls: 'bad', text: t('token 已过期', 'Token expired') }
-  if (days < 1)
-    return {
-      cls: 'warn',
-      text: t(
-        `${Math.max(1, Math.ceil(days * 24))} 小时后过期`,
-        `${Math.max(1, Math.ceil(days * 24))}h to expiry`
-      ),
-    }
-  if (days < 3)
-    return { cls: 'warn', text: t(`${Math.ceil(days)} 天后过期`, `${Math.ceil(days)}d to expiry`) }
-  return { cls: '', text: t('有效期至 ', 'Valid to ') + fmtDate(d) }
-})
 const addonExpiry = computed(() => {
   const ts = Number(usage.value?.expiresAt) || 0
-  if (!ts || ts >= 253402214400000) return t('长期有效', 'Never expires')
-  return fmtDate(ts)
+  if (!ts) return '—'
+  return ts >= 253402214400000 ? t('长期有效', 'No expiry') : fmtDate(ts)
 })
+const rows = computed(() => [
+  { label: t('订阅额度', 'Subscription'), q: usage.value?.userQuota, time: '' },
+  { label: t('个人资源包', 'Bonus packs'), q: usage.value?.addOnQuota, time: Number(usage.value?.addOnQuota?.total) > 0 ? addonExpiry.value : '' },
+])
+const known = computed(() => rows.value.some((r) => r.q && Number.isFinite(Number(r.q.remaining))))
+const total = computed(() => rows.value.reduce((s, r) => s + (Number(r.q?.remaining) || 0), 0))
+const pct = (q: any) => (q && Number(q.total) > 0 ? Math.min(100, Math.max(0, (Number(q.remaining) / Number(q.total)) * 100)) : 0)
+const expiry = computed(() => {
+  const d = Number(a.value.expiresAt ? Date.parse(a.value.expiresAt) : NaN)
+  if (!Number.isFinite(d)) return { cls: 'muted', text: t('有效期未知', 'Expiry unknown') }
+  const days = (d - state.now) / 864e5
+  if (days <= 0) return { cls: 'bad', text: t('登录已过期', 'Login expired') }
+  if (days < 3) return { cls: 'warn', text: days < 1 ? t(`${Math.max(1, Math.ceil(days * 24))} 小时后过期`, `${Math.max(1, Math.ceil(days * 24))}h left`) : t(`${Math.ceil(days)} 天后过期`, `${Math.ceil(days)}d left`) }
+  return { cls: '', text: t('有效期至 ', 'Valid to ') + fmtDate(d) }
+})
+const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n + c.charCodeAt(0), 0) % 3)
+const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
 </script>
 <template>
-  <article class="acard" :class="{ current: a.isCurrent }">
-    <div class="acard-top">
-      <div class="avatar qoder">{{ Array.from(name)[0] }}</div>
-      <div class="acard-id">
-        <strong :title="name">{{ name }}</strong>
-        <small :title="a.uid">UID · {{ a.uid }}</small>
-        <small v-if="contact"
-          >{{ contact }}
-          <a
-            v-if="a.phone && !a.email"
-            style="cursor: pointer; margin-left: 4px"
-            @click="reveal = !reveal"
-            >{{ reveal ? t('隐藏', 'hide') : t('显示', 'show') }}</a
-          ></small
-        >
-        <div class="acard-badges">
-          <span class="ptag"><ProviderMark provider="qoder" />Qoder</span>
-          <span class="rtag">{{
-            a.edition === 'cn' ? t('国内版', 'China') : t('国际版', 'International')
-          }}</span>
-          <span v-if="a.isCurrent" class="state-pill">{{ t('当前登录', 'Signed in') }}</span>
-          <span class="state-pill" :class="expiry.cls">{{ expiry.text }}</span>
+  <article class="switch-card" :class="[{ 'current-card': a.isCurrent, 'compact-card': compact }, `tone-${color}`]">
+    <header class="switch-card-header">
+      <div class="switch-avatar">{{ Array.from(String(name))[0] }}</div>
+      <div class="switch-identity">
+        <h3 :title="name">{{ name }}</h3>
+        <p :title="a.uid">UID · {{ a.uid }}</p>
+        <p v-if="phone" class="switch-contact mono"><IconMobile /> {{ phone }}</p>
+        <p v-if="a.email" class="switch-contact" :title="a.email"><IconEmail /> {{ a.email }}</p>
+        <div class="switch-badges">
+          <span class="card-chip">{{ a.edition === 'cn' ? t('国内版', 'China') : t('国际版', 'Intl') }}</span>
+          <span v-if="a.isCurrent" class="card-chip ok">{{ t('当前登录', 'Signed in') }}</span>
+          <span class="card-chip" :class="expiry.cls || 'ok'">{{ expiry.text }}</span>
         </div>
       </div>
-      <a-dropdown trigger="click">
-        <a-button size="mini" type="text" :aria-label="t('账号操作', 'Account actions')"
-          ><IconMore
-        /></a-button>
-        <template #content>
-          <a-doption @click="emit('info')">{{ t('积分详情', 'Credit details') }}</a-doption>
-          <a-doption @click="emit('note')">{{ t('修改备注', 'Edit note') }}</a-doption>
-          <a-doption @click="emit('refreshToken')">{{
-            t('刷新登录凭证', 'Refresh login')
-          }}</a-doption>
-          <a-doption @click="emit('remove')"
-            ><span style="color: var(--danger)">{{
-              t('删除账号', 'Delete account')
-            }}</span></a-doption
-          >
-        </template>
-      </a-dropdown>
-    </div>
-    <div class="balance">
-      <strong
-        >{{ known ? fmtNumber(total) : '—'
-        }}<small>{{ t('剩余积分', 'credits left') }}</small></strong
+      <a-dropdown trigger="click"
+        ><button class="card-more" :aria-label="t('账号操作', 'Account actions')"><IconMore /></button
+        ><template #content
+          ><a-doption @click="emit('info')"><IconInfoCircle /> {{ t('积分详情', 'Credit details') }}</a-doption
+          ><a-doption @click="emit('note')"><IconEdit /> {{ t('修改备注', 'Edit note') }}</a-doption
+          ><a-doption @click="emit('refreshToken')"><IconLock /> {{ t('刷新登录凭证', 'Refresh login') }}</a-doption
+          ><a-doption @click="emit('json')"><IconCode /> {{ t('查看 JSON', 'View JSON') }}</a-doption
+          ><a-doption @click="emit('remove')"
+            ><span class="danger-option"><IconDelete /> {{ t('删除账号', 'Delete account') }}</span></a-doption
+          ></template
+        ></a-dropdown
       >
-      <small>{{
-        a.credit?.updatedAt
-          ? t(
-              `${fmtTime(a.credit.updatedAt).slice(0, 5)} 更新`,
-              `Updated ${fmtTime(a.credit.updatedAt).slice(0, 5)}`
-            )
-          : t('尚未查询', 'Not queried')
-      }}</small>
-    </div>
-    <template v-if="!compact">
-      <div v-for="([label, q], i) in parts" :key="i">
-        <div class="pack-row" style="grid-template-columns: 1fr auto; margin-bottom: 4px">
-          <span>{{ label }}</span>
-          <b>{{
-            q && q.remaining != null
-              ? fmtNumber(q.remaining) + ' / ' + fmtNumber(q.total || 0)
-              : t('待查询', 'Pending')
-          }}</b>
-        </div>
-        <div class="track">
-          <i
-            :style="{
-              width: `${q && Number(q.total) > 0 ? Math.min(100, (Number(q.remaining) / Number(q.total)) * 100) : 0}%`,
-            }"
-          ></i>
-        </div>
-      </div>
-      <small v-if="Number(usage?.addOnQuota?.total) > 0" class="muted" style="font-size: 12px"
-        >{{ t('资源包有效期至 ', 'Packs valid to ') }}{{ addonExpiry }}</small
-      >
-      <small
-        v-if="a.credit?.stale || a.credit?.ok === false"
-        style="color: var(--warn); font-size: 12px"
-        >{{
-          a.credit?.error || t('查询失败，显示旧数据', 'Query failed; showing cached data')
-        }}</small
-      >
-    </template>
-    <div class="acard-foot">
-      <div class="ops">
-        <a-button
-          size="small"
-          type="primary"
-          :disabled="a.isCurrent"
-          :loading="state.pending.has('qswitch:' + a.id)"
-          @click="emit('switch')"
-          ><template #icon><IconSwap /></template
-          >{{ a.isCurrent ? t('当前账号', 'Current') : t('切换', 'Switch') }}</a-button
-        >
-        <a-button size="small" :loading="state.pending.has('qclaim:' + a.id)" @click="emit('claim')"
-          ><template #icon><IconGift /></template>{{ t('领取', 'Claim') }}</a-button
-        >
-        <a-button
-          size="small"
-          :loading="state.pending.has('qcredit:' + a.id)"
-          @click="emit('credits')"
-          ><template #icon><IconRefresh /></template>{{ t('积分', 'Credits') }}</a-button
+      <span v-if="a.isCurrent" class="client-watermark">Q</span>
+    </header>
+    <section class="switch-credit-section">
+      <div class="switch-credit-line">
+        <IconStar /><strong>{{ known ? credits(total) : pending('qcredit') ? t('查询中', 'Loading') : '—' }}</strong
+        ><span>{{ t('剩余积分', 'credits left') }}</span
+        ><small :class="{ stale: a.credit?.stale }" :title="a.credit?.error"
+          ><IconClockCircle /> {{ a.credit?.stale ? t('旧数据 · ', 'Stale · ') : '' }}{{ a.credit?.updatedAt ? t(`${updated(a.credit.updatedAt)} 更新`, `Updated ${updated(a.credit.updatedAt)}`) : t('尚未查询', 'Not queried') }}</small
         >
       </div>
-      <ProxyState provider="qoder" :id="a.id" />
-    </div>
+      <p v-if="a.credit?.ok === false || a.credit?.stale" class="credit-error">
+        {{ a.credit?.error || t('查询失败，显示旧数据', 'Query failed; showing cached data') }}
+      </p>
+      <div class="expiry-heading">
+        <span>{{ t('额度明细', 'Quota') }}</span
+        ><button :disabled="!a.credit" @click="emit('info')">{{ t('积分详情', 'Details') }} <IconArrowRight /></button>
+      </div>
+      <div v-for="r in rows" :key="r.label" class="switch-package">
+        <div>
+          <b>{{ r.q && r.q.remaining != null ? `${credits(Number(r.q.remaining))} / ${credits(Number(r.q.total || 0))}` : t('待查询', 'Pending') }}</b
+          ><span>{{ r.label }}</span><time>{{ r.time }}</time>
+        </div>
+        <div class="package-track"><i :style="{ width: `${pct(r.q)}%` }"></i></div>
+      </div>
+    </section>
+    <footer class="switch-card-footer">
+      <div class="client-buttons">
+        <button class="qoder" :class="{ selected: a.isCurrent }" :disabled="a.isCurrent || pending('qswitch')" @click="emit('switch')">
+          <i><IconSwap /></i><IconCheck v-if="a.isCurrent" /><span>{{ a.isCurrent ? t('当前账号', 'Current') : t('切换', 'Switch') }}</span>
+        </button>
+        <button class="claim" :disabled="pending('qclaim')" @click="emit('claim')"><i><IconGift /></i><span>{{ t('领取', 'Claim') }}</span></button>
+        <button class="refresh" :disabled="pending('qcredit')" @click="emit('credits')"><i><IconRefresh /></i><span>{{ t('刷新积分', 'Credits') }}</span></button>
+      </div>
+      <CardProxyRow provider="qoder" :id="a.id" />
+    </footer>
   </article>
 </template>

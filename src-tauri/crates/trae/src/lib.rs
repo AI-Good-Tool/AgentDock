@@ -1,6 +1,7 @@
 //! Trae provider for AgentDock (Rust port of Trae Switch): local login
 //! capture and switching, browser OAuth, encrypted account vault, official
 //! usage/credit packs, daily check-in and the native chat gateway transport.
+pub mod platform;
 pub mod api;
 pub mod client;
 pub mod credits;
@@ -76,6 +77,8 @@ pub fn public_account(a: &Value) -> Value {
         "username": a["user"]["account"]["username"],
         "email": a["user"]["account"]["email"],
         "note": a["note"].as_str().unwrap_or(""),
+        // Already masked by the server (e.g. 138******34); the full number is never sent.
+        "mobile": a["user"]["account"]["nonPlainTextMobile"].as_str().unwrap_or(""),
         "userId": a["user"]["userId"],
         "region": a["user"]["account"]["storeRegion"],
         "expiredAt": a["user"]["expiredAt"],
@@ -184,6 +187,13 @@ impl Provider {
     }
     async fn refresh_unlocked(&self, id: &str) -> Result<Value, String> {
         let a = self.store.account(id)?;
+        // Model lists from the old native catalog do not match Remote Agent names: replace them once.
+        let stale = a["models"].as_array().is_none_or(|m| m.is_empty() || m.iter().any(|x| x["remote"] != true));
+        if stale {
+            if let Ok(models) = gateway::model_catalog(&a).await {
+                self.store.patch_account(id, |a| a["models"] = json!(models))?;
+            }
+        }
         let snapshot = api::refresh_snapshot(&a).await;
         let a = self.store.patch_account(id, |a| {
             if snapshot["checkin"].is_object() {
@@ -276,28 +286,38 @@ impl Provider {
         outcome
     }
     /// Startup catch-up and periodic automatic check-in for opted-in CN accounts.
-    pub async fn auto_checkin_tick(self: &Arc<Self>) {
-        let due: Vec<String> = self
+    /// Check in every opted-in CN account not yet checked today.
+    pub async fn auto_checkin_tick(self: &Arc<Self>) -> Vec<Value> {
+        let due: Vec<(String, String)> = self
             .store
             .accounts()
             .iter()
             .filter(|a| a["autoCheckin"] == true && a["variant"] == "cn" && !checked_today(a))
-            .filter_map(|a| a["id"].as_str().map(str::to_owned))
+            .filter_map(|a| a["id"].as_str().map(|id| (id.to_owned(), display_name(a))))
             .collect();
-        for id in due {
+        let mut results = vec![];
+        for (id, name) in due {
             let Ok(_busy) = self.exclusive(&id) else {
+                results.push(json!({"id": id, "name": name, "ok": false, "message": "账号正忙，稍后重试"}));
                 continue;
             };
             match self.checkin(&id, "auto").await {
                 Ok(result) => {
-                    if result["already"] != true {
+                    let already = result["already"] == true;
+                    if !already {
                         let _ = self.refresh_unlocked(&id).await;
                         self.store.event("checkin", "自动签到成功");
                     }
+                    results.push(json!({"id": id, "name": name, "ok": true,
+                        "message": if already { "今日已签到" } else { "签到成功" }}));
                 }
-                Err(e) => self.store.event("error", &format!("自动签到：{e}")),
+                Err(e) => {
+                    self.store.event("error", &format!("自动签到：{e}"));
+                    results.push(json!({"id": id, "name": name, "ok": false, "message": e.to_string()}));
+                }
             }
         }
+        results
     }
 
     pub fn pool_accounts(&self) -> Vec<PoolAccount> {
@@ -332,7 +352,8 @@ impl Provider {
                         region: region.clone(),
                         id: id.into(),
                         name: name.into(),
-                        supports_tools: Some(false),
+                        // Client tools run through the Remote text bridge.
+                        supports_tools: Some(true),
                         supports_images: Some(false),
                         config,
                         ..UpstreamModel::default()

@@ -35,12 +35,25 @@ async fn serve(app: Router) -> (String, tokio::task::JoinHandle<()>) {
 async fn fixture() -> Fixture {
     let qoder_calls = Arc::new(AtomicUsize::new(0));
     let qc = qoder_calls.clone();
+    let queued = Arc::new(AtomicUsize::new(0));
     let qoder_upstream = Router::new().route(
         "/model/v1/chat/completions",
         post(move |Json(body): Json<Value>| {
             let qc = qc.clone();
+            let queued = queued.clone();
             async move {
                 qc.fetch_add(1, Ordering::SeqCst);
+                let sse = [("retry-after", "0"), ("content-type", "text/event-stream")];
+                // Qoder reports model permission and queueing inside an HTTP 200 stream.
+                if body["model"] == "q-gate" {
+                    let frame = json!({"statusCodeValue":403,"body":"model not allowed"});
+                    return (axum::http::StatusCode::OK, sse, format!("data: {frame}\n\n"));
+                }
+                if body["model"] == "q-queue" && queued.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let notice = json!({"message": json!({"code":"10605","isQueued":true,"retryAfterSeconds":1}).to_string()});
+                    let frame = json!({"statusCodeValue":403,"body":notice.to_string()});
+                    return (axum::http::StatusCode::OK, sse, format!("data: {frame}\n\n"));
+                }
                 if body["model"] == "q-flaky" {
                     return (
                         axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -66,23 +79,66 @@ async fn fixture() -> Fixture {
     );
     let trae_calls = Arc::new(AtomicUsize::new(0));
     let tc = trae_calls.clone();
-    let trae_upstream = Router::new().route(
-        "/api/agent/v3/llm_utils_chat",
-        post(move |Json(body): Json<Value>| {
-            let tc = tc.clone();
-            async move {
-                tc.fetch_add(1, Ordering::SeqCst);
-                assert!(body.get("tools").is_none());
-                let text = format!("你好 from {}", body["model"].as_str().unwrap_or("auto"));
-                let wire = format!(
-                    "event: output\ndata: {}\n\nevent: usage\ndata: {}\n\nevent: done\ndata: {{}}\n\n",
-                    json!({"response": text}),
-                    json!({"usage":{"prompt_tokens":3,"completion_tokens":2}})
-                );
-                ([("content-type", "text/event-stream")], wire)
-            }
-        }),
-    );
+    // Trae Remote Agent chain: models → chat_sessions → events (one turn per request).
+    let sessions: Arc<std::sync::Mutex<HashMap<String, (String, String)>>> = Arc::default();
+    let created = sessions.clone();
+    let trae_upstream = Router::new()
+        .route(
+            "/api/remote/v1/models",
+            axum::routing::get(|| async {
+                Json(json!({"code":0,"data":{"list":[
+                    {"function":"solo_work_remote","models":[{"name":"work-only"}]},
+                    {"function":"solo_agent_remote","models":[
+                        {"name":"shared-real","display_name":"Shared","is_default":true,"config_source":1},
+                        {"name":"flaky-real","display_name":"Flaky"}]}]}}))
+            }),
+        )
+        .route(
+            "/api/remote/v1/chat_sessions",
+            post(move |Json(body): Json<Value>| {
+                let (tc, created) = (tc.clone(), created.clone());
+                async move {
+                    tc.fetch_add(1, Ordering::SeqCst);
+                    let m = &body["initial_message"];
+                    assert_eq!(m["custom_model"]["name"], m["model_name"], "the full catalog entry is sent");
+                    let query: Value = serde_json::from_str(m["query"].as_str().unwrap()).unwrap();
+                    let sid = uuid::Uuid::new_v4().simple().to_string();
+                    created.lock().unwrap().insert(
+                        sid.clone(),
+                        (m["model_name"].as_str().unwrap().to_owned(), query[0]["data"]["content"].as_str().unwrap().to_owned()),
+                    );
+                    Json(json!({"code":0,"data":{"chat_session_id":sid,"message_id":"m1"}}))
+                }
+            }),
+        )
+        .route(
+            "/api/remote/v1/chat_sessions/{sid}/events",
+            axum::routing::get(move |axum::extract::Path(sid): axum::extract::Path<String>| {
+                let sessions = sessions.clone();
+                async move {
+                    let (model, query) = sessions.lock().unwrap().get(&sid).cloned().unwrap();
+                    let reply = match query.split_once("\nTools: ") {
+                        Some((_, tools)) if !query.contains("[Client tool result]") => {
+                            let tools: Value = serde_json::from_str(tools).unwrap();
+                            format!("<client_tool_call>{}</client_tool_call>", json!({"name": tools[0]["name"], "input": {}}))
+                        }
+                        _ => format!("你好 from {model}"),
+                    };
+                    let wire = [
+                        ("model_config", json!({"config_name": model})),
+                        ("plan_item", json!({"id":"p1","thought":"thinking"})),
+                        ("plan_item", json!({"id":"p2","tool_call_info":{"name":"finish","params":{"summary": reply}}})),
+                        ("token_usage", json!({"prompt_tokens":3,"completion_tokens":2})),
+                        ("done", json!({"status":"completed"})),
+                    ]
+                    .iter()
+                    .map(|(e, d)| format!("event: {e}\ndata: {d}\n\n"))
+                    .collect::<String>();
+                    ([("content-type", "text/event-stream")], wire)
+                }
+            }),
+        )
+        .route("/api/remote/v1/chat_sessions/{sid}/stop", post(|| async { Json(json!({"code":0})) }));
     let (qoder_url, q_task) = serve(qoder_upstream).await;
     let (trae_url, t_task) = serve(trae_upstream).await;
     let dir = std::env::temp_dir().join(format!("agentdock-e2e-{}", uuid::Uuid::new_v4()));
@@ -99,8 +155,8 @@ async fn fixture() -> Fixture {
             disabled_accounts: vec![],
         },
         HashMap::from([
-            ("cn".into(), vec![json!({"id":"q-shared","name":"Shared"}), json!({"id":"q-only","name":"QoderOnly"}), json!({"id":"q-flaky","name":"Flaky"})]),
-            ("intl".into(), vec![json!({"id":"q-shared-i","name":"Shared"})]),
+            ("cn".into(), vec![json!({"id":"q-shared","name":"Shared"}), json!({"id":"q-only","name":"QoderOnly"}), json!({"id":"q-flaky","name":"Flaky"}), json!({"id":"q-gate","name":"Gate"}), json!({"id":"q-queue","name":"Queued"})]),
+            ("intl".into(), vec![json!({"id":"q-shared-i","name":"Shared"}), json!({"id":"q-gate-i","name":"Gate"})]),
         ]),
     );
     let trae = trae::Provider::open(&dir.join("trae")).unwrap();
@@ -176,7 +232,7 @@ async fn exclusive_models_and_scoped_paths_never_widen_the_pool() {
     }
     // Provider scope: Trae only; a model Trae lacks is unavailable there.
     let v: Value = post_json(&f, "/trae/v1/chat/completions", chat("Shared")).await.json().await.unwrap();
-    assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("cfg-shared"));
+    assert!(v["choices"][0]["message"]["content"].as_str().unwrap().contains("你好 from shared-real"));
     let r = post_json(&f, "/trae/v1/chat/completions", chat("QoderOnly")).await;
     assert_eq!(r.status(), 400);
     assert_eq!(r.json::<Value>().await.unwrap()["error"]["code"], "model_not_available");
@@ -230,30 +286,42 @@ async fn aliases_apply_to_requests_lists_logs_and_all_protocols() {
 }
 
 #[tokio::test]
-async fn tools_roundtrip_on_capable_upstreams_and_are_refused_by_text_only_trae() {
+async fn tools_roundtrip_on_every_provider_including_the_trae_text_bridge() {
     let f = fixture().await;
     let body = json!({"model":"Shared","max_tokens":64,"tools":[{"name":"read","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"use a tool"}]});
     let v: Value = post_json(&f, "/qoder/v1/messages", body.clone()).await.json().await.unwrap();
     assert_eq!(v["stop_reason"], "tool_use");
     assert_eq!(v["content"][0]["name"], "read");
-    // Trae is text-only: the scheduler never sends a tool request there.
-    let r = post_json(&f, "/trae/v1/messages", body.clone()).await;
-    assert_eq!(r.status(), 503);
-    assert!(r.json::<Value>().await.unwrap()["error"]["message"].as_str().unwrap().contains("Trae 仅支持纯文本对话"));
-    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0);
-    // On the unified path the shared model rotates only over capable accounts.
-    for _ in 0..4 {
-        let v: Value = post_json(&f, "/v1/messages", body.clone()).await.json().await.unwrap();
-        assert_eq!(v["stop_reason"], "tool_use");
-    }
-    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0);
+    // Trae: the Remote reply's <client_tool_call> becomes a real tool_use block.
+    let v: Value = post_json(&f, "/trae/v1/messages", body.clone()).await.json().await.unwrap();
+    assert_eq!(v["stop_reason"], "tool_use", "{v}");
+    assert_eq!(v["content"][0]["type"], "tool_use");
+    assert_eq!(v["content"][0]["name"], "read");
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 1);
+    // The tool result goes back as context and the turn ends with text.
+    let id = v["content"][0]["id"].as_str().unwrap().to_owned();
+    let mut follow = body.clone();
+    follow["messages"] = json!([
+        {"role":"user","content":"use a tool"},
+        {"role":"assistant","content":[{"type":"tool_use","id":id,"name":"read","input":{}}]},
+        {"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":"file body"}]},
+    ]);
+    let v: Value = post_json(&f, "/trae/v1/messages", follow).await.json().await.unwrap();
+    assert_eq!(v["stop_reason"], "end_turn", "{v}");
+    assert!(v["content"][0]["text"].as_str().unwrap().contains("你好 from shared-real"));
+    // Images are still refused before any Trae traffic.
+    let image = json!({"model":"Shared","max_tokens":16,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}]});
+    let before = f.trae_calls.load(Ordering::SeqCst);
+    let _ = post_json(&f, "/trae/v1/messages", image).await;
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), before);
 }
 
 #[tokio::test]
 async fn rate_limited_accounts_cool_down_and_traffic_moves_to_other_providers() {
     let f = fixture().await;
+    // The Qoder 429 happens before any output, so the request fails over to Trae.
     let r = post_json(&f, "/v1/chat/completions", chat("Flaky")).await;
-    assert_eq!(r.status(), 429);
+    assert_eq!(r.status(), 200);
     let key = "qoder/cn:u1";
     assert!(f.hub.runtime.lock().unwrap().cooldown.contains_key(key));
     let before = f.qoder_calls.load(Ordering::SeqCst);
@@ -265,14 +333,60 @@ async fn rate_limited_accounts_cool_down_and_traffic_moves_to_other_providers() 
     for _ in 0..2 {
         assert_eq!(post_json(&f, "/v1/chat/completions", chat("Shared")).await.status(), 200);
     }
-    let logs = wait_logs(&f, 6).await;
-    assert!(logs.iter().any(|l| l.status == 429 && l.outcome == "upstream_rejected" && l.provider == "qoder"));
+    let logs = wait_logs(&f, 7).await;
+    let retried = logs.iter().find(|l| l.status == 429 && l.outcome == "retried" && l.provider == "qoder").unwrap();
+    assert!(logs.iter().any(|l| l.request_group == retried.request_group && l.attempt == 2 && l.provider == "trae" && l.outcome == "completed"));
     assert_eq!(f.hub.runtime.lock().unwrap().in_flight.values().sum::<usize>(), 0);
     // Disabling a provider removes it from the pool.
     f.hub.update_settings(|s| { s.providers.get_mut(&agentdock_core::provider::ProviderKind::Trae).unwrap().enabled = false; Ok(()) }).unwrap();
     let r = post_json(&f, "/v1/chat/completions", chat("Flaky")).await;
     assert_eq!(r.status(), 503, "only the cooled-down Qoder account remains");
     assert!(r.json::<Value>().await.unwrap()["error"]["message"].as_str().unwrap().contains("账号冷却中"));
+}
+
+#[tokio::test]
+async fn in_stream_qoder_rejections_fail_over_before_output_and_cool_down_only_the_model() {
+    let f = fixture().await;
+    for stream in [false, true] {
+        let mut body = chat("Gate");
+        body["stream"] = json!(stream);
+        let r = post_json(&f, "/qoder/v1/chat/completions", body).await;
+        assert_eq!(r.status(), 200);
+        let text = r.text().await.unwrap();
+        assert!(text.contains("OK from q-gate-i") && !text.contains("not allowed"), "{text}");
+    }
+    let logs = wait_logs(&f, 3).await;
+    let retried: Vec<_> = logs.iter().filter(|l| l.outcome == "retried").collect();
+    assert_eq!(retried.len(), 1, "the second request skips the cooled model: {logs:?}");
+    assert_eq!((retried[0].status, retried[0].real_model.as_str(), retried[0].upstream_code.as_deref()), (403, "q-gate", Some("403")));
+    {
+        let rt = f.hub.runtime.lock().unwrap();
+        assert!(rt.model_cooldown.contains_key(&("qoder/cn:u1".to_owned(), "q-gate".to_owned())));
+        assert!(!rt.cooldown.contains_key("qoder/cn:u1"), "the account keeps serving its other models");
+    }
+    assert_eq!(post_json(&f, "/qoder/cn/v1/chat/completions", chat("Shared")).await.status(), 200);
+    // With no alternative account left, the model is rejected with its real status.
+    let r = post_json(&f, "/qoder/cn/v1/messages", json!({"model":"Gate","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})).await;
+    assert_eq!(r.status(), 503, "cooled model on the only account is not retried");
+    assert!(r.text().await.unwrap().contains("该模型冷却中"));
+    f.hub.runtime.lock().unwrap().model_cooldown.clear();
+    let r = post_json(&f, "/qoder/cn/v1/messages", json!({"model":"Gate","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})).await;
+    assert_eq!(r.status(), 403);
+    assert_eq!(r.json::<Value>().await.unwrap()["error"]["type"], "permission_error");
+}
+
+#[tokio::test]
+async fn queue_notice_waits_and_retries_the_same_account_when_no_other_exists() {
+    let f = fixture().await;
+    let r = post_json(&f, "/v1/chat/completions", chat("Queued")).await;
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("OK from q-queue"));
+    let logs = wait_logs(&f, 2).await;
+    let queued = logs.iter().find(|l| l.outcome == "retried").unwrap();
+    assert!(queued.message.contains("排队中") && queued.upstream_code.as_deref() == Some("10605"), "{queued:?}");
+    assert!(logs.iter().any(|l| l.attempt == 2 && l.account_id == queued.account_id && l.outcome == "completed"));
+    let rt = f.hub.runtime.lock().unwrap();
+    assert!(rt.model_cooldown.is_empty() && !rt.cooldown.contains_key("qoder/cn:u1"), "queueing is not a rejection");
 }
 
 #[tokio::test]

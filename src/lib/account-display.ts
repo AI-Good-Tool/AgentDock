@@ -9,6 +9,15 @@ export function accountName(a: Account) {
 export function maskedPhone(phone?: string) {
   return phone?.replace(/^(\d{3})\d+(\d{4})$/, '$1****$2') || ''
 }
+/** Card phone line: masked unless the page-level reveal is on (keeps +86 / spacing intact). */
+export function phoneText(phone: string | undefined | null, reveal: boolean) {
+  const raw = String(phone || '').trim()
+  if (!raw || reveal) return raw
+  const digits = raw.replace(/\D/g, '')
+  if (digits.length < 7) return raw.replace(/\d/g, '*')
+  const local = digits.length > 11 && digits.startsWith('86') ? digits.slice(2) : digits
+  return local.slice(0, 3) + '****' + local.slice(-4)
+}
 export function credits(value?: number) {
   return value === undefined || value === null
     ? '—'

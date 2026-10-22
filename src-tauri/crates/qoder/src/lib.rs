@@ -2,6 +2,7 @@
 //! OAuth device login, daily credit claiming, sessions, local statistics and
 //! the native-signed gateway transport.
 pub mod gateway;
+pub mod platform;
 pub mod qcore;
 pub mod qsession;
 pub mod qstats;

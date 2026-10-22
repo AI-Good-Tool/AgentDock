@@ -421,6 +421,10 @@ impl Provider {
             }
         }
         normalize_qoder_messages(&mut body);
+        if let Err(e) = validate_tool_history(&body) {
+            details.local_error("validation", &e);
+            return Err(SendFailure::local(400, "invalid_request", e));
+        }
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage":true});
         let request_id = input.request_id.clone();
@@ -525,7 +529,7 @@ impl Provider {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(60)
                 .min(3600);
-            let message =
+            let mut message =
                 format!("Qoder 上游拒绝请求（HTTP {status}），请检查账号、模型权限或接入地址");
             let mut code = Value::Null;
             if let Ok(bytes) = bounded_body(response, 64 * 1024).await {
@@ -533,6 +537,9 @@ impl Provider {
                     details.first_byte_ms = Some(started.elapsed().as_millis());
                 }
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                    if let Some(hint) = provider_error_hint(&v) {
+                        message = format!("Qoder 上游拒绝请求（HTTP {status}）：{hint}");
+                    }
                     details.upstream_error(&v, &[&account.token]);
                     code = v.get("code").or_else(|| v["error"].get("code")).map(|v| {
                         json!(v
@@ -585,7 +592,7 @@ impl Provider {
                 let events = match parser.feed(&part) {
                     Ok(v) => v,
                     Err(e) => {
-                        yield Err(StreamFailure::new(e));
+                        yield Err(parser.failure(e));
                         return;
                     }
                 };
@@ -650,7 +657,7 @@ pub fn credit_rank(entry: Option<&Value>) -> CreditRank {
 pub fn machine_id(edition: &str) -> String {
     if let Some(ed) = qcore::edition(edition) {
         for path in [
-            qcore::home_dir().join(ed.data_dir).join("auth.machine-id"),
+            crate::platform::data_dir(ed).join("auth.machine-id"),
             qcore::home_dir().join(ed.home_dir).join(".auth/machine_id"),
         ] {
             if let Ok(value) = fs::read_to_string(path) {
@@ -684,7 +691,9 @@ pub async fn runtime_helper(input: Value) -> Result<Value, String> {
         PathBuf::from("/usr/local/bin/node"),
     ];
     if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(std::env::split_paths(&path).map(|p| p.join("node")));
+        candidates.extend(
+            std::env::split_paths(&path).map(|p| p.join(if cfg!(windows) { "node.exe" } else { "node" })),
+        );
     }
     let nvm = qcore::home_dir().join(".nvm/versions/node");
     if let Ok(entries) = fs::read_dir(nvm) {
@@ -692,21 +701,29 @@ pub async fn runtime_helper(input: Value) -> Result<Value, String> {
             candidates.push(e.path().join("bin/node"));
         }
     }
-    let bundled = PathBuf::from(if input["edition"] == "cn" {
-        "/Applications/Qoder CN.app/Contents/MacOS/Qoder CN"
-    } else {
-        "/Applications/Qoder.app/Contents/MacOS/Qoder"
-    });
-    let executable = if bundled.is_file() {
-        bundled
-    } else {
-        candidates
-            .into_iter()
-            .find(|p| p.is_file())
-            .ok_or("请安装 Qoder 或 Node.js")?
-    };
-    let mut child = tokio::process::Command::new(executable)
+    #[cfg(windows)]
+    for key in ["ProgramFiles", "LOCALAPPDATA", "NVM_SYMLINK"] {
+        if let Some(root) = std::env::var_os(key) {
+            candidates.push(PathBuf::from(&root).join("nodejs/node.exe"));
+            candidates.push(PathBuf::from(root).join("node.exe"));
+        }
+    }
+    let ed = qcore::edition(input["edition"].as_str().unwrap_or("intl")).ok_or("未知版本")?;
+    // The installed Qoder doubles as the Node runtime (ELECTRON_RUN_AS_NODE).
+    let executable = crate::platform::app_executable(ed)
+        .or_else(|| candidates.into_iter().find(|p| p.is_file()))
+        .ok_or("请安装 Qoder 或 Node.js")?;
+    let source = crate::platform::resources_dir(ed)
+        .ok_or("请安装对应地区的 Qoder 客户端")?
+        .join("app.asar.unpacked/node_modules/@qoder-ai")
+        .join(if ed.key == "cn" { "qoder-cn-agent-sdk" } else { "qoder-agent-sdk" })
+        .join("dist/_worker/qoder-worker-runtime.obf.mjs");
+    let mut command = tokio::process::Command::new(executable);
+    #[cfg(windows)]
+    command.creation_flags(0x08000000);
+    let mut child = command
         .arg(path)
+        .env("AGENTDOCK_QODER_SOURCE", source)
         .env("ELECTRON_RUN_AS_NODE", "1")
         .env(
             "AGENTDOCK_QODER_CACHE",
@@ -819,7 +836,92 @@ pub fn normalize_qoder_messages(chat: &mut Value) {
                     .join("\n"));
             }
         }
+        // Match the installed SDK's history contract, not just OpenAI's generic
+        // shape: tool-only assistant content is an empty string and every
+        // historical call carries its index. IDs and arguments are preserved.
+        if row["role"] == "assistant" && row["tool_calls"].as_array().is_some_and(|a| !a.is_empty()) {
+            if row["content"].is_null() {
+                row["content"] = json!("");
+            }
+            for (index, call) in row["tool_calls"].as_array_mut().unwrap().iter_mut().enumerate() {
+                call["index"] = json!(index);
+            }
+        }
     }
+}
+
+/// Orphaned, duplicated or unanswered tool history is rejected locally: the
+/// upstream would refuse it with a 400 after charging the request setup.
+pub fn validate_tool_history(chat: &Value) -> Result<(), String> {
+    let mut pending = std::collections::HashSet::new();
+    for (index, row) in chat["messages"].as_array().into_iter().flatten().enumerate() {
+        if row["role"] == "tool" {
+            let id = row["tool_call_id"].as_str().unwrap_or("");
+            if !pending.remove(id) {
+                return Err(format!(
+                    "messages[{index}] 的工具结果缺少匹配的前置调用；请检查工具历史是否被截断"
+                ));
+            }
+            continue;
+        }
+        if !pending.is_empty() {
+            return Err(format!(
+                "messages[{index}] 前尚有 {} 个工具调用未返回结果；工具结果必须先完整回传",
+                pending.len()
+            ));
+        }
+        for call in row["tool_calls"].as_array().into_iter().flatten() {
+            let id = call["id"].as_str().filter(|s| !s.is_empty()).ok_or("工具调用缺少 ID")?;
+            if !pending.insert(id.to_owned()) {
+                return Err(format!("messages[{index}] 存在重复工具调用 ID"));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        return Err(format!("历史末尾尚有 {} 个工具调用未返回结果", pending.len()));
+    }
+    Ok(())
+}
+
+/// Fixed hints for known upstream validation errors; raw bodies are never echoed.
+fn provider_error_hint(body: &Value) -> Option<&'static str> {
+    let serialized = body.to_string().to_lowercase();
+    if serialized.contains("must be a response to a preceding message")
+        || serialized.contains("tool_call_id") && serialized.contains("tool_calls")
+    {
+        Some("工具历史校验失败：工具结果缺少对应的前置 tool_calls")
+    } else if serialized.contains("reasoning_content") {
+        Some("模型要求回传 reasoning_content，请检查思考历史兼容性")
+    } else if serialized.contains("max_tokens") || serialized.contains("max_output_tokens") {
+        Some("输出 token 参数不符合模型限制")
+    } else if serialized.contains("context_length") || serialized.contains("context window") {
+        Some("请求上下文超过模型限制")
+    } else if serialized.contains("schema") && serialized.contains("tool") {
+        Some("工具参数 schema 不符合上游要求")
+    } else {
+        None
+    }
+}
+
+fn rejection_hint(status: u16) -> &'static str {
+    match status {
+        400 => "上游请求格式或参数校验失败",
+        401 => "上游认证被拒绝，请刷新账号登录凭证",
+        403 => "上游拒绝此请求，可能与模型权限或临时风控有关；该账号对此模型将短暂冷却",
+        429 => "上游限流，请稍后重试",
+        _ => "请检查模型权限、配额和请求兼容性",
+    }
+}
+
+fn safe_code(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '/')
+        .take(48)
+        .collect()
 }
 
 pub fn legacy_body(
@@ -867,6 +969,41 @@ pub fn legacy_body(
 }
 
 /// Qoder SSE: plain chunks, `statusCodeValue` envelopes and quota markers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueueInfo {
+    pub retry_after: u64,
+    pub queue_count: Option<u64>,
+    pub sub_code: Option<String>,
+}
+impl QueueInfo {
+    pub fn label(&self) -> String {
+        let count = self.queue_count.map(|c| format!("，队列 {c}")).unwrap_or_default();
+        let code = self.sub_code.as_deref().map(|c| format!("（{c}）")).unwrap_or_default();
+        format!("模型{code}排队中{count}，约 {} 秒后自动重试", self.retry_after)
+    }
+}
+
+/// Qoder reports model queueing as a 403 envelope whose message is JSON with
+/// code 10605 / isQueued; it is a wait signal, not an account rejection.
+fn parse_queue_notice(body: &Value) -> Option<QueueInfo> {
+    let outer: Value = serde_json::from_str(body.as_str()?).ok()?;
+    let inner: Value = serde_json::from_str(outer.get("message")?.as_str()?).ok()?;
+    if inner.get("code").and_then(Value::as_str) != Some("10605")
+        && inner.get("isQueued").and_then(Value::as_bool) != Some(true)
+    {
+        return None;
+    }
+    Some(QueueInfo {
+        retry_after: inner.get("retryAfterSeconds").and_then(Value::as_u64).unwrap_or(30).clamp(1, 120),
+        queue_count: inner.get("queueCount").and_then(Value::as_u64),
+        sub_code: inner
+            .get("subCode")
+            .or_else(|| outer.get("subCode"))
+            .filter(|v| v.is_string())
+            .map(safe_code),
+    })
+}
+
 #[derive(Default)]
 pub struct Parser {
     pending: Vec<u8>,
@@ -874,6 +1011,22 @@ pub struct Parser {
     retained: usize,
     pub done: bool,
     pub finished: bool,
+    /// Business status carried inside an HTTP 200 SSE envelope.
+    pub business_status: Option<u16>,
+    pub business_code: Option<String>,
+    pub queue: Option<QueueInfo>,
+}
+impl Parser {
+    /// Stream failure enriched with the business status/code seen so far.
+    pub fn failure(&self, message: String) -> StreamFailure {
+        StreamFailure {
+            message,
+            code: self.business_code.clone(),
+            error: json!({"code": self.business_code}),
+            status: self.business_status,
+            retry_after: self.queue.as_ref().map(|q| q.retry_after),
+        }
+    }
 }
 impl Parser {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Option<Value>>, String> {
@@ -922,7 +1075,22 @@ impl Parser {
             let mut v: Value = serde_json::from_slice(&data).map_err(|_| "上游 SSE JSON 无效")?;
             if let Some(status) = v["statusCodeValue"].as_u64() {
                 if status != 200 {
-                    return Err(format!("Qoder 流式业务错误（{status}）"));
+                    self.business_status = u16::try_from(status).ok().filter(|s| (400..=599).contains(s));
+                    self.business_code = Some(status.to_string());
+                    if status == 403 {
+                        if let Some(queue) = parse_queue_notice(&v["body"]) {
+                            self.business_code = Some(
+                                queue.sub_code.as_deref().map(|c| format!("10605/{c}")).unwrap_or_else(|| "10605".into()),
+                            );
+                            let label = queue.label();
+                            self.queue = Some(queue);
+                            return Err(label);
+                        }
+                    }
+                    return Err(format!(
+                        "Qoder 流式业务错误（{status}）；{}",
+                        provider_error_hint(&v["body"]).unwrap_or(rejection_hint(self.business_status.unwrap_or(502)))
+                    ));
                 }
                 let inner = v["body"].as_str().unwrap_or("").trim();
                 if inner.is_empty() {
@@ -941,7 +1109,17 @@ impl Parser {
             if v.get("error").is_some_and(|v| !v.is_null())
                 || v.get("code").is_some_and(|v| v.as_i64() != Some(0))
             {
-                return Err("Qoder 返回业务错误事件，请检查模型权限与配额".into());
+                self.business_code = v.get("code").or_else(|| v["error"].get("code")).map(safe_code);
+                self.business_status = self
+                    .business_code
+                    .as_ref()
+                    .and_then(|s| s.parse::<u16>().ok())
+                    .filter(|s| [401, 403, 429].contains(s));
+                return Err(format!(
+                    "Qoder 返回业务错误事件{}；{}",
+                    self.business_code.as_ref().map(|c| format!("（{c}）")).unwrap_or_default(),
+                    rejection_hint(self.business_status.unwrap_or(502))
+                ));
             }
             for c in v["choices"].as_array().into_iter().flatten() {
                 if c["finish_reason"].is_string() {
@@ -1041,6 +1219,52 @@ mod tests {
         assert!(Parser::default()
             .feed(b"data: [EXCEED_QUOTA] unavailable\n\n")
             .is_err());
+    }
+    #[test]
+    fn stream_rejections_keep_business_status_code_and_queue_notice() {
+        let mut p = Parser::default();
+        assert!(p.feed(b"data: {\"statusCodeValue\":403,\"body\":\"denied\"}\n\n").is_err());
+        let f = p.failure("x".into());
+        assert_eq!((f.status, f.code.as_deref(), f.retry_after), (Some(403), Some("403"), None));
+        let notice = json!({"message": json!({"code":"10605","retryAfterSeconds":7,"queueCount":3,"subCode":"busy"}).to_string()});
+        let mut p = Parser::default();
+        let frame = format!("data: {}\n\n", json!({"statusCodeValue":403,"body":notice.to_string()}));
+        let e = p.feed(frame.as_bytes()).unwrap_err();
+        assert!(e.contains("排队中，队列 3") && e.contains("7 秒"), "{e}");
+        let f = p.failure(e);
+        assert_eq!((f.status, f.code.as_deref(), f.retry_after), (Some(403), Some("10605/busy"), Some(7)));
+        let mut p = Parser::default();
+        assert!(p.feed(b"data: {\"code\":429,\"error\":{\"code\":429}}\n\n").is_err());
+        assert_eq!(p.failure(String::new()).status, Some(429));
+    }
+    #[test]
+    fn tool_only_assistant_matches_native_contract() {
+        let input = json!({"model":"dfmodel","max_tokens":64,"messages":[{"role":"user","content":"use tools"},{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"echo","input":{"x":1}},{"type":"tool_use","id":"call-2","name":"echo","input":{"x":2}}]},{"role":"user","content":[{"type":"text","text":"continue"},{"type":"tool_result","tool_use_id":"call-1","content":"one"},{"type":"text","text":"please"},{"type":"tool_result","tool_use_id":"call-2","content":"two"}]}]});
+        let mut chat = anthropic::to_chat(&input).unwrap();
+        normalize_qoder_messages(&mut chat);
+        assert_eq!(chat["messages"][1]["content"], "");
+        assert_eq!(chat["messages"][1]["tool_calls"][0]["index"], 0);
+        assert_eq!(chat["messages"][1]["tool_calls"][1]["index"], 1);
+        assert_eq!(chat["messages"][2]["tool_call_id"], "call-1");
+        assert_eq!(chat["messages"][3]["tool_call_id"], "call-2");
+        assert_eq!(chat["messages"][4]["content"], "continue\nplease");
+        assert!(validate_tool_history(&chat).is_ok());
+        let wire = legacy_body(&chat, &json!({"id":"dfmodel"}), "test", "test", "cn");
+        assert_eq!(wire["messages"], chat["messages"]);
+    }
+    #[test]
+    fn orphan_results_and_incomplete_parallel_calls_are_rejected_locally() {
+        for messages in [
+            json!([{"role":"tool","tool_call_id":"missing","content":"result"}]),
+            json!([{"role":"assistant","content":null,"tool_calls":[{"id":"call-1"},{"id":"call-2"}]},{"role":"tool","tool_call_id":"call-1","content":"one"},{"role":"user","content":"continue"}]),
+            json!([{"role":"assistant","content":"","tool_calls":[{"id":"a"},{"id":"a"}]}]),
+        ] {
+            assert!(validate_tool_history(&json!({"messages":messages})).is_err());
+        }
+        assert_eq!(
+            provider_error_hint(&json!("Messages with role 'tool' must be a response to a preceding message with 'tool_calls'")),
+            Some("工具历史校验失败：工具结果缺少对应的前置 tool_calls")
+        );
     }
     #[test]
     fn quota_rank_sums_known_parts_and_uses_addon_expiry() {

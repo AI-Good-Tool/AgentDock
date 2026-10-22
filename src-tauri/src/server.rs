@@ -26,7 +26,31 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
+
+/// Distinct account attempts per client request (explicit pre-output rejections only).
+const MAX_ATTEMPTS: u32 = 3;
+/// Events buffered while waiting for generation to start before streaming anyway.
+const PROBE_EVENTS: usize = 64;
+
+/// Once content, reasoning, tool calls, a finish reason or usage appears the
+/// attempt is committed: it is never replayed on another account.
+fn generation_started(event: &UpstreamEvent) -> bool {
+    let UpstreamEvent::Chunk(chunk) = event else { return true };
+    chunk["usage"].is_object()
+        || chunk["choices"].as_array().into_iter().flatten().any(|c| {
+            c["finish_reason"].is_string()
+                || ["content", "reasoning_content", "tool_calls"].iter().any(|k| match &c["delta"][*k] {
+                    Value::Null => false,
+                    Value::String(s) => !s.is_empty(),
+                    Value::Array(a) => !a.is_empty(),
+                    _ => true,
+                })
+        })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
@@ -508,121 +532,235 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
         None => settings.pinned.get(&ep.scope.key()).filter(|s| !s.is_empty()).cloned(),
     };
     let accounts = hub.pool_accounts();
-    let now = chrono::Utc::now().timestamp_millis();
-    let picked = {
+    let choose = |tried: &HashSet<String>| {
+        let now = chrono::Utc::now().timestamp_millis();
         let check = |a: &agentdock_core::provider::PoolAccount, t: &agentdock_core::provider::UpstreamModel| {
             let mut probe = body.clone();
             probe["model"] = json!(t.id);
             hub.eligibility(a, t, &probe, &headers)
         };
         let mut rt = hub.runtime.lock().unwrap();
-        crate::scheduler::select(&accounts, &targets, &settings, &mut rt, &route.route_id, pinned.as_deref(), now, &check)
+        crate::scheduler::select_excluding(
+            &accounts,
+            &targets,
+            &settings,
+            &mut rt,
+            &route.route_id,
+            pinned.as_deref(),
+            now,
+            &check,
+            tried,
+        )
     };
-    let pick = match picked {
-        Ok(p) => p,
-        Err(e) => {
-            details.local_error("account_selection", &e);
-            reject(&hub, &ep, &requested, 503, "no_available_account", details);
-            return if kind == Kind::Messages {
-                let mut v = anthropic::error_value(503, &e);
-                v["error"]["type"] = json!("overloaded_error");
-                (StatusCode::SERVICE_UNAVAILABLE, Json(v)).into_response()
-            } else {
-                openai_error(503, &e, "no_available_account")
-            };
+    let group = uuid::Uuid::new_v4().simple().to_string();
+    let mut tried = HashSet::<String>::new();
+    let mut next: Option<crate::scheduler::Pick> = None;
+    let mut attempt = 0u32;
+    let (id, mut lease, mut events) = loop {
+        let pick = match next.take().map(Ok).unwrap_or_else(|| choose(&tried)) {
+            Ok(p) => p,
+            Err(e) => {
+                let mut details = details.clone();
+                details.local_error("account_selection", &e);
+                reject(&hub, &ep, &requested, 503, "no_available_account", details);
+                return if kind == Kind::Messages {
+                    let mut v = anthropic::error_value(503, &e);
+                    v["error"]["type"] = json!("overloaded_error");
+                    (StatusCode::SERVICE_UNAVAILABLE, Json(v)).into_response()
+                } else {
+                    openai_error(503, &e, "no_available_account")
+                };
+            }
+        };
+        attempt += 1;
+        let id = if attempt == 1 { group.clone() } else { uuid::Uuid::new_v4().simple().to_string() };
+        let mut body = body.clone();
+        let mut details = details.clone();
+        body["model"] = json!(pick.target.id);
+        details.request_summary["realModel"] = json!(pick.target.id);
+        details.request_summary["provider"] = json!(pick.account.provider.key());
+        details.request_summary["region"] = json!(pick.account.region);
+        if attempt > 1 {
+            details.request_summary["attempt"] = json!(attempt);
         }
-    };
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    body["model"] = json!(pick.target.id);
-    details.request_summary["realModel"] = json!(pick.target.id);
-    details.request_summary["provider"] = json!(pick.account.provider.key());
-    details.request_summary["region"] = json!(pick.account.region);
-    if !pick.skipped.is_empty() {
-        details.request_summary["skipped"] = pick
-            .skipped
-            .iter()
-            .map(|((provider, region, reason), count)| json!({"provider": provider, "region": region, "reason": reason, "count": count}))
-            .collect();
-    }
-    let log = RequestLog {
-        id: id.clone(),
-        time: chrono::Utc::now().to_rfc3339(),
-        protocol: protocol(&ep).into(),
-        path: path.clone(),
-        requested_model: diagnostics::bounded(&requested, 128),
-        model: route.alias.clone(),
-        route_id: route.route_id.clone(),
-        real_model: pick.target.id.clone(),
-        model_name: pick.target.name.clone(),
-        provider: pick.account.provider.key().into(),
-        region: pick.account.region.clone(),
-        account_id: pick.account.id.clone(),
-        account_name: pick.account.name.clone(),
-        status: 0,
-        outcome: "running".into(),
-        strategy: format!("{:?}", settings.strategy),
-        stream,
-        ..RequestLog::default()
-    };
-    hub.active.lock().unwrap().insert(id.clone(), log.clone());
-    let mut lease = Lease {
-        hub: hub.clone(),
-        key: pick.account.key(),
-        log,
-        details,
-        start: Instant::now(),
-        finished: false,
-    };
-    let send = SendInput {
-        body,
-        headers: headers.clone(),
-        request_id: id.clone(),
-        session_id: agentdock_core::session::client_session(&headers, &input),
-        effort_input,
-        client_profile: ep.zcode.then(|| "zcode".into()),
-    };
-    let started = lease.start;
-    let result = match pick.exec {
-        Exec::Workbuddy(config) => {
-            workbuddy::upstream::send(&hub.wb, &pick.account.id, config, send, &mut lease.details, started).await
+        if !pick.skipped.is_empty() {
+            details.request_summary["skipped"] = pick
+                .skipped
+                .iter()
+                .map(|((provider, region, reason), count)| json!({"provider": provider, "region": region, "reason": reason, "count": count}))
+                .collect();
         }
-        Exec::Qoder(info) => hub.qoder.send(&pick.account.id, info, send, &mut lease.details, started).await,
-        Exec::Trae(config) => hub.trae.send(&pick.account.id, config, send, &mut lease.details, started).await,
-    };
-    let ok = match result {
-        Ok(ok) => ok,
-        Err(f) => {
-            {
-                let mut rt = hub.runtime.lock().unwrap();
-                match f.effect {
-                    AccountEffect::Cooldown(s) => {
-                        rt.cooldown.insert(lease.key.clone(), now + s as i64 * 1000);
+        let log = RequestLog {
+            id: id.clone(),
+            time: chrono::Utc::now().to_rfc3339(),
+            protocol: protocol(&ep).into(),
+            path: path.clone(),
+            requested_model: diagnostics::bounded(&requested, 128),
+            model: route.alias.clone(),
+            route_id: route.route_id.clone(),
+            real_model: pick.target.id.clone(),
+            model_name: pick.target.name.clone(),
+            provider: pick.account.provider.key().into(),
+            region: pick.account.region.clone(),
+            account_id: pick.account.id.clone(),
+            account_name: pick.account.name.clone(),
+            status: 0,
+            outcome: "running".into(),
+            strategy: format!("{:?}", settings.strategy),
+            stream,
+            attempt,
+            request_group: group.clone(),
+            ..RequestLog::default()
+        };
+        hub.active.lock().unwrap().insert(id.clone(), log.clone());
+        let mut lease = Lease {
+            hub: hub.clone(),
+            key: pick.account.key(),
+            log,
+            details,
+            start: Instant::now(),
+            finished: false,
+        };
+        let send = SendInput {
+            body,
+            headers: headers.clone(),
+            request_id: id.clone(),
+            session_id: agentdock_core::session::client_session(&headers, &input),
+            effort_input: effort_input.clone(),
+            client_profile: ep.zcode.then(|| "zcode".into()),
+        };
+        let started = lease.start;
+        // Only Qoder rejects some account/model pairs in-band before any
+        // output, so only Qoder attempts fail over (at most MAX_ATTEMPTS).
+        let can_fail_over = pick.account.provider == ProviderKind::Qoder;
+        let result = match pick.exec {
+            Exec::Workbuddy(config) => {
+                workbuddy::upstream::send(&hub.wb, &pick.account.id, config, send, &mut lease.details, started).await
+            }
+            Exec::Qoder(info) => hub.qoder.send(&pick.account.id, info, send, &mut lease.details, started).await,
+            Exec::Trae(config) => hub.trae.send(&pick.account.id, config, send, &mut lease.details, started).await,
+        };
+        let ok = match result {
+            Ok(ok) => ok,
+            Err(f) => {
+                {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let mut rt = hub.runtime.lock().unwrap();
+                    match f.effect {
+                        AccountEffect::Cooldown(s) => {
+                            rt.cooldown.insert(lease.key.clone(), now + s as i64 * 1000);
+                        }
+                        AccountEffect::AuthFailed => {
+                            rt.auth_failed.insert(lease.key.clone());
+                        }
+                        AccountEffect::None => {}
                     }
-                    AccountEffect::AuthFailed => {
-                        rt.auth_failed.insert(lease.key.clone());
+                }
+                lease.log.upstream_code = f.error["code"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| f.error["code"].as_i64().map(|c| c.to_string()));
+                if lease.details.error_stage.is_none() {
+                    lease.details.local_error("upstream", &f.message);
+                }
+                if can_fail_over && [401, 403, 429].contains(&f.status) && attempt < MAX_ATTEMPTS {
+                    tried.insert(lease.key.clone());
+                    if let Ok(p) = choose(&tried) {
+                        lease.finish(f.status, "retried", &f.message);
+                        next = Some(p);
+                        continue;
                     }
-                    AccountEffect::None => {}
+                }
+                let outcome = if f.code == "upstream_error" || f.code == "upstream_channel_denied" {
+                    "upstream_rejected"
+                } else {
+                    f.code.as_str()
+                }
+                .to_owned();
+                lease.finish(f.status, &outcome, &f.message);
+                return failure_response(kind, &f);
+            }
+        };
+        let mut events = ok.events;
+        let mut prefix = Vec::new();
+        if can_fail_over {
+            // Hold back the stream start until generation begins: a rejection
+            // seen before that can still move to another account unnoticed.
+            let mut failure = None;
+            while prefix.len() < PROBE_EVENTS {
+                let Some(event) = events.next().await else { break };
+                lease.first_byte();
+                match event {
+                    Ok(e) => {
+                        let generated = generation_started(&e);
+                        prefix.push(Ok(e));
+                        if generated {
+                            break;
+                        }
+                    }
+                    Err(f) => {
+                        failure = Some(f);
+                        break;
+                    }
                 }
             }
-            lease.log.upstream_code = f.error["code"]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| f.error["code"].as_i64().map(|c| c.to_string()));
-            if lease.details.error_stage.is_none() {
-                lease.details.local_error("upstream", &f.message);
+            if let Some(f) = failure {
+                let status = f.status.filter(|s| [401, 403, 429].contains(s));
+                if f.retry_after.is_none() && status.is_none() {
+                    prefix.push(Err(f));
+                } else {
+                    let status = status.unwrap_or(403);
+                    {
+                        let until = chrono::Utc::now().timestamp_millis() + 60_000;
+                        let mut rt = hub.runtime.lock().unwrap();
+                        match status {
+                            403 if f.retry_after.is_none() => {
+                                rt.model_cooldown.insert((lease.key.clone(), lease.log.real_model.clone()), until);
+                            }
+                            401 | 429 => {
+                                rt.cooldown.insert(lease.key.clone(), until);
+                            }
+                            _ => {}
+                        }
+                    }
+                    record_stream_failure(&mut lease, &f);
+                    if attempt < MAX_ATTEMPTS {
+                        tried.insert(lease.key.clone());
+                        if let Ok(p) = choose(&tried) {
+                            lease.finish(status, "retried", &f.message);
+                            next = Some(p);
+                            continue;
+                        }
+                        if let Some(wait) = f.retry_after {
+                            // Queued with no alternative: wait as told, then
+                            // let the scheduler pick again (usually the same account).
+                            lease.finish(status, "retried", &f.message);
+                            tried.remove(&lease.key);
+                            drop(lease);
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            continue;
+                        }
+                    }
+                    lease.finish(status, "upstream_rejected", &f.message);
+                    let mut sf = SendFailure::local(status, "upstream_error", f.message.clone());
+                    sf.error = json!({"code": f.code});
+                    sf.anthropic_type = match status {
+                        401 => Some("authentication_error".into()),
+                        403 => Some("permission_error".into()),
+                        _ => Some("rate_limit_error".into()),
+                    };
+                    return failure_response(kind, &sf);
+                }
             }
-            let outcome = if f.code == "upstream_error" || f.code == "upstream_channel_denied" {
-                "upstream_rejected"
-            } else {
-                f.code.as_str()
-            }
-            .to_owned();
-            lease.finish(f.status, &outcome, &f.message);
-            return failure_response(kind, &f);
         }
+        let events: agentdock_core::stream::EventStream = if prefix.is_empty() {
+            events
+        } else {
+            Box::pin(futures_util::stream::iter(prefix).chain(events))
+        };
+        break (id, lease, events);
     };
     let alias = route.alias.clone();
-    let mut events = ok.events;
     if !stream {
         let mut aggregate = Aggregate::new(&alias);
         let mut done = false;
@@ -798,6 +936,7 @@ pub async fn start(hub: Shared) -> Result<u16, String> {
         .await
         .map_err(|_| {
             let e = format!("端口 {} 已占用或无法监听", settings.port);
+            agentdock_core::applog::error("gateway", || (e.clone(), Value::Null));
             *hub.error.lock().unwrap() = e.clone();
             e
         })?;
@@ -811,6 +950,9 @@ pub async fn start(hub: Shared) -> Result<u16, String> {
         *server = Some(crate::app::ServerHandle { port, stop: tx });
     }
     hub.error.lock().unwrap().clear();
+    agentdock_core::applog::info("gateway", || {
+        (format!("网关已启动：127.0.0.1:{port}"), json!({"strategy": settings.strategy}))
+    });
     let app = router(hub.clone());
     let state = hub.clone();
     tokio::spawn(async move {
@@ -830,6 +972,7 @@ pub async fn start(hub: Shared) -> Result<u16, String> {
 pub fn stop(hub: &Shared) {
     if let Some(handle) = hub.server.lock().unwrap().take() {
         let _ = handle.stop.send(());
+        agentdock_core::applog::info("gateway", || ("网关已停止".into(), Value::Null));
     }
 }
 

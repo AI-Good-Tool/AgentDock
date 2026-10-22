@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import ProviderMark from './components/ProviderMark.vue'
-import { computed, onMounted } from 'vue'
+import BrandMark from './components/BrandMark.vue'
+import { computed, onMounted, watch } from 'vue'
 import {
   IconApps,
   IconUserGroup,
@@ -14,6 +15,7 @@ import {
   IconLink,
   IconPoweroff,
   IconPlayArrow,
+  IconFile,
 } from '@arco-design/web-vue/es/icon'
 import { t, isZh } from './i18n'
 import { state, page, startPolling, act, refreshApp } from './store'
@@ -28,6 +30,7 @@ import Tokens from './pages/Tokens.vue'
 import Sessions from './pages/Sessions.vue'
 import Access from './pages/Access.vue'
 import Preferences from './pages/Preferences.vue'
+import Logs from './pages/Logs.vue'
 
 const nav = computed(() => [
   { id: 'overview', label: t('工作台', 'Overview'), icon: IconApps },
@@ -49,8 +52,14 @@ const nav = computed(() => [
   { id: 'tokens', label: t('Token 统计', 'Token Usage'), icon: IconCode },
   { id: 'sessions', label: t('会话管理', 'Sessions'), icon: IconMessage },
   { id: 'access', label: t('接入设置', 'API Access'), icon: IconLink },
+  ...(logging.value ? [{ id: 'logs', label: t('运行日志', 'Runtime Log'), icon: IconFile }] : []),
   { id: 'settings', label: t('偏好设置', 'Preferences'), icon: IconSettings },
 ])
+const logging = computed(() => state.app?.settings.logging ?? true)
+// Leave the Logs page when its menu is switched off.
+watch(logging, (on) => {
+  if (!on && page.value === 'logs') page.value = 'settings'
+})
 const accountCount = computed(() => {
   const p = state.pool
   if (!p) return undefined
@@ -71,6 +80,7 @@ const pages: Record<string, any> = {
   sessions: Sessions,
   access: Access,
   settings: Preferences,
+  logs: Logs,
 }
 const running = computed(() => !!state.app?.running)
 function toggle() {
@@ -90,7 +100,7 @@ onMounted(startPolling)
   <div class="app-shell" :class="{ en: !isZh }">
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-symbol dock-symbol"><span>A</span><i></i></div>
+        <BrandMark />
         <div>
           <strong>Agent<b>Dock</b></strong
           ><small>{{ t('统一模型网关', 'UNIFIED MODEL GATEWAY') }}</small>
@@ -124,11 +134,14 @@ onMounted(startPolling)
       <header class="topbar">
         <div>AgentDock <span>/</span> {{ nav.find((n) => n.id === page)?.label }}</div>
         <div class="topbar-right">
-          <span v-if="running" class="version-chip mono">127.0.0.1:{{ state.app?.port }}</span>
-          <span class="vertical-line"></span>
+          <span class="gateway-chip" :class="{ online: running }">
+            <i class="dot" :class="{ online: running }"></i>
+            <span class="mono">{{ running ? `127.0.0.1:${state.app?.port}` : t('未启动', 'Stopped') }}</span>
+          </span>
           <a-button
-            size="small"
-            :type="running ? 'secondary' : 'primary'"
+            class="gateway-btn"
+            :type="running ? 'outline' : 'primary'"
+            :status="running ? 'danger' : 'normal'"
             :loading="state.pending.has('gateway')"
             @click="toggle"
           >

@@ -135,7 +135,8 @@ pub fn to_chat(input: &Value) -> Result<Value, String> {
                     calls.push(json!({"id":id,"type":"function","function":{"name":name,"arguments":block["input"].to_string()}}));
                 }
                 Some("tool_result") if role == "user" => {
-                    flush_user(&mut parts, &mut messages);
+                    // Every result precedes user text from the same turn, so parallel
+                    // tool calls stay contiguous and matched to their tool_calls.
                     let id = block["tool_use_id"]
                         .as_str()
                         .filter(|s| !s.is_empty())

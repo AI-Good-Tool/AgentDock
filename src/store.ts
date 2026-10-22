@@ -23,6 +23,8 @@ export const state = reactive({
   now: Date.now(),
 })
 export const page = ref('overview')
+/** Show full phone numbers on account cards (session only, never persisted). */
+export const revealPhones = ref(false)
 
 export function runtimeOf(provider: string, id: string): AccountRuntime | undefined {
   return state.pool?.runtime?.[`${provider}/${id}`]

@@ -57,6 +57,8 @@ const na = () => t('未提供', 'n/a')
           <a-descriptions-item :label="t('HTTP 状态', 'HTTP status')">{{ record.status }}</a-descriptions-item>
           <a-descriptions-item :label="t('请求路径', 'Path')" :span="2"><span class="mono">{{ details?.method || '—' }} {{ record.path || details?.clientPath || '—' }}</span></a-descriptions-item>
           <a-descriptions-item label="Request ID" :span="2"><span class="mono">{{ record.id }}</span></a-descriptions-item>
+          <a-descriptions-item v-if="(record.attempt ?? 0) > 1 || record.outcome === 'retried'" :label="t('账号尝试', 'Attempt')">{{ t(`第 ${record.attempt} 个账号`, `Account #${record.attempt}`) }}</a-descriptions-item>
+          <a-descriptions-item v-if="(record.attempt ?? 0) > 1 || record.outcome === 'retried'" :label="t('请求组', 'Request group')"><span class="mono">{{ record.requestGroup || record.id }}</span></a-descriptions-item>
         </a-descriptions>
       </section>
       <section>

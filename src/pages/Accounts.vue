@@ -2,7 +2,7 @@
 import ProviderMark from '../components/ProviderMark.vue'
 import { computed, ref, onMounted, h } from 'vue'
 import { Modal, Message } from '@arco-design/web-vue'
-import { IconPlus, IconRefresh, IconThunderbolt, IconLaunch } from '@arco-design/web-vue/es/icon'
+import { IconPlus, IconRefresh, IconThunderbolt, IconLaunch, IconEye, IconEyeInvisible } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
 import AccountCard from '../components/workbuddy/AccountCard.vue'
 import AddAccountDialog from '../components/workbuddy/AddAccountDialog.vue'
@@ -13,13 +13,14 @@ import QoderInfoDialog from '../components/QoderInfoDialog.vue'
 import TraeCard from '../components/TraeCard.vue'
 import TraeDialogs from '../components/TraeDialogs.vue'
 import LoginDialog from '../components/LoginDialog.vue'
+import AccountJsonDialog from '../components/AccountJsonDialog.vue'
 import { call } from '../api'
 import { t } from '../i18n'
-import { state, act, busy, refreshPool, runtimeOf } from '../store'
+import { state, act, busy, refreshPool, runtimeOf, revealPhones } from '../store'
 import { accountName } from '../lib/account-display'
 
 const provider = ref<'all' | 'workbuddy' | 'qoder' | 'trae'>('all')
-const region = ref<'all' | 'cn' | 'intl'>('all')
+const region = ref<'all' | 'cn' | 'intl'>('cn')
 const query = ref('')
 const compact = ref(false)
 const creditLoading = ref<string[]>([])
@@ -45,14 +46,14 @@ const wbAccounts = computed(() =>
     .filter(
       (a: any) =>
         inRegion(a.variant === 'ai' ? 'intl' : 'cn') &&
-        match(accountName(a), a.presentation?.uid, a.id, a.note)
+        match(accountName(a), a.presentation?.uid, a.id, a.note, a.presentation?.phoneNumber)
     )
     .map((a: any) => {
       const rt = runtimeOf('workbuddy', a.id)
       return {
         ...a,
         inFlight: rt?.inFlight ?? 0,
-        concurrency: rt?.concurrency ?? 2,
+        concurrency: rt?.concurrency ?? 4,
         authFailed: rt?.authFailed ?? false,
         cooldownUntil: rt?.cooldownUntil,
       }
@@ -65,7 +66,7 @@ const qoderAccounts = computed(() =>
 )
 const traeAccounts = computed(() =>
   (state.pool?.trae?.accounts ?? []).filter(
-    (a: any) => inRegion(a.variant) && match(a.username, a.note, a.email, a.userId)
+    (a: any) => inRegion(a.variant) && match(a.username, a.note, a.email, a.userId, a.mobile)
   )
 )
 const total = computed(
@@ -220,14 +221,14 @@ function traeSwitch(a: any) {
   Modal.confirm({
     title: t('切换 Trae 账号', 'Switch Trae account'),
     content: t(
-      '请先退出对应 Trae 客户端。切换前会备份原始登录存储，完成后重新打开客户端。',
-      'Quit the Trae client first. The original storage is backed up and the client reopens.'
+      '如果对应的 Trae 客户端正在运行，会先自动退出（未响应时强制结束），再写入登录态并重新打开。未保存的编辑内容请先保存；原始登录存储会先备份。',
+      'If the Trae client is running it is quit first (force-closed if it does not respond), then the login is written and the client reopens. Save open work first; the original login storage is backed up.'
     ),
     onOk: () =>
       traeRun(
         a,
         'trae_switch',
-        t('账号已切换，原始存储已备份', 'Switched; original storage backed up')
+        t('账号已切换，客户端已重新打开（原始存储已备份）', 'Switched and reopened; original storage backed up')
       ),
   })
 }
@@ -290,6 +291,9 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
           <a-doption @click="wbImport('switch')">{{
             t('导入 WorkBuddy Switch 账号库', 'Import WorkBuddy Switch store')
           }}</a-doption>
+          <a-doption @click="dialog = { kind: 'json-import', provider: 'workbuddy' }">{{
+            t('导入账号 JSON', 'Import account JSON')
+          }}</a-doption>
         </a-dgroup>
         <a-dgroup title="Qoder">
           <a-doption @click="dialog = { kind: 'login', provider: 'qoder', region: 'cn' }">{{
@@ -303,6 +307,9 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
           }}</a-doption>
           <a-doption @click="qoderCapture('intl')">{{
             t('采集 Qoder 当前账号', 'Capture Qoder account')
+          }}</a-doption>
+          <a-doption @click="dialog = { kind: 'json-import', provider: 'qoder' }">{{
+            t('导入账号 JSON', 'Import account JSON')
           }}</a-doption>
         </a-dgroup>
         <a-dgroup title="Trae">
@@ -332,7 +339,7 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
             "
             >{{ t('采集 Trae 本机账号', 'Capture Trae account') }}</a-doption
           >
-          <a-doption @click="dialog = { kind: 'trae-import' }">{{
+          <a-doption @click="dialog = { kind: 'json-import', provider: 'trae' }">{{
             t('导入账号 JSON', 'Import account JSON')
           }}</a-doption>
         </a-dgroup>
@@ -353,6 +360,10 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
       <a-radio value="intl">{{ t('国际版', 'International') }}</a-radio>
     </a-radio-group>
     <span class="grow"></span>
+    <label class="reveal-switch" :title="t('仅本次运行有效；重启后恢复脱敏显示', 'This session only; masked again after restart')">
+      <IconEye v-if="revealPhones" /><IconEyeInvisible v-else />{{ t('显示完整手机号', 'Show full numbers') }}
+      <a-switch v-model="revealPhones" size="small" />
+    </label>
     <span class="muted">{{ total }} {{ t('个账号', 'accounts') }}</span>
     <a-input-search
       v-model="query"
@@ -412,6 +423,7 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         @info="dialog = { kind: 'wb-info', id: a.id }"
         @resources="dialog = { kind: 'wb-resources', id: a.id }"
         @switch="(target) => wbSwitch(a, target)"
+        @json="dialog = { kind: 'json-view', provider: 'workbuddy', id: a.id, name: accountName(a) }"
       />
     </div>
   </template>
@@ -452,7 +464,7 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         )
       }}
     </div>
-    <div v-else class="grid-cards" :class="{ compact }">
+    <div v-else class="switch-account-grid" :class="{ compact }">
       <QoderCard
         v-for="a in qoderAccounts"
         :key="a.id"
@@ -465,6 +477,7 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         @note="qoderNote(a)"
         @refresh-token="qoderRefreshToken(a)"
         @remove="qoderRemove(a)"
+        @json="dialog = { kind: 'json-view', provider: 'qoder', id: a.id, name: a.note || a.name || a.email }"
       />
     </div>
   </template>
@@ -502,7 +515,7 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         )
       }}
     </div>
-    <div v-else class="grid-cards" :class="{ compact }">
+    <div v-else class="switch-account-grid" :class="{ compact }">
       <TraeCard
         v-for="a in traeAccounts"
         :key="a.id"
@@ -527,13 +540,14 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         @token="traeRun(a, 'trae_refresh_token', t('登录凭证已刷新', 'Login refreshed'))"
         @models="traeRun(a, 'trae_sync_models', t('模型目录已同步', 'Models synced'))"
         @remove="traeRemove(a)"
+        @json="dialog = { kind: 'json-view', provider: 'trae', id: a.id, name: a.note || a.username }"
       />
     </div>
     <div class="notice" style="margin-top: 14px">
       {{
         t(
-          'Trae 切换前自动备份原始登录态；请先退出对应客户端，切换成功后会重新打开。',
-          'Trae switching backs up the original login; quit the client first, it reopens afterwards.'
+          'Trae 切换前自动备份原始登录态；客户端运行中会先自动退出（必要时强制结束），切换成功后重新打开。',
+          'Trae switching backs up the original login; a running client is quit first (forced if needed) and reopens afterwards.'
         )
       }}
     </div>
@@ -572,5 +586,12 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
     :account="dialog.account"
     @close="dialog = null"
   />
-  <TraeDialogs v-if="dialog?.kind === 'trae-import'" mode="import" @close="dialog = null" />
+  <AccountJsonDialog
+    v-if="dialog?.kind === 'json-view' || dialog?.kind === 'json-import'"
+    :mode="dialog.kind === 'json-view' ? 'view' : 'import'"
+    :provider="dialog.provider"
+    :id="dialog.id"
+    :name="dialog.name"
+    @close="dialog = null"
+  />
 </template>

@@ -107,6 +107,13 @@ pub async fn send(
     let model = input.body["model"].as_str().unwrap_or("").to_owned();
     let allow_auxiliary = state.store.lock().unwrap().settings.allow_auxiliary_agents;
     let agent_purpose = crate::official::purpose(&input.headers, allow_auxiliary).map_err(|m| {
+        agentdock_core::applog::warn("workbuddy.agent", || {
+            (
+                format!("已拒绝 Agent 请求：{m}"),
+                json!({"account": if account.note.is_empty() { &account.name } else { &account.note }, "model": model,
+                    "purpose": input.headers.get("x-agent-purpose").and_then(|v| v.to_str().ok())}),
+            )
+        });
         details.local_error("agent_policy", m);
         SendFailure::local(403, "agent_disabled", m)
     })?;
@@ -191,6 +198,30 @@ pub async fn send(
             message,
         ));
     }
+    agentdock_core::applog::emit(
+        if response.status().is_success() {
+            agentdock_core::applog::Level::Info
+        } else {
+            agentdock_core::applog::Level::Warn
+        },
+        "workbuddy.agent",
+        || {
+            let kind = crate::official::agent_type(&agent_purpose);
+            (
+                format!("{kind} Agent · {agent_purpose} → HTTP {status}"),
+                json!({
+                    "account": if account.note.is_empty() { &account.name } else { &account.note },
+                    "region": account.variant,
+                    "model": model,
+                    "purpose": agent_purpose,
+                    "agentType": kind,
+                    "sessionInferred": context.inferred,
+                    "deviceSdk": use_device_sdk,
+                    "firstByteMs": started.elapsed().as_millis() as u64,
+                }),
+            )
+        },
+    );
     details.upstream_summary["deviceTokenSource"] = json!("installed-native-sdk");
     details.upstream_summary["gzipHeaderHex"] = json!("1f8b0800000000000013");
     details.upstream_status = Some(status);
@@ -282,6 +313,7 @@ pub async fn send(
                         code: scratch.error["code"].as_i64().map(|c| c.to_string())
                             .or_else(|| scratch.error["code"].as_str().map(str::to_owned)),
                         error: scratch.error,
+                        ..StreamFailure::default()
                     });
                     return;
                 }

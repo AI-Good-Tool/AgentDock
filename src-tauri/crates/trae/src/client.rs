@@ -31,11 +31,23 @@ pub fn variant_name(variant: &str) -> &'static str {
 pub struct Profile {
     pub variant: String,
     pub name: String,
+    /// `.app` bundle on macOS, install folder on Windows.
     pub app: PathBuf,
+    /// `resources/app` inside the installation.
+    pub root: PathBuf,
+    pub executable: PathBuf,
     pub dir: PathBuf,
     pub product: Value,
-    pub salt: Vec<u8>,
     pub storage: PathBuf,
+}
+impl Profile {
+    /// Login-state salt, derived only when login data is encoded or decoded so
+    /// routing, refresh and credits never depend on the client's private format.
+    pub fn salt(&self) -> Result<Vec<u8>, String> {
+        let source = fs::read_to_string(self.root.join("out/main.js"))
+            .map_err(|_| "无法读取客户端主程序")?;
+        salt_from_source(&source)
+    }
 }
 
 static PROFILES: Mutex<Option<HashMap<String, Profile>>> = Mutex::new(None);
@@ -44,8 +56,37 @@ fn sha(bytes: &[u8]) -> Vec<u8> {
     Sha512::digest(bytes).to_vec()
 }
 
-fn home() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
+
+/// The client XORs two 64-byte constants in the `AES` branch of its key
+/// helper (`…AES)for(let r=0;r<t;r++)i[r]=Gle[r]^zle[r]`). Minified names change
+/// between builds (Trae 3.6.4: Gle/zle, Trae CN 3.4.6: Yle/Xle), so the pair is
+/// located from that expression; the historical names remain a fallback.
+fn salt_from_source(source: &str) -> Result<Vec<u8>, String> {
+    let names = aes_xor_names(source).unwrap_or(("Gle".into(), "zle".into()));
+    let a = byte_array(source, &names.0)?;
+    let b = byte_array(source, &names.1)?;
+    if a.len() != b.len() || a.is_empty() {
+        return Err("客户端加密格式已变化，请重新分析版本".into());
+    }
+    Ok(a.iter().zip(&b).map(|(x, y)| x ^ y).collect())
+}
+
+fn aes_xor_names(source: &str) -> Option<(String, String)> {
+    let ident = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$') && !s.is_empty();
+    for (at, _) in source.match_indices(".AES)for(let ") {
+        let rest = &source[at + ".AES)for(let ".len()..];
+        let var = rest.split('=').next()?;
+        // `r=0;r<t;r++)i[r]=A[r]^B[r]`
+        let body = rest.split_once(')')?.1;
+        let (_, rhs) = body.split_once(&format!("[{var}]="))?;
+        let (lhs, tail) = rhs.split_once('^')?;
+        let a = lhs.strip_suffix(&format!("[{var}]"))?;
+        let b = tail.split_once(&format!("[{var}]"))?.0;
+        if ident(a) && ident(b) && ident(var) {
+            return Some((a.to_owned(), b.to_owned()));
+        }
+    }
+    None
 }
 
 /// Parse `<key>=Uint8Array.from([...])` / `new Uint8Array([...])` as JSON.
@@ -81,28 +122,30 @@ pub fn profile(variant: &str) -> Result<Profile, String> {
         return Ok(p.clone());
     }
     let name = variant_name(variant);
-    let app = PathBuf::from(format!("/Applications/{name}.app"));
-    let root = app.join("Contents/Resources/app");
-    let product: Value = serde_json::from_str(
-        &fs::read_to_string(root.join("product.json")).map_err(|_| format!("未安装 {name}"))?,
-    )
-    .map_err(|_| "客户端 product.json 无效")?;
-    let source =
-        fs::read_to_string(root.join("out/main.js")).map_err(|_| "无法读取客户端主程序")?;
-    let a = byte_array(&source, "Gle")?;
-    let b = byte_array(&source, "zle")?;
-    if a.len() != b.len() || a.is_empty() {
-        return Err("客户端加密格式已变化，请重新分析版本".into());
-    }
-    let dir = home().join("Library/Application Support").join(name);
+    let found = crate::platform::candidates(variant, name).into_iter().find_map(|c| {
+        let product: Value = serde_json::from_str(&fs::read_to_string(c.root.join("product.json")).ok()?).ok()?;
+        // Both clients may share an install root: accept only the matching edition.
+        let is_cn = product["nameShort"].as_str().unwrap_or("").to_lowercase().split_whitespace().any(|w| w == "cn");
+        if (variant == "cn") != is_cn {
+            return None;
+        }
+        let executable = crate::platform::resolve_executable(&c, &product, name)?;
+        Some((c, product, executable))
+    });
+    let Some((c, product, executable)) = found else {
+        let hint = if variant == "cn" { "TRAE_CN_PATH" } else { "TRAE_INTL_PATH" };
+        return Err(format!("未安装 {name}（或设置 {hint} 指向安装位置）"));
+    };
+    let dir = crate::platform::data_dir(name);
     let p = Profile {
         variant: variant.into(),
         name: name.into(),
-        app,
+        app: c.app,
+        root: c.root,
+        executable,
         storage: dir.join("User/globalStorage/storage.json"),
         dir,
         product,
-        salt: a.iter().zip(&b).map(|(x, y)| x ^ y).collect(),
     };
     PROFILES
         .lock()
@@ -157,7 +200,8 @@ pub fn read_local(variant: &str) -> Result<Value, String> {
     let auth = storage[AUTH_KEY]
         .as_str()
         .ok_or_else(|| format!("请先登录 {}", p.name))?;
-    let user = decode(auth, &p.salt)?;
+    let salt = p.salt()?;
+    let user = decode(auth, &salt)?;
     let pair = storage
         .as_object()
         .and_then(|o| o.iter().find(|(k, _)| k.starts_with(DEVICE_PREFIX)));
@@ -171,7 +215,7 @@ pub fn read_local(variant: &str) -> Result<Value, String> {
         "user": user,
         "models": models,
         "deviceId": pair.and_then(|(k, _)| k.rsplit(':').next()),
-        "deviceKeys": pair.and_then(|(_, v)| v.as_str()).and_then(|v| decode(v, &p.salt).ok()),
+        "deviceKeys": pair.and_then(|(_, v)| v.as_str()).and_then(|v| decode(v, &salt).ok()),
         "machineId": storage["telemetry.machineId"].as_str().unwrap_or(""),
         "cached": cached,
         "capturedAt": chrono::Utc::now().to_rfc3339(),
@@ -251,40 +295,73 @@ pub fn host_for(account: &Value, category: &str) -> Result<String, String> {
 
 pub fn launch(variant: &str) -> Result<(), String> {
     let p = profile(variant)?;
-    std::process::Command::new("/usr/bin/open")
-        .arg("-a")
-        .arg(&p.app)
-        .status()
-        .map_err(|_| "无法打开客户端")?;
-    Ok(())
+    crate::platform::launch(&p.app, &p.executable)
 }
 
+/// Unknown process state counts as running so the login is never overwritten blindly.
 pub fn is_running(variant: &str) -> bool {
     let Ok(p) = profile(variant) else {
         return false;
     };
-    let prefix = format!("{}/Contents/MacOS/", p.app.display());
-    match std::process::Command::new("/bin/ps")
-        .args(["-axo", "command"])
-        .output()
-    {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .any(|l| l.starts_with(&prefix)),
-        Err(_) => true,
-    }
+    crate::platform::processes(&p.app, &p.executable, false).map_or(true, |ps| ps.iter().any(|x| x.main))
 }
 
-/// Write the selected identity into the stopped client, after a private backup.
+/// Pids of every process inside this client's installation (main app and helpers).
+fn bundle_pids(p: &Profile) -> Result<Vec<u32>, String> {
+    crate::platform::processes(&p.app, &p.executable, true).map(|ps| ps.into_iter().map(|x| x.pid).collect())
+}
+
+fn wait_until(deadline: std::time::Duration, done: impl Fn() -> bool) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(crate::platform::QUIT_POLL_MS));
+    }
+    done()
+}
+
+/// Quit a running client so it cannot overwrite the login we write: ask it to
+/// quit (it saves its own state), then SIGTERM / SIGKILL only this bundle's
+/// processes. Returns whether the client had been running.
+pub fn quit(variant: &str) -> Result<bool, String> {
+    let p = profile(variant)?;
+    let running = crate::platform::processes(&p.app, &p.executable, true)
+        .map_err(|e| format!("{e}，未修改 {} 登录态", p.name))?;
+    if running.is_empty() {
+        return Ok(false);
+    }
+    let mains: Vec<u32> = running.iter().filter(|x| x.main).map(|x| x.pid).collect();
+    crate::platform::request_quit(&p.app, &mains);
+    let gone = || bundle_pids(&p).is_ok_and(|v| v.is_empty());
+    if !wait_until(std::time::Duration::from_secs(10), &gone) {
+        for force in [false, true] {
+            let pids = bundle_pids(&p).unwrap_or_default();
+            if pids.is_empty() {
+                break;
+            }
+            crate::platform::terminate(&pids, force);
+            if wait_until(std::time::Duration::from_secs(4), &gone) {
+                break;
+            }
+        }
+    }
+    if !gone() {
+        return Err(format!("无法退出 {}，请手动退出后重试", p.name));
+    }
+    // Let the file system settle after the client's own shutdown writes.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    Ok(true)
+}
+
+/// Write the selected identity into the client (quitting it first when it
+/// runs), after a private backup, then reopen it.
 pub fn switch_account(account: &Value, backup_dir: &Path) -> Result<Value, String> {
     let variant = account["variant"].as_str().unwrap_or("");
     let p = profile(variant)?;
-    if is_running(variant) {
-        return Err(format!(
-            "请先退出 {} 再切换，避免运行中的客户端覆盖登录态",
-            p.name
-        ));
-    }
+    // A running client would overwrite the login on exit: quit it first.
+    let restarted = quit(variant)?;
     let original = fs::read_to_string(&p.storage).map_err(|_| "无法读取客户端登录存储")?;
     let mut data: serde_json::Map<String, Value> =
         serde_json::from_str(&original).map_err(|_| "客户端 storage.json 无效")?;
@@ -293,8 +370,9 @@ pub fn switch_account(account: &Value, backup_dir: &Path) -> Result<Value, Strin
         "{variant}-{}.json",
         chrono::Utc::now().timestamp_millis()
     ));
+    let salt = p.salt()?;
     write_private(&backup, original.as_bytes())?;
-    data.insert(AUTH_KEY.into(), json!(encode(&account["user"], &p.salt)));
+    data.insert(AUTH_KEY.into(), json!(encode(&account["user"], &salt)));
     // Cached entitlement and device credentials must follow the selected identity.
     data.remove(SERVER_DATA_KEY);
     data.retain(|k, _| !k.starts_with(DEVICE_PREFIX));
@@ -302,7 +380,7 @@ pub fn switch_account(account: &Value, backup_dir: &Path) -> Result<Value, Strin
         account.get("deviceKeys").filter(|v| v.is_object()),
         account["deviceId"].as_str(),
     ) {
-        data.insert(format!("{DEVICE_PREFIX}{id}"), json!(encode(keys, &p.salt)));
+        data.insert(format!("{DEVICE_PREFIX}{id}"), json!(encode(keys, &salt)));
     }
     if let Some(cached) = account.get("cached").filter(|v| v.is_object()) {
         data.insert(SERVER_DATA_KEY.into(), json!(cached.to_string()));
@@ -317,7 +395,7 @@ pub fn switch_account(account: &Value, backup_dir: &Path) -> Result<Value, Strin
     write_private(&tmp, &text)?;
     fs::rename(&tmp, &p.storage).map_err(|_| "无法写入客户端登录态")?;
     launch(variant)?;
-    Ok(json!({"backup": backup}))
+    Ok(json!({"backup": backup, "restarted": restarted}))
 }
 
 pub fn write_private_dir(dir: &Path) -> Result<(), String> {
@@ -363,6 +441,14 @@ mod tests {
         let src = "x;Gle=Uint8Array.from([1,2,3]),zle=new Uint8Array([4,5,6]);";
         assert_eq!(byte_array(src, "Gle").unwrap(), vec![1, 2, 3]);
         assert_eq!(byte_array(src, "zle").unwrap(), vec![4, 5, 6]);
+    }
+    #[test]
+    fn salt_pair_is_found_from_the_aes_branch_whatever_the_names() {
+        let src = "Kle=new Uint8Array([9,9]),Jle=new Uint8Array([1,1]),Yle=Uint8Array.from([1,2]),Xle=Uint8Array.from([3,4]);function h(t,e){const i=new Uint8Array(t);if(e===Qs.AES_PRIVATE)for(let r=0;r<t;r++)i[r]=Kle[r]^Jle[r];else if(e===Qs.AES)for(let r=0;r<t;r++)i[r]=Yle[r]^Xle[r];return i}";
+        assert_eq!(aes_xor_names(src), Some(("Yle".into(), "Xle".into())));
+        assert_eq!(salt_from_source(src).unwrap(), vec![1 ^ 3, 2 ^ 4]);
+        // Old builds without the expression still use the historical names.
+        assert_eq!(salt_from_source("Gle=Uint8Array.from([5]),zle=Uint8Array.from([6])").unwrap(), vec![5 ^ 6]);
         assert!(byte_array(src, "Missing").is_err());
     }
 }
