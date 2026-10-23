@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, onMounted } from 'vue'
+import { computed, ref } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
 import { IconDownload, IconUpload, IconFolder, IconFile } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
@@ -8,7 +8,6 @@ import ProviderMark from '../components/ProviderMark.vue'
 import { t, lang, systemLang, systemZone, zoneLabel, zoneOptions, defaultZone, zone, followSystemZone, fmtDateTime, langSetting, tzSetting } from '../i18n'
 import { state, act, busy, saveSettings, refreshPool, themeSetting, page } from '../store'
 
-onMounted(refreshPool)
 const zones = computed(() => zoneOptions())
 
 function setLang(v: string) {
@@ -162,7 +161,7 @@ function summaryText(s: any, p: Provider) {
     <div class="field-row" style="border-bottom: none">
       <div>
         <b>{{ t('记录运行日志', 'Record runtime log') }}</b>
-        <small>{{ t('开启后显示「运行日志」菜单，记录网关请求、WorkBuddy 设备 SDK / Agent 调用、签到与备份；关闭后不产生开销。', 'Shows the Runtime Log menu and records gateway requests, WorkBuddy device SDK / Agent calls, check-ins and backups. No overhead when off.') }}</small>
+        <small>{{ t('开启后显示「运行日志」菜单，记录网关请求、WorkBuddy 设备 SDK / Agent 调用、Trae 运行事件、签到与备份；关闭后不产生开销。', 'Shows the Runtime Log menu and records gateway requests, WorkBuddy device SDK / Agent calls, Trae activity, check-ins and backups. No overhead when off.') }}</small>
       </div>
       <div class="control end">
         <a-button v-if="state.app?.settings.logging" size="small" @click="page = 'logs'"><template #icon><IconFile /></template>{{ t('查看日志', 'Open log') }}</a-button>
@@ -239,11 +238,4 @@ function summaryText(s: any, p: Provider) {
 
   </section>
 
-  <section class="box">
-    <div class="box-head"><h2>{{ t('运行事件（Trae）', 'Activity (Trae)') }}</h2></div>
-    <div v-for="e in (state.pool?.trae?.events ?? []).slice(0, 30)" :key="e.id" class="kv">
-      <span>{{ fmtDateTime(e.time) }} · {{ String(e.type).toUpperCase() }}</span><b>{{ e.message }}</b>
-    </div>
-    <a-empty v-if="!(state.pool?.trae?.events ?? []).length" :description="t('暂无事件', 'No events')" />
-  </section>
 </template>

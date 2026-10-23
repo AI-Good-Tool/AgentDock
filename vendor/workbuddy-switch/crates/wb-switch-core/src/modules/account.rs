@@ -60,13 +60,12 @@ fn find_account_in(accounts: &[Value], account_id: &str) -> Option<Value> {
 }
 
 fn delete_account_from_path(path: &Path, account_id: &str) -> Result<(), String> {
-    let mut accounts = load_accounts_from_path(path);
-    let before = accounts.len();
-    accounts.retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
-    if accounts.len() == before {
-        return Err("账号不存在".to_string());
-    }
-    save_accounts_to_path(path, &accounts).map_err(|error| error.to_string())
+    mutate_accounts_at(path, |accounts| {
+        let before = accounts.len();
+        accounts.retain(|account| account.get("id").and_then(Value::as_str) != Some(account_id));
+        if accounts.len() == before { return Err(std::io::Error::other("账号不存在")); }
+        Ok(())
+    }).map_err(|error| error.to_string())
 }
 
 /// 读取账号库；文件缺失或损坏返回空列表。
@@ -97,13 +96,30 @@ pub fn find_account(account_id: &str) -> Option<Value> {
 /// 从 profile_raw 读取官方手机号（仅接受非空字符串）。
 ///
 /// 手机号不落库、每次实时读取，避免与官方数据产生第二份副本。
-fn profile_phone_number(acc: &Value) -> Option<String> {
-    acc.get("profile_raw")
-        .and_then(|p| p.get("phoneNumber"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+pub fn profile_phone_number(acc: &Value) -> Option<String> {
+    // Prefer an available full number; old OAuth profiles may only contain a mask.
+    let candidates = [acc.pointer("/profile_raw/phoneNumber"), acc.get("phoneNumber"),
+        acc.pointer("/auth_raw/account/phoneNumber"), acc.pointer("/auth_raw/phoneNumber")];
+    let values: Vec<&str> = candidates.into_iter().flatten().filter_map(Value::as_str)
+        .map(str::trim).filter(|s| !s.is_empty()).collect();
+    values.iter().find(|s| !s.contains('*') && !s.contains('•')).map(|s| (*s).to_owned())
+        .or_else(|| token_phone_number(acc))
+        .or_else(|| values.first().map(|s| (*s).to_owned()))
+}
+
+// Display hint only, never used to authenticate or route. The official access token
+// may include an unmasked preferred_username even when the profile uses a mask.
+fn token_phone_number(acc: &Value) -> Option<String> {
+    use base64::Engine;
+    let token = acc.get("access_token")?.as_str()?;
+    let mut pieces = token.split('.'); pieces.next()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(pieces.next()?).ok()?;
+    let claims: Value = serde_json::from_slice(&bytes).ok()?;
+    if claims.get("sub")?.as_str()? != acc.get("uid")?.as_str()? { return None; }
+    let username = claims.get("preferred_username")?.as_str()?;
+    let national = username.strip_prefix("+86").or_else(|| username.strip_prefix("86")).unwrap_or(username);
+    (national.len() == 11 && national.starts_with('1') && national.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| username.to_owned())
 }
 
 /// 账号展示名：按本地 `displayField` 选择（note / phone / nickname），
@@ -213,7 +229,9 @@ fn identity_email(account: &Value) -> Option<String> {
 pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value) -> Value {
     let collected_uid = get_str(&collected, "uid");
     let collected_email = identity_email(&collected);
+    let explicit_variant = get_str(&collected, "variant").is_some() || get_str(&collected, "domain").is_some();
     let matches_identity = |existing: &Value| {
+        if explicit_variant && variant_of(existing) != variant_of(&collected) { return false; }
         if let Some(uid) = collected_uid.as_deref() {
             return get_str(existing, "uid").as_deref() == Some(uid);
         }
@@ -297,17 +315,33 @@ pub fn upsert_collected_account(accounts: &mut Vec<Value>, mut collected: Value)
 
 /// 使用统一身份规则保存采集到的账号。
 pub fn save_collected_account(collected: Value) -> std::io::Result<Value> {
-    let mut accounts = load_accounts();
-    let saved = upsert_collected_account(&mut accounts, collected);
-    save_accounts(&accounts)?;
-    Ok(saved)
+    mutate_accounts_at(&accounts_file(), |accounts| Ok(upsert_collected_account(accounts, collected)))
 }
 
 /// 按 id 覆盖；id 缺失或未命中时按 uid 回退覆盖，仍未命中则补 id 追加。
 pub fn upsert_account(updated: &Value) -> std::io::Result<()> {
-    let mut accounts = load_accounts();
-    upsert_account_in(&mut accounts, updated);
-    save_accounts(&accounts)
+    mutate_accounts_at(&accounts_file(), |accounts| { upsert_account_in(accounts, updated); Ok(()) })
+}
+
+/// Serialize read/modify/write across AgentDock processes; never hold this lock over HTTP.
+pub fn lock_accounts_at(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
+        .open(path.with_extension("json.lock"))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+pub fn mutate_accounts_at<T>(path: &Path, edit: impl FnOnce(&mut Vec<Value>) -> std::io::Result<T>) -> std::io::Result<T> {
+    let _lock = lock_accounts_at(path)?;
+    let mut accounts: Vec<Value> = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text).map_err(std::io::Error::other)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(e) => return Err(e),
+    };
+    let result = edit(&mut accounts)?;
+    save_accounts_to_path(path, &accounts)?;
+    Ok(result)
 }
 
 /// 备注长度上限（字符数），与前端输入框 maxLength 保持一致。
@@ -318,10 +352,14 @@ const NOTE_MAX_CHARS: usize = 24;
 /// 只触碰本地展示字段，不修改 uid / token / profile_raw 等官方数据。
 /// 先整体校验再写入，避免部分更新。返回更新后的 `account_meta`。
 pub fn update_account_display(account_id: &str, patch: &Value) -> Result<Value, String> {
-    let mut accounts = load_accounts();
-    let updated = update_account_display_in(&mut accounts, account_id, patch)?;
-    save_accounts(&accounts).map_err(|error| error.to_string())?;
-    Ok(account_meta(&updated))
+    update_account_display_at(&accounts_file(), account_id, patch)
+}
+
+fn update_account_display_at(path: &Path, account_id: &str, patch: &Value) -> Result<Value, String> {
+    mutate_accounts_at(path, |accounts| {
+        let updated = update_account_display_in(accounts, account_id, patch).map_err(std::io::Error::other)?;
+        Ok(account_meta(&updated))
+    }).map_err(|error| error.to_string())
 }
 
 /// 更新账号展示字段的内存实现（不落盘，便于单测）。
@@ -499,9 +537,44 @@ pub fn import_local(variant: WbVariant) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn display_edit_waits_for_credential_writer_and_reloads_latest_tokens() {
+        let dir = std::env::temp_dir().join(format!("wb-display-race-{}",uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap(); let path = dir.join("accounts.json");
+        save_accounts_to_path(&path,&[json!({"id":"a","uid":"u","access_token":"old"})]).unwrap();
+        let guard = lock_accounts_at(&path).unwrap();
+        let (started_tx,started_rx) = std::sync::mpsc::channel();
+        let (done_tx,done_rx) = std::sync::mpsc::channel();
+        let target = path.clone();
+        let task = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = update_account_display_at(&target,"a",&json!({"note":"edited"}));
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(std::time::Duration::from_millis(30)).is_err());
+        save_accounts_to_path(&path,&[json!({"id":"a","uid":"u","access_token":"fresh"})]).unwrap();
+        drop(guard);
+        done_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap(); task.join().unwrap();
+        let rows = load_accounts_from_path(&path);
+        assert_eq!(rows[0]["access_token"],"fresh"); assert_eq!(rows[0]["note"],"edited");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use serde_json::json;
 
     /// 回归 issue #94：信封凭据要能被识别并给出可读错误，明文/缺字段不误报。
+    #[test]
+    fn phone_projection_reads_matching_token_claim_without_exposing_token() {
+        use base64::Engine;
+        let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"u1","preferred_username":"13800138000"}"#);
+        let mut raw = json!({"uid":"u1","access_token":format!("header.{claims}.signature"),"profile_raw":{"phoneNumber":"138****8000"}});
+        assert_eq!(account_meta(&raw)["phoneNumber"], "13800138000");
+        raw["uid"] = json!("other");
+        assert_eq!(account_meta(&raw)["phoneNumber"], "138****8000");
+        raw["profile_raw"]["phoneNumber"] = json!("13900139000");
+        assert_eq!(account_meta(&raw)["phoneNumber"], "13900139000");
+    }
+
     #[test]
     fn envelope_token_error_only_fires_on_envelope_access_token() {
         let envelope = json!({

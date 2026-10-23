@@ -137,6 +137,7 @@ export interface RuntimeSettings {
   accountRefreshMinutes: number
   allowAuxiliaryAgents: boolean
   useDeviceSdk: boolean
+  tokenAutoRenew: boolean
 }
 export interface ClientState {
   available: boolean
@@ -158,6 +159,7 @@ export interface CreditResource {
 }
 export interface CreditExpiry {
   ok: boolean
+  authFailed?: boolean
   totalCapacity?: number
   totalRemaining?: number
   expiringSoonRemaining?: number

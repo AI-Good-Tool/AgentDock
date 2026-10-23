@@ -11,11 +11,12 @@ const draft = ref<RuntimeSettings>({
   accountRefreshMinutes: 30,
   allowAuxiliaryAgents: true,
   useDeviceSdk: false,
+  tokenAutoRenew: true,
 })
 watch(
   () => JSON.stringify(props.snapshot.settings),
   (v) => {
-    if (v) draft.value = { useDeviceSdk: false, ...JSON.parse(v) }
+    if (v) draft.value = { tokenAutoRenew: true, useDeviceSdk: false, ...JSON.parse(v) }
   },
   { immediate: true }
 )
@@ -41,7 +42,7 @@ function save() {
           : t('设备 SDK 开启：启动反代时预热设备令牌，可能触发 macOS 钥匙串密码授权；不保存系统密码，失败不自动降级。', 'Device SDK on: the device token is prepared when the gateway starts and may trigger a macOS Keychain prompt; no system password is stored and failures never downgrade silently.')
         : t('设备 SDK 关闭：不获取设备令牌，上游可能拒绝。', 'Device SDK off: no device token is sent; the upstream may reject requests.'),
       settings.accountRefreshEnabled
-        ? t(`定时刷新开启：每 ${settings.accountRefreshMinutes} 分钟向官方查询所有启用账号的积分与积分包，首次在一个完整间隔后执行；使用现有凭据，不刷新登录令牌，可能遇到限流。`, `Scheduled refresh on: every ${settings.accountRefreshMinutes} minutes, credits and packs of enabled accounts are queried (first run after one full interval), with existing credentials and no token refresh; rate limits may apply.`)
+        ? t(`定时刷新开启：每 ${settings.accountRefreshMinutes} 分钟向官方查询所有启用账号的积分与积分包，首次在一个完整间隔后执行；Token 按自动续期设置独立处理，可能遇到限流。`, `Scheduled refresh on: every ${settings.accountRefreshMinutes} minutes, credits and packs of enabled accounts are queried (first run after one full interval), with token renewal controlled independently; rate limits may apply.`)
         : t('定时刷新保持关闭。', 'Scheduled refresh stays off.'),
     ].join(' '),
     okText: t('确认并保存', 'Confirm and save'),
@@ -53,12 +54,19 @@ function save() {
   <section class="panel runtime-settings">
     <div class="panel-heading">
       <div>
-        <h2>{{ t('账号定时刷新', 'Scheduled account refresh') }}</h2>
-        <p>{{ t('积分、积分包到期时间与本机账号状态，按同一计划更新。', 'Credits, pack expiry and local account status refresh on one schedule.') }}</p>
+        <h2>{{ t('账号维护与续期', 'Account maintenance and renewal') }}</h2>
+        <p>{{ t('Token 自动续期与积分定时刷新分别设置。', 'Configure token renewal and credit refresh independently.') }}</p>
       </div>
       <a-tag :color="snapshot.settings?.accountRefreshEnabled ? 'green' : 'gray'">{{
-        snapshot.settings?.accountRefreshEnabled ? t('计划已开启', 'Scheduled') : t('默认关闭', 'Off by default')
+        snapshot.settings?.accountRefreshEnabled ? t('积分刷新已开启', 'Credit refresh on') : t('积分刷新已关闭', 'Credit refresh off')
       }}</a-tag>
+    </div>
+    <div class="runtime-row">
+      <div>
+        <strong>{{ t('Token 自动续期', 'Automatic token renewal') }}</strong>
+        <p>{{ t('默认开启。应用运行时每 5 分钟检查，临近到期或距上次续期满 24 小时时续期；请求遇到 401 时尝试续期一次。已失效的刷新凭据仍需重新登录。', 'On by default. Checks every 5 minutes while running, renews near expiry or after 24 hours, and tries once after HTTP 401. Invalid refresh credentials require login.') }}</p>
+      </div>
+      <a-switch v-model="draft.tokenAutoRenew" :aria-label="t('Token 自动续期', 'Automatic token renewal')" />
     </div>
     <div class="runtime-row">
       <div>

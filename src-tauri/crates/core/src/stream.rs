@@ -26,6 +26,8 @@ pub struct StreamFailure {
     pub status: Option<u16>,
     /// Set when the upstream asked to queue: wait this long, then retry.
     pub retry_after: Option<u64>,
+    /// Credential snapshot used by this request, for rejecting stale auth failures.
+    pub credential_revision: Option<u64>,
 }
 impl StreamFailure {
     pub fn new(message: impl Into<String>) -> Self {

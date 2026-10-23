@@ -69,6 +69,7 @@ pub fn refresh_local(state: &Shared) -> Result<(), String> {
         };
         presentations.insert(a.id.clone(),json!({"uid":raw["uid"],"nickname":meta["nickname"],"email":meta["email"],
             "phoneNumber":meta["phoneNumber"],"note":meta["note"],"displayName":name.filter(|s|!s.is_empty()).unwrap_or(&a.name),
+            "expiresAt":meta["expiresAt"],
             "needsRelogin":meta["needsRelogin"],"travel":switch::travel::travel_display(source_id),
             "clients":{"workbuddy":raw["uid"].is_string()&&current["account"]["uid"]==raw["uid"],
                 "cli":cli["activeAccountId"]==source_id,"ide":ide["activeAccountId"]==source_id,"vscode":vscode["activeAccountId"]==source_id}}));
@@ -85,23 +86,32 @@ pub fn refresh_local(state: &Shared) -> Result<(), String> {
 
 pub async fn refresh_credit(state: Shared, id: String) -> Result<Value, String> {
     let (a, mut lease) = state.acquire("credits", Some(&id))?;
-    let c = pool::credentials(&a)?;
+    let _ = crate::auth::ensure(&state, &a, None).await;
+    let mut c = pool::credentials(&a)?;
     // This sanitized request object is memory-only; no refresh token is passed.
     let raw = json!({"id":a.source_id,"uid":c.uid,"nickname":a.name,"variant":a.variant,
         "domain":c.domain,"access_token":c.token,"enterpriseId":c.enterprise});
     let mut credit = switch::credits::get_credit_expiry_read_only(&raw).await;
+    if credit["authFailed"] == true && crate::auth::ensure(&state, &a, Some(&c.token)).await.unwrap_or(false) {
+        c = pool::credentials(&a)?;
+        let raw = json!({"uid":c.uid,"variant":a.variant,"domain":c.domain,"access_token":c.token,"enterpriseId":c.enterprise});
+        credit = switch::credits::get_credit_expiry_read_only(&raw).await;
+    }
     credit["accountId"] = json!(a.id);
-    lease.status = if credit["ok"] == true { 200 } else { 502 };
+    lease.status = if credit["ok"] == true { 200 } else if credit["authFailed"] == true { 401 } else { 502 };
     lease.outcome = if credit["ok"] == true {
         "completed"
+    } else if credit["authFailed"] == true {
+        "auth_failed"
     } else {
         "credit_query_failed"
     }
     .into();
     let cached = credit.clone();
-    tokio::task::spawn_blocking(move || state.cache_credit(&id, cached))
-        .await
-        .map_err(|e| e.to_string())??;
+    let revision = agentdock_core::provider::credential_revision(&c.token);
+    let applied = tokio::task::spawn_blocking(move || state.cache_credit_observed(&id, cached, revision))
+        .await.map_err(|e| e.to_string())??;
+    if !applied { return Err("登录凭据已更新，已忽略旧积分响应，请重新刷新".into()); }
     Ok(credit)
 }
 

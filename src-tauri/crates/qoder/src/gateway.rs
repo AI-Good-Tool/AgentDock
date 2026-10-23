@@ -205,12 +205,12 @@ impl Provider {
         Ok(())
     }
     pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<(), String> {
-        let mut c = self.config();
+        let mut current = self.config.lock().unwrap();
+        let mut c = current.clone();
         c.disabled_accounts.retain(|x| x != id);
         if !enabled {
             c.disabled_accounts.push(id.to_owned());
         }
-        let mut current = self.config.lock().unwrap();
         self.persist(
             "settings.json",
             &serde_json::to_vec_pretty(&c).unwrap(),
@@ -421,6 +421,7 @@ impl Provider {
             .into_iter()
             .find(|a| a.id() == account_id)
             .ok_or_else(|| SendFailure::local(503, "no_available_account", "账号已移除"))?;
+        let credential_revision = agentdock_core::provider::credential_revision(&account.token);
         let config = self.config();
         let edition = account.edition.clone();
         let mut body = input.body;
@@ -573,10 +574,13 @@ impl Provider {
                 details.local_error("upstream", &message);
             }
             let mut failure = SendFailure::local(status, "upstream_error", message);
+            failure.credential_revision = Some(credential_revision);
             failure.error = json!({"code":code});
             failure.effect = if status == 429 {
                 AccountEffect::Cooldown(retry)
-            } else if [401, 403].contains(&status) {
+            } else if agentdock_core::provider::login_rejected(status, &details.error) {
+                AccountEffect::AuthFailed
+            } else if status == 403 {
                 AccountEffect::Cooldown(60)
             } else {
                 AccountEffect::None
@@ -610,7 +614,9 @@ impl Provider {
                 let events = match parser.feed(&part) {
                     Ok(v) => v,
                     Err(e) => {
-                        yield Err(parser.failure(e));
+                        let mut failure = parser.failure(e);
+                        failure.credential_revision = Some(credential_revision);
+                        yield Err(failure);
                         return;
                     }
                 };
@@ -1043,6 +1049,7 @@ impl Parser {
             error: json!({"code": self.business_code}),
             status: self.business_status,
             retry_after: self.queue.as_ref().map(|q| q.retry_after),
+            credential_revision: None,
         }
     }
 }
@@ -1133,6 +1140,9 @@ impl Parser {
                     .as_ref()
                     .and_then(|s| s.parse::<u16>().ok())
                     .filter(|s| [401, 403, 429].contains(s));
+                if agentdock_core::provider::login_rejected(0, &v) {
+                    self.business_status = Some(401);
+                }
                 return Err(format!(
                     "Qoder 返回业务错误事件{}；{}",
                     self.business_code.as_ref().map(|c| format!("（{c}）")).unwrap_or_default(),
@@ -1358,6 +1368,12 @@ mod tests {
         let mut p = Parser::default();
         assert!(p.feed(b"data: {\"code\":429,\"error\":{\"code\":429}}\n\n").is_err());
         assert_eq!(p.failure(String::new()).status, Some(429));
+        let mut p = Parser::default();
+        assert!(p.feed(b"data: {\"error\":{\"type\":\"authentication_error\"}}\n\n").is_err());
+        assert_eq!(p.failure(String::new()).status, Some(401));
+        let mut p = Parser::default();
+        assert!(p.feed(b"data: {\"error\":{\"code\":\"model_not_allowed\"}}\n\n").is_err());
+        assert_eq!(p.failure(String::new()).status, None);
     }
     #[test]
     fn tool_only_assistant_matches_native_contract() {

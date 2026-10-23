@@ -14,6 +14,7 @@ import TraeCard from '../components/TraeCard.vue'
 import TraeDialogs from '../components/TraeDialogs.vue'
 import LoginDialog from '../components/LoginDialog.vue'
 import AccountJsonDialog from '../components/AccountJsonDialog.vue'
+import AccountBatchExportDialog from '../components/AccountBatchExportDialog.vue'
 import { call } from '../api'
 import { t } from '../i18n'
 import { state, act, busy, refreshPool, runtimeOf, revealPhones } from '../store'
@@ -54,7 +55,8 @@ const wbAccounts = computed(() =>
         ...a,
         inFlight: rt?.inFlight ?? 0,
         concurrency: rt?.concurrency ?? 4,
-        authFailed: rt?.authFailed ?? false,
+        authFailed: !!(rt?.authFailed || a.authFailed),
+        enabled: rt?.enabled ?? a.enabled,
         cooldownUntil: rt?.cooldownUntil,
       }
     })
@@ -75,6 +77,11 @@ const total = computed(
     (show('qoder') ? qoderAccounts.value.length : 0) +
     (show('trae') ? traeAccounts.value.length : 0)
 )
+const exportAccounts = computed(() => [
+  ...(show('workbuddy') ? wbAccounts.value.map((a: any) => ({ provider: 'workbuddy', id: a.id, name: accountName(a), region: a.variant === 'ai' ? 'intl' : 'cn' })) : []),
+  ...(show('qoder') ? qoderAccounts.value.map((a: any) => ({ provider: 'qoder', id: a.id, name: a.note || a.name || a.email || a.uid, region: a.edition })) : []),
+  ...(show('trae') ? traeAccounts.value.map((a: any) => ({ provider: 'trae', id: a.id, name: a.note || a.username || a.userId, region: a.variant })) : []),
+])
 
 // ── WorkBuddy ──
 function wbEnable(a: any, enabled: boolean) {
@@ -88,6 +95,9 @@ function wbCheckinEnable(a: any, enabled: boolean) {
     () => call('wb_set_account_checkin', { id: a.id, enabled }),
     enabled ? t('此账号签到已开启', 'Check-in enabled') : t('此账号签到已关闭', 'Check-in disabled')
   )
+}
+function wbRenew(a: any) {
+  return act(`wb:${a.id}`, () => call('wb_renew_token', { id: a.id }))
 }
 function wbCheckin(a: any) {
   return act(
@@ -143,11 +153,13 @@ function wbImport(source: string) {
   return act(
     'wb-import',
     async () => {
-      const n = await call('wb_import_accounts', { source })
-      await call('wb_refresh_statuses').catch(() => {})
-      return n
-    },
-    t('账号来源已导入', 'Accounts imported')
+      const result = await call<any>('wb_import_accounts', { source })
+      await refreshPool()
+      Message.success(result?.updated
+        ? t('当前登录凭据已更新，账号状态已刷新', 'Current login credentials and account status updated')
+        : t(`已导入 ${result?.count ?? result ?? 0} 个账号`, `Imported ${result?.count ?? result ?? 0} accounts`))
+      return result
+    }
   )
 }
 
@@ -271,6 +283,8 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
       )
     "
   >
+    <a-button @click="dialog = { kind: 'json-import', provider: 'auto' }">{{ t('导入 JSON', 'Import JSON') }}</a-button>
+    <a-button :disabled="!exportAccounts.length" @click="dialog = { kind: 'json-export-batch' }">{{ t('批量导出', 'Batch export') }}</a-button>
     <a-button
       :loading="busy('wb-credits') || busy('qcredit:all') || busy('trae-all')"
       @click="refreshAllCredits"
@@ -424,6 +438,8 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         @resources="dialog = { kind: 'wb-resources', id: a.id }"
         @switch="(target) => wbSwitch(a, target)"
         @json="dialog = { kind: 'json-view', provider: 'workbuddy', id: a.id, name: accountName(a) }"
+        @relogin="dialog = { kind: 'wb-oauth', variant: a.variant, accountId: a.id }"
+        @renew="wbRenew(a)"
       />
     </div>
   </template>
@@ -555,6 +571,8 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
 
   <AddAccountDialog
     v-if="dialog?.kind === 'wb-oauth'"
+    :initial-variant="dialog.variant"
+    :expected-account-id="dialog.accountId"
     @close="dialog = null"
     @added="refreshPool"
   />
@@ -594,4 +612,5 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
     :name="dialog.name"
     @close="dialog = null"
   />
+  <AccountBatchExportDialog v-if="dialog?.kind === 'json-export-batch'" :accounts="exportAccounts" @close="dialog = null" />
 </template>

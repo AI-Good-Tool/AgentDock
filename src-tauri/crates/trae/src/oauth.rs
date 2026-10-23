@@ -285,7 +285,7 @@ async fn exchange(flow: &Flow, code: &str) -> Result<(), String> {
             "userTag": "row",
         },
     });
-    flow.store.upsert(json!({
+    let saved = flow.store.upsert(json!({
         "variant": flow.variant,
         "user": user,
         "deviceId": flow.device_id,
@@ -293,5 +293,6 @@ async fn exchange(flow: &Flow, code: &str) -> Result<(), String> {
         "deviceKeys": {"publicKeyPEM": flow.public, "privateKeyPEM": flow.private},
         "capturedAt": chrono::Utc::now().to_rfc3339(),
     }))?;
+    flow.store.login_restored(&saved);
     Ok(())
 }

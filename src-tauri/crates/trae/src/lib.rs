@@ -220,6 +220,7 @@ impl Provider {
         let a = self.store.account(id)?;
         let user = api::refresh_token(&a).await?;
         let a = self.store.patch_account(id, |a| a["user"] = user.clone())?;
+        self.store.login_restored(&a);
         self.store.event(
             "token",
             &format!(
@@ -404,7 +405,12 @@ impl Provider {
         } else {
             None
         };
+        let revision = agentdock_core::provider::credential_revision(a["user"]["token"].as_str().unwrap_or(""));
         gateway::send(&a, config_id, input, details, started, host, self.cleanup.clone()).await
+            .map_err(|mut failure| {
+                failure.credential_revision = Some(revision);
+                failure
+            })
     }
     /// Retry only gateway-owned sessions whose previous cleanup was interrupted.
     pub async fn retry_remote_cleanup(&self) {

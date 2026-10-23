@@ -18,7 +18,8 @@ import {
   IconMobile,
 } from '@arco-design/web-vue/es/icon'
 import { t, fmtDate, fmtShort } from '../i18n'
-import { state } from '../store'
+import { state, runtimeOf } from '../store'
+import AccountAuthAlert from './AccountAuthAlert.vue'
 import { credits, updated } from '../lib/account-display'
 import CardProxyRow from './CardProxyRow.vue'
 const props = defineProps<{ account: any; compact?: boolean }>()
@@ -35,6 +36,9 @@ const emit = defineEmits<{
   json: []
 }>()
 const a = computed(() => props.account)
+const rt = computed(() => runtimeOf('trae', a.value.id))
+const expired = computed(() => a.value.tokenExpired || Date.parse(a.value.expiredAt) <= state.now)
+const loginInvalid = computed(() => expired.value || a.value.tokenPresent === false || rt.value?.authFailed)
 const name = computed(() => a.value.note || a.value.username || 'Trae')
 const b = computed(() => a.value.balance || {})
 const usd = computed(() => b.value.unit === 'usd')
@@ -49,7 +53,7 @@ const plan = computed(() => a.value.snapshot?.pay?.user_pay_identity_str || a.va
 const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n + c.charCodeAt(0), 0) % 3)
 </script>
 <template>
-  <article class="switch-card" :class="[{ 'compact-card': compact }, `tone-${color}`]">
+  <article class="switch-card" :class="[{ 'compact-card': compact, 'auth-invalid-card': loginInvalid }, `tone-${color}`]">
     <header class="switch-card-header">
       <div class="switch-avatar">{{ Array.from(String(name))[0]?.toUpperCase() }}</div>
       <div class="switch-identity">
@@ -58,7 +62,7 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
         <p v-if="a.mobile" class="switch-contact mono" :title="t('Trae 官方只提供脱敏手机号', 'Trae only provides a masked number')"><IconMobile /> {{ a.mobile }}</p>
         <div class="switch-badges">
           <span class="card-chip">{{ a.variant === 'cn' ? t('国内版', 'China') : t('国际版', 'Intl') }}</span>
-          <span class="card-chip" :class="a.tokenExpired ? 'bad' : 'ok'">{{ a.tokenExpired ? t('凭证过期', 'Login expired') : t('凭证有效', 'Login valid') }}</span>
+          <span :class="loginInvalid ? 'auth-invalid-chip' : 'card-chip ok'">{{ loginInvalid ? expired ? t('登录已过期', 'Login expired') : t('需重新登录', 'Sign-in required') : t('凭证有效', 'Login valid') }}</span>
           <span v-if="a.models?.length" class="card-chip">{{ a.models.length }} {{ t('个模型', 'models') }}</span>
           <a-tooltip v-if="a.variant === 'cn'" :content="a.checkedToday ? t('今日已签到', 'Checked in today') : a.autoCheckin ? t('已开启自动签到', 'Auto check-in on') : t('自动签到已关闭', 'Auto check-in off')"
             ><span class="badge-symbol" :class="{ muted: !a.checkedToday }"><IconCalendar /></span
@@ -79,12 +83,13 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
         ></a-dropdown
       >
     </header>
+    <AccountAuthAlert v-if="loginInvalid" :expired="!!expired" :disabled="!(rt?.enabled ?? a.enabled)" />
     <section class="switch-credit-section">
       <div class="switch-credit-line">
         <IconStar /><strong>{{ amount(b.remaining) }}</strong
-        ><span>{{ usd ? 'USD' : t('剩余积分', 'credits left') }}{{ b.total ? ` / ${amount(b.total)}` : '' }}</span
-        ><small :title="a.snapshot?.time"
-          ><IconClockCircle /> {{ busy ? t('刷新中 · ', 'Refreshing · ') : '' }}{{ snapshotTime ? t(`${updated(snapshotTime)} 更新`, `Updated ${updated(snapshotTime)}`) : t('尚未查询', 'Not queried') }}</small
+        ><span>{{ loginInvalid ? (usd ? t('缓存余额', 'Cached balance') : t('缓存积分', 'Cached credits')) : usd ? 'USD' : t('剩余积分', 'credits left') }}{{ b.total ? ` / ${amount(b.total)}` : '' }}</span
+        ><small :class="{ stale: loginInvalid }" :title="a.snapshot?.time"
+          ><IconClockCircle /> {{ busy ? t('刷新中 · ', 'Refreshing · ') : '' }}{{ loginInvalid ? t('旧数据 · ', 'Stale · ') : '' }}{{ snapshotTime ? t(`${updated(snapshotTime)} 更新`, `Updated ${updated(snapshotTime)}`) : t('尚未查询', 'Not queried') }}</small
         >
       </div>
       <p v-if="error" class="credit-error">{{ error }}</p>

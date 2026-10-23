@@ -11,6 +11,7 @@
     "desktop": "tauri dev",
     "desktop:build": "tauri build",
     "test:core": "cargo test --workspace --manifest-path src-tauri/Cargo.toml",
+    "test:display": "node --test src/lib/account-display.test.mjs",
     "format": "prettier --write src"
   },
   "dependencies": {

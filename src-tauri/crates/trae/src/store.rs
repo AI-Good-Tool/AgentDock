@@ -15,6 +15,8 @@ pub struct Store {
     key: [u8; 32],
     data: Mutex<Value>,
     writer: Mutex<()>,
+    events_writer: Mutex<()>,
+    pub login_sink: Mutex<Option<Arc<dyn Fn(&str, u64) + Send + Sync>>>,
 }
 
 fn default_data() -> Value {
@@ -25,6 +27,18 @@ fn default_data() -> Value {
         "checkinHistory": [],
         "settings": {}
     })
+}
+
+/// Shared by single-account writes and batch-import preflight.
+pub fn validate_user(user: &Value) -> Result<(), String> {
+    if !user["userId"].as_str().is_some_and(|s| !s.is_empty())
+        || !user["token"].as_str().is_some_and(|s| !s.is_empty())
+        || !user["account"].is_object()
+    { return Err("账号数据缺少有效 userId、token 或 account".into()); }
+    if !user["expiredAt"].as_str().is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()) {
+        return Err("账号缺少有效的 expiredAt 到期时间".into());
+    }
+    Ok(())
 }
 
 impl Store {
@@ -77,6 +91,8 @@ impl Store {
             key,
             data: Mutex::new(data),
             writer: Mutex::new(()),
+            events_writer: Mutex::new(()),
+            login_sink: Mutex::new(None),
         }))
     }
     pub fn snapshot(&self) -> Value {
@@ -159,16 +175,19 @@ impl Store {
     }
     /// Merge fields into a stored account (by id); unknown ids fail.
     pub fn patch_account(&self, id: &str, patch: impl FnOnce(&mut Value)) -> Result<Value, String> {
-        self.update(|data| {
+        let (account, changed) = self.update(|data| {
             let account = data["accounts"]
                 .as_array_mut()
                 .unwrap()
                 .iter_mut()
                 .find(|a| a["id"] == id)
                 .ok_or("账号不存在")?;
+            let token = account["user"]["token"].clone();
             patch(account);
-            Ok(account.clone())
-        })
+            Ok((account.clone(), token != account["user"]["token"]))
+        })?;
+        if changed { self.login_restored(&account); }
+        Ok(account)
     }
     pub fn remove_account(&self, id: &str) -> Result<(), String> {
         self.update(|data| {
@@ -184,46 +203,41 @@ impl Store {
     /// Insert or update by (variant, userId); keeps the existing local id and settings.
     pub fn upsert(&self, mut account: Value) -> Result<Value, String> {
         let user = &account["user"];
-        if !user["userId"].as_str().is_some_and(|s| !s.is_empty())
-            || !user["token"].as_str().is_some_and(|s| !s.is_empty())
-            || !user["account"].is_object()
-        {
-            return Err("账号数据缺少有效 userId、token 或 account".into());
-        }
-        if !user["expiredAt"]
-            .as_str()
-            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok())
-        {
-            return Err("账号缺少有效的 expiredAt 到期时间".into());
-        }
-        self.update(|data| {
+        validate_user(user)?;
+        let (account, changed) = self.update(|data| {
             let accounts = data["accounts"].as_array_mut().unwrap();
             if let Some(old) = accounts.iter_mut().find(|x| {
                 x["variant"] == account["variant"] && x["user"]["userId"] == account["user"]["userId"]
             }) {
                 let id = old["id"].clone();
+                let changed = old["user"]["token"] != account["user"]["token"];
                 for (k, v) in account.as_object().unwrap() {
                     old[k] = v.clone();
                 }
                 old["id"] = id;
-                Ok(old.clone())
+                Ok((old.clone(), changed))
             } else {
                 account["id"] = json!(uuid::Uuid::new_v4().to_string());
                 accounts.push(account.clone());
-                Ok(account)
+                Ok((account, false))
             }
-        })
+        })?;
+        if changed { self.login_restored(&account); }
+        Ok(account)
+    }
+    /// Called after storage locks are released; the hub may update the account's
+    /// proxy switch. Credential revision checks reject delayed recovery signals.
+    pub fn login_restored(&self, account: &Value) {
+        if !crate::expires_ms(account).is_some_and(|exp| exp > chrono::Utc::now().timestamp_millis()) { return; }
+        let Some(token) = account["user"]["token"].as_str().filter(|t| !t.is_empty()) else { return; };
+        let Some(id) = account["id"].as_str() else { return; };
+        let sink = self.login_sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink(id, agentdock_core::provider::credential_revision(token));
+        }
     }
     pub fn event(&self, kind: &str, message: &str) {
-        agentdock_core::applog::emit(
-            if kind == "error" {
-                agentdock_core::applog::Level::Warn
-            } else {
-                agentdock_core::applog::Level::Info
-            },
-            "trae",
-            || (format!("[{kind}] {message}"), serde_json::Value::Null),
-        );
+        let _writer = self.events_writer.lock().unwrap();
         let _ = self.update(|data| {
             let events = data["events"].as_array_mut().unwrap();
             events.insert(
@@ -233,6 +247,17 @@ impl Store {
             events.truncate(200);
             Ok(())
         });
+        agentdock_core::applog::emit(
+            if kind == "error" { agentdock_core::applog::Level::Warn } else { agentdock_core::applog::Level::Info },
+            "trae", || (format!("[{kind}] {message}"), serde_json::Value::Null),
+        );
+    }
+    /// Serialize with event publication so clearing runtime logs cannot leave
+    /// an older event in the vault to reappear on the next launch.
+    pub fn clear_events_then<T>(&self, clear_log: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _writer = self.events_writer.lock().unwrap();
+        self.update(|data| { data["events"] = json!([]); Ok(()) })?;
+        clear_log()
     }
 }
 

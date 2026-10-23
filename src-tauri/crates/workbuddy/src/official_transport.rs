@@ -513,6 +513,25 @@ upstream.listen(0,'127.0.0.1',()=>{{
     }
 }
 impl Transport {
+    pub async fn login_device_headers(&self, variant: &str) -> std::collections::HashMap<String, String> {
+        let mut slot = self.0.lock().await;
+        if slot.as_mut().is_some_and(|w| w.child.try_wait().ok().flatten().is_some()) { *slot = None; }
+        if slot.is_none() {
+            let Ok(worker) = Worker::start().await else { return Default::default(); };
+            *slot = Some(worker);
+        }
+        let worker = slot.as_ref().unwrap();
+        let result = worker.client.post(format!("{}/_auth/headers", worker.local_url.as_deref().unwrap_or("http://localhost")))
+            .header("host", "localhost").header("x-wb-bridge-key", &worker.key).send().await;
+        if let Ok(response) = result {
+            if let Ok(value) = response.json::<serde_json::Value>().await {
+                if value["region"] == variant {
+                    return serde_json::from_value(value["headers"].clone()).unwrap_or_default();
+                }
+            }
+        }
+        Default::default()
+    }
     /// Explicit startup authorization; never sends model traffic or returns the token.
     pub async fn prepare_device(&self) -> Result<(), String> {
         let mut slot = self.0.lock().await;

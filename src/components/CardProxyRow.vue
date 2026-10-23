@@ -25,7 +25,7 @@ async function clear() {
       <a-switch size="small" :model-value="rt?.enabled ?? true" :loading="state.pending.has(`enable:${key}`)" @change="(v) => toggle(!!v)"
     /></label>
     <slot />
-    <button v-if="rt?.authFailed" class="relogin-chip" :title="t('点击解除', 'Click to clear')" @click="clear">{{ t('鉴权失效', 'Auth failed') }}</button>
+    <span v-if="rt?.authFailed" class="auth-invalid-chip" :title="t('重新登录后请手动开启反代', 'Sign in again, then enable proxy manually')">{{ t('登录失效', 'Login invalid') }}</span>
     <button v-else-if="cooling" class="relogin-chip" :title="t('点击解除', 'Click to clear')" @click="clear">{{ t('冷却', 'Cooldown') }} · {{ relative(rt?.cooldownUntil, state.now) }}</button>
     <span>{{ rt?.inFlight ?? 0 }} / {{ rt?.concurrency ?? 4 }} {{ t('并发', 'active') }}</span>
   </div>

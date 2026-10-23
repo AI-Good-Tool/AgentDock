@@ -159,7 +159,7 @@ function saveQoder() {
         </div>
       </section>
       <section class="box">
-        <div class="box-head"><div><h2>WorkBuddy</h2><p>{{ t('辅助 Agent、设备 SDK 与积分定时刷新', 'Auxiliary agents, device SDK and scheduled credit refresh') }}</p></div><ProviderMark provider="workbuddy" /></div>
+        <div class="box-head"><div><h2>WorkBuddy</h2><p>{{ t('自动续期、辅助 Agent、设备 SDK 与积分定时刷新', 'Auxiliary agents, device SDK and scheduled credit refresh') }}</p></div><ProviderMark provider="workbuddy" /></div>
         <RuntimeSettings :snapshot="wbSnapshot as any" :pending="busy('wb-runtime') ? 'runtime-settings' : ''" @save="(settings, confirmed) => act('wb-runtime', () => call('wb_set_runtime_settings', { settings, confirmed }), t('运行设置已保存', 'Runtime settings saved'))" />
       </section>
       <section v-if="qoder" class="box">

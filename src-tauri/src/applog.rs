@@ -3,7 +3,7 @@
 //! wait on disk. Nothing is recorded while logging is switched off.
 use agentdock_core::applog::{Entry, Level};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -14,8 +14,13 @@ const FILE_LIMIT: u64 = 5 * 1024 * 1024;
 
 pub struct AppLog {
     ring: Mutex<VecDeque<Entry>>,
-    tx: Mutex<Option<mpsc::Sender<String>>>,
+    tx: Mutex<Option<mpsc::Sender<WriteCommand>>>,
     path: PathBuf,
+}
+
+enum WriteCommand {
+    Append(String),
+    Clear(mpsc::Sender<Result<(), String>>),
 }
 
 impl AppLog {
@@ -34,10 +39,10 @@ impl AppLog {
         agentdock_core::applog::set_enabled(enabled);
         log
     }
-    fn writer(&self) -> Option<mpsc::Sender<String>> {
+    fn writer(&self) -> Option<mpsc::Sender<WriteCommand>> {
         let mut slot = self.tx.lock().unwrap();
         if slot.is_none() {
-            let (tx, rx) = mpsc::channel::<String>();
+            let (tx, rx) = mpsc::channel();
             let path = self.path.clone();
             std::thread::Builder::new()
                 .name("agentdock-log".into())
@@ -48,16 +53,34 @@ impl AppLog {
         slot.clone()
     }
     fn push(&self, entry: Entry) {
+        // Order disk messages with ring mutations, including clear barriers.
+        let mut ring = self.ring.lock().unwrap();
         if let Ok(line) = serde_json::to_string(&entry) {
             if let Some(tx) = self.writer() {
-                let _ = tx.send(line);
+                let _ = tx.send(WriteCommand::Append(line));
             }
         }
-        let mut ring = self.ring.lock().unwrap();
         if ring.len() >= RING {
             ring.pop_front();
         }
         ring.push_back(entry);
+    }
+    /// Called once before provider tasks start. Persisted Trae events already
+    /// have durable storage; seed the UI without appending them to app.log again.
+    pub fn restore_trae_events(&self, events: &Value) {
+        let mut seen = HashSet::new();
+        let mut entries: Vec<_> = events.as_array().into_iter().flatten().filter_map(|event| {
+            let id = event["id"].as_str()?;
+            if !seen.insert(id) { return None; }
+            let time = chrono::DateTime::parse_from_rfc3339(event["time"].as_str()?).ok()?.timestamp_millis();
+            let kind = event["type"].as_str()?;
+            let message = event["message"].as_str()?;
+            Some(Entry::new(time, if kind == "error" { Level::Warn } else { Level::Info }, "trae", format!("[{kind}] {message}"), Value::Null))
+        }).collect();
+        entries.sort_by_key(|e| e.time);
+        let mut ring = self.ring.lock().unwrap();
+        ring.extend(entries);
+        while ring.len() > RING { ring.pop_front(); }
     }
     /// Newest first, filtered by minimum level, source prefix and text.
     pub fn query(&self, filter: &Value) -> Value {
@@ -94,17 +117,18 @@ impl AppLog {
             "file": self.path,
         })
     }
-    pub fn clear(&self) {
-        self.ring.lock().unwrap().clear();
-        // Truncate in place: the writer keeps its append handle open.
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&self.path) {
-            let _ = f.set_len(0);
-        }
-        let _ = std::fs::remove_file(self.path.with_extension("log.1"));
+    pub fn clear(&self) -> Result<(), String> {
+        let mut ring = self.ring.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        self.writer().ok_or("无法启动日志写入线程")?
+            .send(WriteCommand::Clear(tx)).map_err(|_| "无法清空日志文件")?;
+        rx.recv().map_err(|_| "清空日志任务失败")??;
+        ring.clear();
+        Ok(())
     }
 }
 
-fn write_loop(path: &Path, rx: mpsc::Receiver<String>) {
+fn write_loop(path: &Path, rx: mpsc::Receiver<WriteCommand>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -120,19 +144,30 @@ fn write_loop(path: &Path, rx: mpsc::Receiver<String>) {
     };
     let mut file = open();
     let mut size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    while let Ok(first) = rx.recv() {
-        // Drain whatever queued up meanwhile into one write.
-        let mut batch = first;
+    while let Ok(command) = rx.recv() {
+        let mut batch = match command {
+            WriteCommand::Append(line) => line,
+            WriteCommand::Clear(done) => {
+                drop(file.take());
+                let result = (|| {
+                    std::fs::OpenOptions::new().write(true).open(path)
+                        .and_then(|f| f.set_len(0)).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })?;
+                    std::fs::remove_file(path.with_extension("log.1"))
+                        .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+                })().map_err(|_| "无法清空日志文件".to_owned());
+                file = open();
+                size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                let _ = done.send(result);
+                continue;
+            }
+        };
         batch.push('\n');
-        while let Ok(more) = rx.try_recv() {
-            batch.push_str(&more);
-            batch.push('\n');
-        }
         if size + batch.len() as u64 > FILE_LIMIT {
             // The file may have been truncated by `clear` since the last write.
             size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         }
         if size + batch.len() as u64 > FILE_LIMIT {
+            drop(file.take()); // Windows cannot rename an open append handle.
             let _ = std::fs::rename(path, path.with_extension("log.1"));
             file = open();
             size = 0;
@@ -174,8 +209,36 @@ mod tests {
         assert_eq!(warn["entries"].as_array().unwrap().len(), 1);
         let text = log.query(&json!({"query": "GLM", "limit": 3}));
         assert_eq!(text["entries"].as_array().unwrap().len(), 3);
-        log.clear();
+        log.clear().unwrap();
         assert_eq!(log.query(&json!({}))["total"], 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn restored_events_are_deduplicated_sorted_and_do_not_rewrite_disk() {
+        let dir = std::env::temp_dir().join(format!("agentdock-log-history-{}", uuid::Uuid::new_v4()));
+        let log = AppLog::new(&dir);
+        let one = json!({"id":"a","time":"2026-10-20T01:00:00Z","type":"refresh","message":"older"});
+        let two = json!({"id":"b","time":"2026-10-20T02:00:00Z","type":"error","message":"newer"});
+        log.restore_trae_events(&json!([two, one, two, {"id":"bad","time":"invalid"}]));
+        let result = log.query(&json!({}));
+        assert_eq!(result["total"], 2);
+        assert_eq!(result["entries"][0]["message"], "[error] newer");
+        assert_ne!(result["entries"][0]["seq"], result["entries"][1]["seq"]);
+        assert!(!log.path.exists());
+    }
+    #[test]
+    fn clearing_queued_writes_cannot_resurrect_pre_clear_disk_records() {
+        let dir = std::env::temp_dir().join(format!("agentdock-log-clear-{}", uuid::Uuid::new_v4()));
+        let log = AppLog::new(&dir);
+        for i in 0..100 { log.push(entry(Level::Info, "trae", &format!("old-{i}"))); }
+        log.clear().unwrap();
+        assert!(std::fs::read(&log.path).unwrap().is_empty());
+        assert_eq!(log.query(&json!({}))["total"], 0);
+        log.push(entry(Level::Info, "trae", "after-clear"));
+        assert_eq!(log.query(&json!({}))["entries"][0]["message"], "after-clear");
+        log.clear().unwrap();
+        assert!(std::fs::read(&log.path).unwrap().is_empty());
+        drop(log);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

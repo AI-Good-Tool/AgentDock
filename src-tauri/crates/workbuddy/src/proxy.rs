@@ -14,7 +14,12 @@ pub fn official_request(
 }
 
 pub async fn sync_models(state: Shared, id: Option<String>) -> Result<usize, String> {
+    if let Some(id) = &id {
+        let account = state.store.lock().unwrap().accounts.iter().find(|a| &a.id == id).cloned();
+        if let Some(account) = account { let _ = crate::auth::ensure(&state, &account, None).await; }
+    }
     let (account, mut lease) = state.acquire("catalog", id.as_deref())?;
+    let _ = crate::auth::ensure(&state, &account, None).await;
     let cred = pool::credentials(&account)?;
     let req = official_request(&state, &account, &cred, "/v3/config")
         .build()
@@ -193,6 +198,8 @@ async fn checkin_inner(
     submit: bool,
     automatic: bool,
 ) -> Result<Value, String> {
+    let account = state.store.lock().unwrap().accounts.iter().find(|a| a.id == id).cloned();
+    if let Some(account) = account { let _ = crate::auth::ensure(&state, &account, None).await; }
     let (a, mut lease) = state.acquire("checkin", Some(&id))?;
     if submit && !a.checkin_enabled {
         return Err("此账号签到开关已关闭；可单独查询状态".into());

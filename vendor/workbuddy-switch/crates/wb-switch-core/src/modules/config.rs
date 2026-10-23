@@ -1045,12 +1045,15 @@ pub async fn http_request_with_proxy(
             if status.is_success() {
                 serde_json::from_str(&text).unwrap_or(Value::Null)
             } else {
-                serde_json::from_str(&text).unwrap_or_else(|_| {
+                let mut error: Value = serde_json::from_str(&text).unwrap_or_else(|_| {
                     json!({
                         "code": status.as_u16(),
                         "message": normalize_error_body(&text),
                     })
-                })
+                });
+                if !error.is_object() { error = json!({"code": status.as_u16(), "message": normalize_error_body(&text)}); }
+                error["httpStatus"] = json!(status.as_u16());
+                error
             }
         }
         Err(e) => json!({"code": -1, "message": e.to_string()}),

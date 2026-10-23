@@ -15,7 +15,7 @@ import { IconMobile,
   IconArrowRight,
 } from '@arco-design/web-vue/es/icon'
 import type { Account, Snapshot } from '../../wb-api'
-import { phoneText,
+import { hasFullPhone, phoneText,
   accountName,
   credits,
   resourceRows,
@@ -25,6 +25,7 @@ import { phoneText,
   updated,
 } from '../../lib/account-display'
 import { t } from '../../i18n'
+import AccountAuthAlert from '../AccountAuthAlert.vue'
 const props = defineProps<{
   account: Account
   clients: Snapshot['clients']
@@ -38,12 +39,16 @@ const emit = defineEmits<{
   checkinEnable: [boolean]
   checkin: []
   refresh: []
+  renew: []
   info: []
   resources: []
   switch: [string]
   json: []
+  relogin: []
 }>()
-const name = computed(() => accountName(props.account))
+const name = computed(() => accountName(props.account, revealPhones.value))
+const expired = computed(() => !!props.account.expiresAt && props.account.expiresAt <= props.now)
+const loginInvalid = computed(() => expired.value || props.account.authFailed || props.account.credit?.authFailed || props.account.presentation?.needsRelogin)
 const rows = computed(() => resourceRows(props.account.credit?.resources, props.now))
 const limits = computed(() =>
   (props.account.modelLimits ?? [])
@@ -81,14 +86,14 @@ const targets = computed(() => [
 <template>
   <article
     class="switch-card"
-    :class="[{ 'current-card': active.workbuddy, 'compact-card': compact }, `tone-${color}`]"
+    :class="[{ 'current-card': active.workbuddy, 'compact-card': compact, 'auth-invalid-card': loginInvalid }, `tone-${color}`]"
   >
     <header class="switch-card-header">
       <div class="switch-avatar">{{ name.slice(0, 1) }}</div>
       <div class="switch-identity">
         <h3 :title="name">{{ name }}</h3>
         <p :title="uid">UID · {{ uid }}</p>
-        <p v-if="account.presentation?.phoneNumber" class="switch-contact mono"><IconMobile /> {{ phoneText(account.presentation.phoneNumber, revealPhones) }}</p>
+        <p v-if="account.presentation?.phoneNumber" class="switch-contact mono"><IconMobile /> {{ phoneText(account.presentation.phoneNumber, revealPhones) }} <span v-if="revealPhones && !hasFullPhone(account.presentation.phoneNumber)" :title="t('可重新授权或导入当前登录账号以更新手机号', 'Sign in again or import the current login to update the phone')">{{ t('（官方已脱敏）', '(masked by source)') }}</span></p>
         <div class="switch-badges">
           <a-tooltip
             :content="
@@ -124,14 +129,13 @@ const targets = computed(() => [
             :content="t(`${credits(account.credit?.expiringSoonRemaining)} 积分将在 7 天内到期`, `${credits(account.credit?.expiringSoonRemaining)} credits expire within 7 days`)"
             ><span class="limit-chip"><IconStar /></span
           ></a-tooltip>
-          <span
-            v-if="
-              account.authFailed ||
-              account.presentation?.needsRelogin ||
-              (account.expiresAt && account.expiresAt < now)
-            "
-            class="relogin-chip"
-            >{{ t('需登录', 'Re-login') }}</span
+          <button
+            v-if="loginInvalid"
+            class="auth-invalid-chip"
+            type="button"
+            :aria-label="t('重新登录 WorkBuddy 账号', 'Sign in to WorkBuddy again')"
+            @click="emit('relogin')"
+            >{{ expired ? t('登录已过期，重新登录', 'Expired · sign in') : t('需重新登录', 'Sign-in required') }}</button
           >
         </div>
       </div>
@@ -150,6 +154,7 @@ const targets = computed(() => [
         active.cli ? '>_' : 'W'
       }}</span>
     </header>
+    <AccountAuthAlert v-if="loginInvalid" :expired="expired" :disabled="!account.enabled" />
     <section class="switch-credit-section">
       <div class="switch-credit-line">
         <IconStar /><strong>{{
@@ -159,10 +164,10 @@ const targets = computed(() => [
               ? t('查询中', 'Loading')
               : '—'
         }}</strong
-        ><span>{{ account.credit?.ok ? t(`${rows.length} 个积分包`, `${rows.length} packs`) : t('尚未查询', 'Not queried') }}</span
-        ><small :class="{ stale: account.credit?.stale }" :title="account.credit?.error"
+        ><span>{{ account.credit?.ok ? (loginInvalid ? t('缓存积分 · ', 'Cached credits · ') : '') + t(`${rows.length} 个积分包`, `${rows.length} packs`) : t('尚未查询', 'Not queried') }}</span
+        ><small :class="{ stale: account.credit?.stale || loginInvalid }" :title="account.credit?.error"
           ><IconClockCircle /> {{ creditLoading ? t('刷新中 · ', 'Refreshing · ') : ''
-          }}{{ account.credit?.stale ? t('旧数据 · ', 'Stale · ') : ''
+          }}{{ account.credit?.stale || loginInvalid ? t('旧数据 · ', 'Stale · ') : ''
           }}{{ t(`${updated(account.credit?.updatedAt)} 更新`, `Updated ${updated(account.credit?.updatedAt)}`) }}</small
         >
       </div>
@@ -214,6 +219,9 @@ const targets = computed(() => [
     </section>
     <footer class="switch-card-footer">
       <div class="client-buttons">
+        <button :disabled="busy" :title="t('手动续期登录 Token', 'Renew the login token now')" @click="emit('renew')">
+          <IconRefresh :spin="busy" /> {{ t('续期', 'Renew') }}
+        </button>
         <button
           v-for="target in targets"
           :key="target.id"

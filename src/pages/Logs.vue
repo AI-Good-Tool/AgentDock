@@ -32,7 +32,7 @@ const sourceNames: Record<string, [string, string]> = {
   'checkin.workbuddy': ['签到 · WorkBuddy', 'Check-in · WorkBuddy'],
   'checkin.qoder': ['领取 · Qoder', 'Claim · Qoder'],
   'checkin.trae': ['签到 · Trae', 'Check-in · Trae'],
-  trae: ['Trae', 'Trae'],
+  trae: ['Trae 运行事件', 'Trae activity'],
   backup: ['备份', 'Backup'],
 }
 const sourceLabel = (s: string) => (sourceNames[s] ? t(...sourceNames[s]) : s)
@@ -100,7 +100,7 @@ const time = (ms: number) => fmtDateTime(ms)
   <PageHead
     eyebrow="RUNTIME LOG"
     :title="t('运行日志', 'Runtime log')"
-    :desc="t('网关请求、各平台调用、WorkBuddy 设备 SDK 与 Agent 调用、签到与备份。关闭后不记录，不占用资源。', 'Gateway requests, provider calls, WorkBuddy device SDK and Agent calls, check-ins and backups. Nothing is recorded while off.')"
+    :desc="t('网关请求、各平台调用、WorkBuddy 设备 SDK 与 Agent 调用、Trae 刷新与签到等运行事件、备份。可按来源筛选；关闭后不记录。', 'Gateway requests, provider calls, WorkBuddy device SDK and Agent calls, Trae refresh and check-in activity, and backups. Filter by source; nothing is recorded while off.')"
   >
     <div class="log-switch">
       <span>{{ t('记录日志', 'Record') }}</span>

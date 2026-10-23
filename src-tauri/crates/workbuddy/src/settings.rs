@@ -10,6 +10,7 @@ pub struct Settings {
     pub account_refresh_minutes: u32,
     pub allow_auxiliary_agents: bool,
     pub use_device_sdk: bool,
+    pub token_auto_renew: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -18,6 +19,7 @@ impl Default for Settings {
             account_refresh_minutes: 30,
             allow_auxiliary_agents: true,
             use_device_sdk: false,
+            token_auto_renew: true,
         }
     }
 }
@@ -40,7 +42,7 @@ pub struct RefreshStatus {
     pub failed: usize,
 }
 
-/// A single gate covers manual and scheduled batches. Never refreshes login tokens.
+/// A single gate covers manual and scheduled batches. Token renewal is independently gated per account.
 pub async fn refresh_accounts(state: Shared, ids: Vec<String>) -> Result<Value, String> {
     refresh_batch(state, ids, false).await
 }

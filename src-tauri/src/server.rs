@@ -531,6 +531,38 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
         },
         None => settings.pinned.get(&ep.scope.key()).filter(|s| !s.is_empty()).cloned(),
     };
+    if targets.iter().any(|t| t.provider() == ProviderKind::Workbuddy) {
+        hub.wb.refresh_login_metadata();
+        // Only expired candidates need renewal before scheduling. The chosen upstream
+        // renews near-expiry tokens itself; unrelated healthy accounts do not add latency.
+        let expired: HashSet<_> = hub.wb.pool_accounts().into_iter()
+            .filter(|a| a.enabled && a.expires_at.is_some_and(|at| at <= chrono::Utc::now().timestamp_millis()))
+            .map(|a| a.id).collect();
+        let candidates: Vec<_> = hub.wb.store.lock().unwrap().accounts.iter().filter(|a| expired.contains(&a.id)).cloned().collect();
+        for a in candidates {
+            let key = agentdock_core::provider::account_key(ProviderKind::Workbuddy, &a.id);
+            if settings.scope(ProviderKind::Workbuddy).enabled
+                && settings.scope(ProviderKind::Workbuddy).regions.contains(&workbuddy::pool::unified_region(&a.variant).to_owned())
+                && pinned.as_ref().is_none_or(|p| p == &key)
+                && targets.iter().any(|t| t.provider() == ProviderKind::Workbuddy && t.region == workbuddy::pool::unified_region(&a.variant)) {
+                let _ = workbuddy::auth::ensure(&hub.wb, &a, None).await;
+            }
+        }
+        hub.wb.refresh_login_metadata();
+    }
+    let accounts = hub.pool_accounts();
+    let now = chrono::Utc::now().timestamp_millis();
+    // Only inspect accounts in this request's participating route/scope.
+    for a in &accounts {
+        let scope = settings.scope(a.provider);
+        if a.enabled && scope.enabled && scope.regions.contains(&a.region)
+            && pinned.as_ref().is_none_or(|key| *key == a.key())
+            && targets.iter().any(|t| t.provider() == a.provider && t.region == a.region)
+            && (a.expires_at.is_some_and(|t| t <= now) || a.blocked.is_some())
+        {
+            hub.disable_expired_account(a.provider, &a.id);
+        }
+    }
     let accounts = hub.pool_accounts();
     let choose = |tried: &HashSet<String>| {
         let now = chrono::Utc::now().timestamp_millis();
@@ -650,11 +682,12 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
                         AccountEffect::Cooldown(s) => {
                             rt.cooldown.insert(lease.key.clone(), now + s as i64 * 1000);
                         }
-                        AccountEffect::AuthFailed => {
-                            rt.auth_failed.insert(lease.key.clone());
-                        }
+                        AccountEffect::AuthFailed => {}
                         AccountEffect::None => {}
                     }
+                }
+                if f.effect == AccountEffect::AuthFailed {
+                    hub.disable_account_auth_observed(pick.account.provider, &pick.account.id, f.credential_revision);
                 }
                 lease.log.upstream_code = f.error["code"]
                     .as_str()
@@ -717,7 +750,7 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
                             403 if f.retry_after.is_none() => {
                                 rt.model_cooldown.insert((lease.key.clone(), lease.log.real_model.clone()), until);
                             }
-                            401 | 429 => {
+                            429 => {
                                 rt.cooldown.insert(lease.key.clone(), until);
                             }
                             _ => {}
@@ -906,6 +939,11 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
 }
 
 fn record_stream_failure(lease: &mut Lease, f: &agentdock_core::stream::StreamFailure) {
+    if agentdock_core::provider::login_rejected(f.status.unwrap_or(0), &f.error) {
+        if let Some(provider) = ProviderKind::ALL.into_iter().find(|p| p.key() == lease.log.provider) {
+            lease.hub.disable_account_auth_observed(provider, &lease.log.account_id, f.credential_revision);
+        }
+    }
     lease.log.upstream_code = f.code.clone();
     if f.error.is_object() {
         lease.details.error_stage = Some("upstream".into());

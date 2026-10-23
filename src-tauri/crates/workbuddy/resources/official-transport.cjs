@@ -155,6 +155,15 @@ function createBridge({ key, tokens, variant, connect = https.request }) {
       } else res.destroy();
     };
     if (req.headers['x-wb-bridge-key'] !== key) { req.resume(); return fail(401, 'bridge_auth_failed'); }
+    // Private OAuth context; unavailable SDK data is omitted just as in the desktop.
+    if (req.method === 'POST' && req.url === '/_auth/headers' && req.headers.host === 'localhost') {
+      req.resume();
+      const headers = {};
+      try { headers['X-Device-Token'] = await tokens.get(); } catch { /* best effort */ }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ headers, region: variant === 'overseas' ? 'ai' : 'cn' }));
+      return;
+    }
     // Private startup preflight: no chat request or credential is sent upstream.
     if (req.method === 'POST' && req.url === '/_device/prepare' && req.headers.host === 'localhost') {
       req.resume();

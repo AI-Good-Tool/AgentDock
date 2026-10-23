@@ -1,17 +1,20 @@
 <script setup lang="ts">
 // WorkBuddy account info (display/note, limits) and all credit packs.
 import { ref, computed, watch } from 'vue'
+import { IconEye, IconEyeInvisible } from '@arco-design/web-vue/es/icon'
 import { call } from '../api'
 import { t } from '../i18n'
 import { act, busy, state } from '../store'
-import { accountName, credits, resourceRows, resourceName, expiry, remaining, maskedPhone } from '../lib/account-display'
+import { accountName, credits, resourceRows, resourceName, expiry, remaining, phoneText, hasFullPhone } from '../lib/account-display'
 const props = defineProps<{ account: any; mode: 'info' | 'resources' }>()
 const emit = defineEmits<{ close: [] }>()
 const note = ref('')
 const field = ref('nickname')
+const phoneVisible = ref(false)
 watch(
   () => props.account?.id,
   () => {
+    phoneVisible.value = false
     note.value = props.account?.note || props.account?.presentation?.note || ''
     field.value = props.account?.displayField || 'nickname'
   },
@@ -34,7 +37,14 @@ function refresh() {
         <a-descriptions-item label="UID">{{ account.presentation?.uid || account.id.split(':').slice(1).join(':') }}</a-descriptions-item>
         <a-descriptions-item :label="t('来源', 'Source')">{{ account.source === 'switch' ? 'WorkBuddy Switch' : t('本机登录态', 'Local login') }}</a-descriptions-item>
         <a-descriptions-item :label="t('地区', 'Region')">{{ account.variant === 'ai' ? t('国际版', 'International') : t('国内版', 'China') }}</a-descriptions-item>
-        <a-descriptions-item :label="t('手机号', 'Phone')">{{ maskedPhone(account.presentation?.phoneNumber) || '—' }}</a-descriptions-item>
+        <a-descriptions-item :label="t('手机号', 'Phone')">
+          <button v-if="hasFullPhone(account.presentation?.phoneNumber)" class="phone-reveal" type="button" :aria-pressed="phoneVisible" :aria-label="phoneVisible ? t('隐藏手机号', 'Hide phone number') : t('显示手机号', 'Show phone number')" @click="phoneVisible = !phoneVisible">
+            {{ phoneText(account.presentation.phoneNumber, phoneVisible) }}
+            <IconEyeInvisible v-if="phoneVisible" /><IconEye v-else />
+          </button>
+          <template v-else-if="account.presentation?.phoneNumber">{{ account.presentation.phoneNumber }} <small>{{ t('官方仅提供脱敏号码，请重新授权或导入当前登录账号', 'Only a masked number is available; sign in again or import the current login') }}</small></template>
+          <template v-else>—</template>
+        </a-descriptions-item>
         <a-descriptions-item :label="t('登录到期', 'Login expires')">{{ expiry(account.expiresAt) }}</a-descriptions-item>
         <a-descriptions-item :label="t('本账号签到', 'Check-in')">{{ account.checkinEnabled ? t('开启', 'On') : t('关闭', 'Off') }}</a-descriptions-item>
       </a-descriptions>
@@ -79,3 +89,9 @@ function refresh() {
     </template>
   </a-drawer>
 </template>
+
+<style scoped>
+.phone-reveal { display: inline-flex; align-items: center; gap: 8px; border: 0; background: transparent; color: inherit; padding: 2px 0; font: inherit; cursor: pointer; }
+.phone-reveal svg { color: var(--color-text-3); }
+.phone-reveal:focus-visible { outline: 2px solid rgb(var(--primary-6)); outline-offset: 3px; border-radius: 3px; }
+</style>

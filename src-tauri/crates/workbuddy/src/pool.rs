@@ -30,6 +30,40 @@ pub struct Account {
     pub expires_at: Option<i64>,
 }
 
+/// Switch credentials may be renewed independently of the imported account
+/// metadata. Until the read-only monitor has scanned the source, its old
+/// imported expiry must not permanently disable a freshly renewed login.
+fn login_expiry(account: &Account, presentation: Option<&Value>) -> Option<i64> {
+    if account.source == "switch" {
+        presentation.and_then(|p| p["expiresAt"].as_i64())
+    } else {
+        account.expires_at
+    }
+}
+
+fn restore_credit_auth_failures(store: &mut Store) {
+    for credit in store.resources.values_mut() {
+        // Older read-only queries kept only this normalized HTML error title.
+        // Recover that explicit 401 without treating arbitrary stale data as expiry.
+        let legacy_401 = credit["error"].as_str()
+            .and_then(|e| e.strip_prefix("服务端返回 HTML 错误页："))
+            .is_some_and(|title| title == "401" || title.starts_with("401 "));
+        if credit.get("authFailed").is_none() && (credit["stale"] == true || credit["ok"] == false) && legacy_401 {
+            credit["authFailed"] = json!(true);
+        }
+    }
+}
+
+fn apply_login_metadata(accounts: &[Account], records: &[Value], rt: &mut Runtime) {
+    for account in accounts.iter().filter(|a| a.source == "switch") {
+        let raw = records.iter().find(|r| r["id"] == account.source_id);
+        let presentation = rt.presentations.entry(account.id.clone()).or_insert_with(|| json!({}));
+        presentation["expiresAt"] = raw.and_then(|r| r.get("expiresAt")).filter(|v| v.is_i64()).cloned().unwrap_or(Value::Null);
+        presentation["needsRelogin"] = json!(raw.is_some_and(|r| r["needs_relogin"] == true));
+        if let Some(raw) = raw { presentation["phoneNumber"] = json!(wb_switch_core::modules::account::profile_phone_number(raw)); }
+    }
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestLog {
@@ -109,6 +143,7 @@ pub struct AppState {
     pub conversations: Mutex<crate::conversation::Sessions>,
     pub official_transport: crate::official_transport::Transport,
     pub refresh_gate: tokio::sync::Mutex<()>,
+    pub renewal: crate::auth::Renewal,
     pub store: Mutex<Store>,
     store_write: Mutex<()>,
     pub runtime: Mutex<Runtime>,
@@ -116,8 +151,11 @@ pub struct AppState {
     pub path: PathBuf,
     /// Receives every finished management/catalog record for the unified log.
     pub log_sink: Mutex<Option<LogSink>>,
+    /// Report confirmed authentication failure/recovery from management queries.
+    pub login_status_sink: Mutex<Option<LoginStatusSink>>,
 }
 pub type LogSink = Arc<dyn Fn(&RequestLog) + Send + Sync>;
+pub type LoginStatusSink = Arc<dyn Fn(&str, bool, Option<u64>) + Send + Sync>;
 
 fn home() -> Result<PathBuf, String> {
     dirs::home_dir().ok_or_else(|| "无法定位用户目录".into())
@@ -260,7 +298,31 @@ impl AppState {
     }
 
     pub fn cache_credit(&self, id: &str, credit: Value) -> Result<(), String> {
-        self.update_store(|store| {
+        self.cache_credit_inner(id, credit, None)
+    }
+    pub fn cache_credit_observed(&self, id: &str, credit: Value, revision: u64) -> Result<bool, String> {
+        self.cache_credit_observed_at(id, credit, revision, &switch_file()?)
+    }
+    fn cache_credit_observed_at(&self, id: &str, credit: Value, revision: u64, path: &std::path::Path) -> Result<bool, String> {
+        let account = self.store.lock().unwrap().accounts.iter().find(|a| a.id == id).cloned().ok_or("账号不存在")?;
+        // Serialize the credential check and its state update with credential writers.
+        // Hub callbacks never acquire this vault lock, so lock order stays one-way.
+        let _vault = if account.source == "switch" {
+            Some(wb_switch_core::modules::account::lock_accounts_at(path).map_err(|_| "无法锁定账号库")?)
+        } else { None };
+        let current = if account.source == "switch" {
+            read_json(&path.to_path_buf())?.as_array().and_then(|rows| rows.iter().find(|r| r["id"] == account.source_id && r["uid"].as_str() == account.id.split_once(':').map(|(_, uid)| uid))).cloned()
+                .and_then(|r| r["access_token"].as_str().map(agentdock_core::provider::credential_revision))
+        } else { credentials(&account).ok().map(|c| agentdock_core::provider::credential_revision(&c.token)) };
+        if current != Some(revision) { return Ok(false); }
+        self.cache_credit_inner(id, credit, Some(revision))?;
+        Ok(true)
+    }
+    fn cache_credit_inner(&self, id: &str, credit: Value, revision: Option<u64>) -> Result<(), String> {
+        let auth_failed = credit["authFailed"] == true;
+        let authenticated = credit["ok"] == true;
+        if auth_failed { self.runtime.lock().unwrap().auth_failed.insert(id.into(), true); }
+        let result = self.update_store(|store| {
             if credit["ok"] == true {
                 if let Some(account) = store.accounts.iter().find(|a| a.id == id).cloned() {
                     crate::statistics::observe_credit(
@@ -275,6 +337,7 @@ impl AppState {
                     let mut cached = old.clone();
                     cached["stale"] = json!(true);
                     cached["error"] = credit["error"].clone();
+                    if auth_failed { cached["authFailed"] = json!(true); }
                     cached
                 } else {
                     credit
@@ -284,7 +347,34 @@ impl AppState {
             };
             store.resources.insert(id.into(), value);
             Ok(())
-        })
+        });
+        // Run after releasing metadata locks; the hub reconciles login state.
+        if auth_failed || (authenticated && result.is_ok()) {
+            let sink = self.login_status_sink.lock().unwrap().clone();
+            if let Some(sink) = sink { sink(id, auth_failed, revision); }
+        }
+        result
+    }
+
+    /// A completed OAuth login or authenticated query repairs login state,
+    /// independently of the user's proxy switch and cached balance.
+    pub fn clear_login_failure(&self, id: &str) -> Result<(), String> {
+        self.update_store(|store| {
+            if !store.accounts.iter().any(|a| a.id == id) { return Err("账号不存在".into()); }
+            if let Some(credit) = store.resources.get_mut(id).filter(|c| c.is_object()) {
+                if credit["authFailed"] == true {
+                    credit.as_object_mut().unwrap().remove("error");
+                    credit.as_object_mut().unwrap().remove("errorAt");
+                }
+                credit["authFailed"] = json!(false);
+            }
+            Ok(())
+        })?;
+        let mut rt = self.runtime.lock().unwrap();
+        rt.auth_failed.remove(id);
+        rt.cooldown.remove(id);
+        if let Some(presentation) = rt.presentations.get_mut(id) { presentation["needsRelogin"] = json!(false); }
+        Ok(())
     }
 
     pub fn record_model_limit(
@@ -345,16 +435,18 @@ impl AppState {
         })
     }
     pub fn new(path: PathBuf) -> Result<Shared, String> {
-        let store = if path.exists() {
+        let mut store = if path.exists() {
             serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
                 .map_err(|_| "元数据文件损坏，请检查本地 store.json".to_string())?
         } else {
             Store::default()
         };
+        restore_credit_auth_failures(&mut store);
         Ok(Arc::new(Self {
             conversations: Mutex::default(),
             official_transport: Default::default(),
             refresh_gate: tokio::sync::Mutex::new(()),
+            renewal: crate::auth::Renewal::default(),
             store: Mutex::new(store),
             store_write: Mutex::new(()),
             runtime: Mutex::new(Runtime::default()),
@@ -366,6 +458,7 @@ impl AppState {
                 .map_err(|e| e.to_string())?,
             path,
             log_sink: Mutex::new(None),
+            login_status_sink: Mutex::new(None),
         }))
     }
 
@@ -401,9 +494,12 @@ impl AppState {
         source: &str,
         only_id: Option<&str>,
     ) -> Result<usize, String> {
+        self.import_source_at(source, only_id, &switch_file()?)
+    }
+    pub(crate) fn import_source_at(&self, source: &str, only_id: Option<&str>, path: &PathBuf) -> Result<usize, String> {
         let mut added = vec![];
         if source == "switch" {
-            let data = read_json(&switch_file()?)?;
+            let data = read_json(path)?;
             let list = data.as_array().ok_or("参考账号库格式不受支持")?;
             for raw in list {
                 if only_id.is_some_and(|id| raw["id"].as_str() != Some(id)) {
@@ -492,6 +588,9 @@ impl AppState {
                 .find(|a| a.id == id)
                 .ok_or("账号不存在")?;
             a.enabled = enabled;
+            if enabled {
+                if let Some(credit) = store.resources.get_mut(id) { credit["authFailed"] = json!(false); }
+            }
             Ok(())
         })?;
         // Existing leases remain valid; only future acquisitions see the switch.
@@ -554,6 +653,7 @@ impl AppState {
         let rt = self.runtime.lock().unwrap();
         json!({ "accounts": store.accounts.iter().map(|a| {
             let mut v=serde_json::to_value(a).unwrap();
+            v["expiresAt"]=json!(login_expiry(a, rt.presentations.get(&a.id)));
             v["inFlight"]=json!(rt.in_flight.get(&a.id).copied().unwrap_or(0));
             v["managementInFlight"]=json!(rt.management_in_flight.get(&a.id).copied().unwrap_or(0));
             v["cooldownUntil"]=json!(rt.cooldown.get(&a.id));
@@ -629,11 +729,11 @@ impl AppState {
                 Some("此地区模型不支持该请求")
             } else if !a.enabled && !["credits", "checkin"].contains(&model) {
                 Some("未启用反代")
-            } else if a.expires_at.is_some_and(|ts| ts < now) && model != "credits" {
+            } else if login_expiry(a, rt.presentations.get(&a.id)).is_some_and(|ts| ts <= now) && model != "credits" {
                 Some("登录已过期")
             } else if rt.cooldown.get(&a.id).is_some_and(|ts| *ts > now) {
                 Some("账号冷却中")
-            } else if rt.auth_failed.get(&a.id).copied().unwrap_or(false) {
+            } else if model != "credits" && rt.auth_failed.get(&a.id).copied().unwrap_or(false) {
                 Some("鉴权已失败")
             } else if if management {
                 rt.management_in_flight.get(&a.id).copied().unwrap_or(0) >= 1
@@ -713,6 +813,16 @@ pub fn variant_of_region(region: &str) -> &'static str {
 }
 
 impl AppState {
+    /// Read only the current credential metadata before expiry decisions.
+    /// Client discovery stays on its slower monitor; no token is refreshed.
+    pub fn refresh_login_metadata(&self) {
+        let accounts = self.store.lock().unwrap().accounts.clone();
+        if !accounts.iter().any(|a| a.source == "switch") { return; }
+        let records = switch_file().ok().and_then(|path| read_json(&path).ok())
+            .and_then(|v| v.as_array().cloned()).unwrap_or_default();
+        apply_login_metadata(&accounts, &records, &mut self.runtime.lock().unwrap());
+    }
+
     /// Accounts as seen by the unified scheduler. Ranking uses cached billing only.
     pub fn pool_accounts(&self) -> Vec<agentdock_core::provider::PoolAccount> {
         let store = self.store.lock().unwrap();
@@ -742,7 +852,7 @@ impl AppState {
                         a.note.clone()
                     },
                     enabled: a.enabled,
-                    expires_at: a.expires_at,
+                    expires_at: login_expiry(a, rt.presentations.get(&a.id)),
                     credit: agentdock_core::provider::CreditRank {
                         remaining,
                         earliest_expiry: earliest,
@@ -750,7 +860,11 @@ impl AppState {
                         updated_at: credit.and_then(|c| c["updatedAt"].as_i64()),
                     },
                     order,
-                    blocked: None,
+                    blocked: (rt.presentations.get(&a.id)
+                        .is_some_and(|p| p["needsRelogin"] == true)
+                        || credit.is_some_and(|c| c["authFailed"] == true)
+                        || rt.auth_failed.get(&a.id).copied().unwrap_or(false))
+                        .then(|| "登录凭证已失效".into()),
                 }
             })
             .collect()
@@ -889,7 +1003,7 @@ pub fn credentials(account: &Account) -> Result<Credential, String> {
             .find(|r| r["id"] == account.source_id)
             .cloned()
             .ok_or("原始账号已移除，请重新导入")?
-    } else {
+    } else if account.source == "local" {
         let login = read_json(&auth_file(&account.variant)?)?;
         let uid = login["account"]["uid"]
             .as_str()
@@ -897,14 +1011,16 @@ pub fn credentials(account: &Account) -> Result<Credential, String> {
         if account.source_id != uid {
             return Err("客户端当前账号已改变，请重新导入".into());
         }
-        let mut raw = json!({ "uid": uid, "access_token": login["auth"]["accessToken"], "domain": login["auth"]["domain"], "enterpriseId": login["account"]["enterpriseId"] });
+        let raw = json!({ "uid": uid, "access_token": login["auth"]["accessToken"], "domain": login["auth"]["domain"], "enterpriseId": login["account"]["enterpriseId"] });
         if !raw["access_token"].is_string() {
-            let saved = read_json(&switch_file()?)?;
-            raw = saved.as_array().ok_or("账号库格式错误")?.iter().find(|r| r["uid"] == uid && r["access_token"].is_string())
-                .cloned().ok_or("WorkBuddy 使用加密信封；参考账号库中没有同 UID 的明文登录态，请先在参考工具重新登录该账号")?;
+            return Err("本地登录态已加密，请点击“导入当前登录账号”读取本机新凭据".into());
         }
         raw
-    };
+    } else { return Err("不支持的账号来源，请重新导入".into()); };
+    if account.source == "switch" && (raw["uid"].as_str() != account.id.split_once(':').map(|(_, uid)| uid)
+        || wb_switch_core::modules::account::variant_of(&raw).as_str() != account.variant) {
+        return Err("原始账号身份或地区已变化，请重新导入，未使用其他账号的凭据".into());
+    }
     let token = raw["access_token"]
         .as_str()
         .filter(|s| !s.is_empty())
@@ -940,6 +1056,37 @@ pub fn endpoint(account: &Account) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stale_credit_results_cannot_replace_new_login_status_or_balance() {
+        let dir = std::env::temp_dir().join(format!("agentdock-stale-credit-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap(); let path = dir.join("accounts.json");
+        std::fs::write(&path, serde_json::to_vec(&json!([{"id":"source","uid":"u","variant":"cn","access_token":"fresh"}])).unwrap()).unwrap();
+        let state = AppState::new(dir.join("metadata.json")).unwrap();
+        state.import_source_at("switch", None, &path).unwrap();
+        state.cache_credit("cn:u", json!({"ok":true,"totalRemaining":99})).unwrap();
+        let old = agentdock_core::provider::credential_revision("old");
+        assert!(!state.cache_credit_observed_at("cn:u",json!({"ok":false,"authFailed":true}),old,&path).unwrap());
+        assert!(!state.cache_credit_observed_at("cn:u",json!({"ok":true,"totalRemaining":1}),old,&path).unwrap());
+        assert_eq!(state.store.lock().unwrap().resources["cn:u"]["totalRemaining"],99);
+        assert!(state.runtime.lock().unwrap().auth_failed.is_empty());
+        let fresh = agentdock_core::provider::credential_revision("fresh");
+        assert!(state.cache_credit_observed_at("cn:u",json!({"ok":true,"totalRemaining":100}),fresh,&path).unwrap());
+        assert_eq!(state.store.lock().unwrap().resources["cn:u"]["totalRemaining"],100);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn legacy_stale_401_migration_does_not_override_manual_acknowledgement_or_network_failures() {
+        let mut store = Store::default();
+        store.resources.insert("auth".into(), json!({"ok":true,"stale":true,"error":"服务端返回 HTML 错误页：401 Authorization Required"}));
+        store.resources.insert("acknowledged".into(), json!({"ok":true,"stale":true,"authFailed":false,"error":"服务端返回 HTML 错误页：401 Authorization Required"}));
+        store.resources.insert("network".into(), json!({"ok":true,"stale":true,"error":"connection timeout"}));
+        store.resources.insert("forbidden".into(), json!({"ok":true,"stale":true,"error":"服务端返回 HTML 错误页：403 Forbidden"}));
+        restore_credit_auth_failures(&mut store);
+        assert_eq!(store.resources["auth"]["authFailed"],true);
+        assert_eq!(store.resources["acknowledged"]["authFailed"],false);
+        assert!(store.resources["network"].get("authFailed").is_none());
+        assert!(store.resources["forbidden"].get("authFailed").is_none());
+    }
     fn state() -> Shared {
         let state = AppState::new(std::env::temp_dir().join(Uuid::new_v4().to_string()))
         .unwrap();
@@ -1408,6 +1555,53 @@ mod tests {
         s.store.lock().unwrap().accounts[0].enabled = true;
         s.store.lock().unwrap().accounts[0].expires_at = Some(1);
         assert!(s.acquire("hy3", None).is_err());
+    }
+
+    #[test]
+    fn renewed_source_expiry_overrides_imported_snapshot_for_ui_and_scheduling() {
+        let s = state();
+        {
+            let mut store = s.store.lock().unwrap();
+            store.accounts[0].source = "switch".into();
+            store.accounts[0].expires_at = Some(1);
+        }
+        // Before the source scan, an old imported timestamp is not evidence
+        // that the credential currently used for requests has expired.
+        assert_eq!(s.pool_accounts()[0].expires_at, None);
+        assert!(s.snapshot()["accounts"][0]["expiresAt"].is_null());
+        drop(s.acquire("hy3", None).unwrap());
+        let future = Utc::now().timestamp_millis() + 86_400_000;
+        s.runtime.lock().unwrap().presentations.insert("a".into(), json!({"expiresAt":future}));
+        assert_eq!(s.pool_accounts()[0].expires_at, Some(future));
+        assert_eq!(s.snapshot()["accounts"][0]["expiresAt"], future);
+        drop(s.acquire("hy3", None).unwrap());
+        // The reverse case must also follow the latest source, not an old
+        // still-valid imported timestamp.
+        s.store.lock().unwrap().accounts[0].expires_at = Some(future);
+        s.runtime.lock().unwrap().presentations.insert("a".into(), json!({"expiresAt":1}));
+        assert_eq!(s.pool_accounts()[0].expires_at, Some(1));
+        assert_eq!(s.snapshot()["accounts"][0]["expiresAt"], 1);
+        assert!(s.acquire("hy3", None).is_err());
+    }
+
+    #[test]
+    fn immediate_metadata_read_replaces_stale_monitor_state_without_touching_tokens() {
+        let s = state();
+        s.store.lock().unwrap().accounts[0].source = "switch".into();
+        let accounts = s.store.lock().unwrap().accounts.clone();
+        s.runtime.lock().unwrap().presentations.insert("a".into(), json!({"expiresAt":1,"needsRelogin":true,"displayName":"kept"}));
+        let future = Utc::now().timestamp_millis() + 86_400_000;
+        let records = vec![json!({"id":"a","expiresAt":future,"access_token":"fixture-secret"})];
+        apply_login_metadata(&accounts, &records, &mut s.runtime.lock().unwrap());
+        assert_eq!(s.pool_accounts()[0].expires_at, Some(future));
+        assert!(s.pool_accounts()[0].blocked.is_none());
+        let snapshot = s.snapshot();
+        assert_eq!(snapshot["accounts"][0]["presentation"]["displayName"], "kept");
+        assert!(!snapshot.to_string().contains("fixture-secret"));
+        // Missing/unreadable source data is unknown, not proof of expiry.
+        apply_login_metadata(&accounts, &[], &mut s.runtime.lock().unwrap());
+        assert_eq!(s.pool_accounts()[0].expires_at, None);
+        assert!(s.pool_accounts()[0].blocked.is_none());
     }
 
     #[test]

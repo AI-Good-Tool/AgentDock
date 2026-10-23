@@ -1,10 +1,23 @@
 import type { Account, CreditResource } from '../wb-api'
 import { t, fmtShort, fmtTime, isZh } from '../i18n'
-export function accountName(a: Account) {
-  if (a.displayField === 'note') return a.note || a.presentation?.nickname || a.name
-  if (a.displayField === 'phone') return maskedPhone(a.presentation?.phoneNumber) || a.name
-  if (a.displayField === 'nickname') return a.presentation?.nickname || a.name
-  return a.presentation?.displayName || a.name
+export function accountName(a: Account, revealPhone = false) {
+  const name = a.displayField === 'phone'
+    ? a.presentation?.phoneNumber || a.name
+    : a.displayField === 'note'
+      ? a.note || a.presentation?.nickname || a.name
+      : a.displayField === 'nickname'
+        ? a.presentation?.nickname || a.name
+        : a.presentation?.displayName || a.name
+  // Source tools may use the full phone as displayName without our displayField.
+  // Keep the same privacy setting for the title and the contact line.
+  const phone = a.presentation?.phoneNumber
+  const digits = (value: string) => value.replace(/\D/g, '').replace(/^86(?=\d{11}$)/, '')
+  const isPhone = /^[+\d\s()-]+$/.test(name) && (
+    (hasFullPhone(phone) && digits(name) === digits(phone!)) || /^1[3-9]\d{9}$/.test(digits(name))
+  )
+  return !revealPhone && isPhone
+    ? phoneText(name, false)
+    : name
 }
 export function maskedPhone(phone?: string) {
   return phone?.replace(/^(\d{3})\d+(\d{4})$/, '$1****$2') || ''
@@ -68,4 +81,8 @@ const names: Record<string, string> = {
 // Package-code labels ported from MIT WorkBuddy Switch / official client table.
 export function resourceName(r: CreditResource) {
   return names[r.packageCode ?? ''] || r.packageName || r.packageCode || t('积分包', 'Credit pack')
+}
+
+export function hasFullPhone(phone?: string) {
+  return !!phone && !/[*•]/.test(phone) && phone.replace(/\D/g, '').length >= 7
 }

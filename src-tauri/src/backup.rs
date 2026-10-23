@@ -166,6 +166,8 @@ pub fn read(path: &Path) -> Result<Value, String> {
 }
 
 pub fn import(hub: &Shared, bundle: &Value, parts: &Parts) -> Result<Value, String> {
+    let before: Vec<_> = agentdock_core::provider::ProviderKind::ALL.into_iter()
+        .map(|p| (p, hub.credential_revisions(p))).collect();
     let mut report = json!({});
     let saved = &bundle["agentdock"]["settings"];
     if parts.settings && saved.is_object() {
@@ -227,6 +229,7 @@ pub fn import(hub: &Shared, bundle: &Value, parts: &Parts) -> Result<Value, Stri
         }
         report["trae"] = r;
     }
+    for (provider, revisions) in before { hub.restore_changed_logins(provider, &revisions)?; }
     agentdock_core::applog::info("backup", || ("已导入备份".into(), report.clone()));
     Ok(report)
 }
@@ -284,31 +287,52 @@ fn import_workbuddy(hub: &Shared, section: &Value, parts: &Parts) -> Result<Valu
 /// keeping a copy of the previous file under `<data>/backups`.
 pub(crate) fn merge_switch_records(data_dir: &Path, records: &[Value]) -> Result<(), String> {
     let path = workbuddy::pool::switch_file()?;
-    let mut list: Vec<Value> = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-    if path.exists() {
-        let copy = data_dir.join("backups").join(format!(
-            "wb-switch-accounts-{}.json",
-            chrono::Local::now().format("%Y%m%d-%H%M%S")
-        ));
-        write_private(&copy, &std::fs::read(&path).map_err(|_| "无法读取 WorkBuddy 账号库")?)?;
-    }
-    for record in records {
-        let Some(id) = record["id"].as_str() else { continue };
-        match list.iter_mut().find(|r| r["id"] == id) {
-            Some(old) => *old = record.clone(),
-            None => list.push(record.clone()),
+    merge_switch_records_at(data_dir, &path, records)
+}
+
+fn merge_switch_records_at(data_dir: &Path, path: &Path, records: &[Value]) -> Result<(), String> {
+    wb_switch_core::modules::account::mutate_accounts_at(path, |list| {
+        for record in records {
+            let Some(id) = record["id"].as_str() else { continue };
+            if let Some(old) = list.iter().find(|r| r["id"] == id) {
+                if old["uid"] != record["uid"] || wb_switch_core::modules::account::variant_of(old) != wb_switch_core::modules::account::variant_of(record) {
+                    return Err(std::io::Error::other("WorkBuddy 记录 ID 已属于其他账号或地区，未覆盖原账号"));
+                }
+            }
         }
-    }
-    write_private(&path, &serde_json::to_vec_pretty(&list).unwrap())
+        if path.exists() {
+            let copy = data_dir.join("backups").join(format!("wb-switch-accounts-{}-{}.json", chrono::Local::now().format("%Y%m%d-%H%M%S"), uuid::Uuid::new_v4().simple()));
+            write_private(&copy, &serde_json::to_vec_pretty(list)?).map_err(std::io::Error::other)?;
+        }
+        for record in records {
+            let Some(id) = record["id"].as_str() else { continue };
+            match list.iter_mut().find(|r| r["id"] == id) {
+                Some(old) => *old = record.clone(),
+                None => list.push(record.clone()),
+            }
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn merge_preserves_fresh_tokens_of_other_accounts_and_rejects_id_reassignment_before_writing() {
+        let dir = std::env::temp_dir().join(format!("agentdock-merge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap(); let path = dir.join("accounts.json");
+        let records = json!([{"id":"a","uid":"one","variant":"cn","access_token":"fresh-one"},{"id":"b","uid":"two","variant":"ai","access_token":"fresh-two"}]);
+        std::fs::write(&path,serde_json::to_vec(&records).unwrap()).unwrap();
+        let bad = json!([{"id":"c","uid":"three","variant":"cn"},{"id":"a","uid":"wrong","variant":"cn"}]);
+        assert!(merge_switch_records_at(&dir,&path,bad.as_array().unwrap()).is_err());
+        assert_eq!(workbuddy::pool::read_json(&path).unwrap(),records);
+        merge_switch_records_at(&dir,&path,&[json!({"id":"c","uid":"three","variant":"cn"})]).unwrap();
+        let after = workbuddy::pool::read_json(&path).unwrap();
+        assert_eq!(after[0]["access_token"],"fresh-one"); assert_eq!(after[1]["access_token"],"fresh-two");
+        assert_eq!(after.as_array().unwrap().len(),3);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn reads_bundles_and_legacy_qoder_backups() {
         let dir = std::env::temp_dir().join(format!("agentdock-backup-{}", uuid::Uuid::new_v4().simple()));

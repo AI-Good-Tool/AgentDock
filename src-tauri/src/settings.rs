@@ -1,7 +1,7 @@
 //! Unified gateway and appearance settings (`~/.agentdock/settings.json`).
 use agentdock_core::provider::ProviderKind;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const DEFAULT_PORT: u16 = 24800;
 pub const DEFAULT_CONCURRENCY: usize = 4;
@@ -121,6 +121,10 @@ pub struct Settings {
     pub routes: BTreeMap<String, RouteOverride>,
     /// Fixed account (account key "provider/id") per path scope ("all", "cn", "intl", "trae", "trae/cn"…).
     pub pinned: BTreeMap<String, String>,
+    /// Accounts automatically suspended after login expiry/authentication failure.
+    /// Kept until verified login recovery or manual acknowledgement. Recovery
+    /// clears this evidence while leaving the native proxy switch disabled.
+    pub auth_disabled_accounts: BTreeSet<String>,
     /// Reject browser (http/https Origin) requests; native and file:// clients pass.
     pub reject_browser_origin: bool,
     /// Start the gateway automatically when AgentDock opens.
@@ -148,6 +152,7 @@ impl Default for Settings {
                 .collect(),
             routes: BTreeMap::new(),
             pinned: BTreeMap::new(),
+            auth_disabled_accounts: BTreeSet::new(),
             reject_browser_origin: true,
             auto_start: false,
             theme: "light".into(),

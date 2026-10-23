@@ -11,6 +11,97 @@ use std::{
 
 const KEY: &str = "fixture-local-key-0123456789";
 
+fn provider_input(model: &str) -> agentdock_core::provider::SendInput {
+    agentdock_core::provider::SendInput {
+        body: chat(model), headers: Default::default(), request_id: "fixture-stale-review".into(),
+        session_id: None, effort_input: Value::Null, client_profile: None,
+    }
+}
+
+#[tokio::test]
+async fn stale_qoder_http_and_stream_401_cannot_disable_replaced_credentials() {
+    use agentdock_core::provider::{credential_revision, ProviderKind};
+    use futures_util::StreamExt;
+    for model in ["q-auth-http", "q-auth-stream", "q-auth-late"] {
+        let f = fixture().await;
+        let input = provider_input(model);
+        let mut details = agentdock_core::diagnostics::RequestDetails::incoming("openai-chat", "/v1/chat/completions", &input.body);
+        let revision = match f.hub.qoder.send("cn:u1", json!({"id":model}), input, &mut details, std::time::Instant::now()).await {
+            Err(failure) => {
+                assert_eq!(failure.effect, agentdock_core::provider::AccountEffect::AuthFailed);
+                failure.credential_revision
+            }
+            Ok(mut response) => loop {
+                match response.events.next().await.expect("fixture must reject") {
+                    Ok(_) => continue,
+                    Err(failure) => {
+                        assert_eq!(failure.status, Some(401));
+                        break failure.credential_revision;
+                    }
+                }
+            },
+        };
+        assert_eq!(revision, Some(credential_revision("never-real")));
+        // Relogin finishes after the old request used its credential snapshot.
+        f.hub.qoder.fixture_accounts.lock().unwrap().as_mut().unwrap()[0].token = "fresh-login-fixture".into();
+        f.hub.disable_account_auth_observed(ProviderKind::Qoder, "cn:u1", revision);
+        assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["authFailed"], false, "{model}");
+        assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["enabled"], true);
+        assert!(f.hub.settings().auth_disabled_accounts.is_empty());
+        assert!(f.hub.qoder.config().disabled_accounts.is_empty());
+        // A rejection of the current credential still suspends it durably.
+        f.hub.disable_account_auth_observed(ProviderKind::Qoder, "cn:u1", Some(credential_revision("fresh-login-fixture")));
+        assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["enabled"], false);
+        assert!(crate::app::read_settings(&f.hub.dir.join("settings.json")).auth_disabled_accounts.contains("qoder/cn:u1"));
+    }
+}
+
+#[tokio::test]
+async fn stale_trae_catalog_session_and_event_401_cannot_disable_replaced_credentials() {
+    use agentdock_core::provider::{credential_revision, ProviderKind};
+    for mode in [401, 402, 404, 405, 406] {
+        let f = fixture().await;
+        f.trae_plan_mode.store(mode, Ordering::SeqCst);
+        let id = f.hub.trae.pool_accounts()[0].id.clone();
+        let input = provider_input("shared-real");
+        let mut details = agentdock_core::diagnostics::RequestDetails::incoming("openai-chat", "/v1/chat/completions", &input.body);
+        let failure = match f.hub.trae.send(&id, Some("shared-real".into()), input, &mut details, std::time::Instant::now()).await {
+            Ok(_) => panic!("fixture must reject"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failure.effect, agentdock_core::provider::AccountEffect::AuthFailed);
+        assert_eq!(failure.credential_revision, Some(credential_revision("never-real")));
+        f.hub.trae.store.patch_account(&id, |a| a["user"]["token"] = json!("fresh-login-fixture")).unwrap();
+        f.hub.disable_account_auth_observed(ProviderKind::Trae, &id, failure.credential_revision);
+        let key = format!("trae/{id}");
+        assert_eq!(f.hub.account_runtime()[&key]["authFailed"], false, "{mode}");
+        assert_eq!(f.hub.account_runtime()[&key]["enabled"], true);
+        assert!(f.hub.settings().auth_disabled_accounts.is_empty());
+        assert_ne!(f.hub.trae.store.account(&id).unwrap()["enabled"], false);
+        f.hub.disable_account_auth_observed(ProviderKind::Trae, &id, Some(credential_revision("fresh-login-fixture")));
+        assert_eq!(f.hub.account_runtime()[&key]["enabled"], false);
+        assert!(crate::app::read_settings(&f.hub.dir.join("settings.json")).auth_disabled_accounts.contains(&key));
+    }
+}
+
+#[tokio::test]
+async fn stale_expiry_or_credential_failure_does_not_disable_repaired_workbuddy_login() {
+    use agentdock_core::provider::{credential_revision, ProviderKind};
+    let f = fixture().await;
+    f.hub.wb.update_store(|store| {
+        store.accounts.push(serde_json::from_value(json!({"id":"late","name":"fixture","source":"test","sourceId":"fixture-only","variant":"cn","enabled":true,"expiresAt":1})).unwrap());
+        Ok(())
+    }).unwrap();
+    // The scheduler saw an expired snapshot, then a login updated the metadata.
+    f.hub.wb.update_store(|store| { store.accounts.iter_mut().find(|a| a.id == "late").unwrap().expires_at = Some(chrono::Utc::now().timestamp_millis()+86400000); Ok(()) }).unwrap();
+    f.hub.disable_expired_account(ProviderKind::Workbuddy,"late");
+    assert_eq!(f.hub.account_runtime()["workbuddy/late"]["enabled"],true);
+    // No matching current credential can confirm the retired request's failure.
+    f.hub.disable_account_auth_observed(ProviderKind::Workbuddy,"late",Some(credential_revision("retired-fixture-token")));
+    assert_eq!(f.hub.account_runtime()["workbuddy/late"]["authFailed"],false);
+    assert!(f.hub.settings().auth_disabled_accounts.is_empty());
+}
+
 struct Fixture {
     hub: crate::app::Shared,
     url: String,
@@ -52,6 +143,16 @@ async fn fixture() -> Fixture {
             async move {
                 qc.fetch_add(1, Ordering::SeqCst);
                 let sse = [("retry-after", "0"), ("content-type", "text/event-stream")];
+                if body["model"] == "q-auth-http" {
+                    return (axum::http::StatusCode::UNAUTHORIZED, sse, json!({"code":"token_expired"}).to_string());
+                }
+                if body["model"] == "q-auth-stream" || body["model"] == "q-auth-late" {
+                    let prefix = if body["model"] == "q-auth-late" {
+                        format!("data: {}\n\n", json!({"choices":[{"index":0,"delta":{"content":"partial"}}]}))
+                    } else { String::new() };
+                    let frame = json!({"statusCodeValue":401,"body":"token expired"});
+                    return (axum::http::StatusCode::OK, sse, format!("{prefix}data: {frame}\n\n"));
+                }
                 // Qoder reports model permission and queueing inside an HTTP 200 stream.
                 if body["model"] == "q-gate" {
                     let frame = json!({"statusCodeValue":403,"body":"model not allowed"});
@@ -102,6 +203,7 @@ async fn fixture() -> Fixture {
     let trae_cleanup_status = Arc::new(AtomicUsize::new(204));
     let cleanup_status = trae_cleanup_status.clone();
     let create_mode = trae_plan_mode.clone();
+    let catalog_mode = trae_plan_mode.clone();
     let trae_events = Arc::new(AtomicUsize::new(0));
     let events_started = trae_events.clone();
     // Trae Remote Agent chain: models → chat_sessions → events (one turn per request).
@@ -150,12 +252,20 @@ async fn fixture() -> Fixture {
         )
         .route(
             "/api/remote/v1/models",
-            axum::routing::get(|| async {
+            axum::routing::get(move || {
+                let catalog_mode = catalog_mode.clone();
+                async move {
+                use axum::response::IntoResponse;
+                let status = catalog_mode.load(Ordering::SeqCst) as u16;
+                if [401, 403, 429, 500].contains(&status) {
+                    return (axum::http::StatusCode::from_u16(status).unwrap(), Json(json!({"code":status}))).into_response();
+                }
                 Json(json!({"code":0,"data":{"list":[
                     {"function":"solo_work_remote","models":[{"name":"work-only"}]},
                     {"function":"solo_agent_remote","models":[
                         {"name":"shared-real","display_name":"Shared","is_default":true,"config_source":1},
-                        {"name":"flaky-real","display_name":"Flaky"}]}]}}))
+                        {"name":"flaky-real","display_name":"Flaky"}]}]}})).into_response()
+                }
             }),
         )
         .route(
@@ -164,6 +274,13 @@ async fn fixture() -> Fixture {
                 let (tc, created, queries, create_mode) = (tc.clone(), created.clone(), queries.clone(), create_mode.clone());
                 async move {
                     tc.fetch_add(1, Ordering::SeqCst);
+                    use axum::response::IntoResponse;
+                    if create_mode.load(Ordering::SeqCst) == 402 {
+                        return (axum::http::StatusCode::UNAUTHORIZED, [("content-type", "text/html")], "<html>Unauthorized</html>").into_response();
+                    }
+                    if create_mode.load(Ordering::SeqCst) == 404 {
+                        return Json(json!({"code":"TOKEN_EXPIRED"})).into_response();
+                    }
                     let m = &body["initial_message"];
                     assert_eq!(m["custom_model"]["name"], m["model_name"], "the full catalog entry is sent");
                     let query: Value = serde_json::from_str(m["query"].as_str().unwrap()).unwrap();
@@ -177,9 +294,9 @@ async fn fixture() -> Fixture {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                     if create_mode.load(Ordering::SeqCst) == 4 {
-                        return Json(json!({"code":0,"data":{"chat_session_id":sid}}));
+                        return Json(json!({"code":0,"data":{"chat_session_id":sid}})).into_response();
                     }
-                    Json(json!({"code":0,"data":{"chat_session_id":sid,"message_id":"m1"}}))
+                    Json(json!({"code":0,"data":{"chat_session_id":sid,"message_id":"m1"}})).into_response()
                 }
             }),
         )
@@ -191,6 +308,13 @@ async fn fixture() -> Fixture {
                 let events_started = events_started.clone();
                 async move {
                     events_started.fetch_add(1,Ordering::SeqCst);
+                    use axum::response::IntoResponse;
+                    if plan_mode.load(Ordering::SeqCst) == 405 {
+                        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if plan_mode.load(Ordering::SeqCst) == 406 {
+                        return ([("content-type", "text/event-stream")], "event: error\ndata: {\"code\":\"TOKEN_EXPIRED\"}\n\n").into_response();
+                    }
                     if plan_mode.load(Ordering::SeqCst) == 6 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
@@ -228,7 +352,7 @@ async fn fixture() -> Fixture {
                     .iter()
                     .map(|(e, d)| format!("event: {e}\ndata: {d}\n\n"))
                     .collect::<String>();
-                    ([("content-type", "text/event-stream")], wire)
+                    ([("content-type", "text/event-stream")], wire).into_response()
                 }
             }),
         )
@@ -265,7 +389,7 @@ async fn fixture() -> Fixture {
             disabled_accounts: vec![],
         },
         HashMap::from([
-            ("cn".into(), vec![json!({"id":"q-shared","name":"Shared"}), json!({"id":"q-only","name":"QoderOnly"}), json!({"id":"q-flaky","name":"Flaky"}), json!({"id":"q-gate","name":"Gate"}), json!({"id":"q-queue","name":"Queued"})]),
+            ("cn".into(), vec![json!({"id":"q-shared","name":"Shared"}), json!({"id":"q-only","name":"QoderOnly"}), json!({"id":"q-flaky","name":"Flaky"}), json!({"id":"q-gate","name":"Gate"}), json!({"id":"q-queue","name":"Queued"}), json!({"id":"q-auth-http","name":"AuthHttp"}), json!({"id":"q-auth-stream","name":"AuthStream"}), json!({"id":"q-auth-late","name":"AuthLate"})]),
             ("intl".into(), vec![json!({"id":"q-shared-i","name":"Shared"}), json!({"id":"q-gate-i","name":"Gate"})]),
         ]),
     );
@@ -723,6 +847,316 @@ async fn queue_notice_waits_and_retries_the_same_account_when_no_other_exists() 
     assert!(logs.iter().any(|l| l.attempt == 2 && l.account_id == queued.account_id && l.outcome == "completed"));
     let rt = f.hub.runtime.lock().unwrap();
     assert!(rt.model_cooldown.is_empty() && !rt.cooldown.contains_key("qoder/cn:u1"), "queueing is not a rejection");
+}
+
+#[tokio::test]
+async fn workbuddy_expired_or_relogin_required_is_disabled_only_when_its_route_is_used() {
+    for needs_relogin in [false, true] {
+        let f = fixture().await;
+        f.hub.wb.store.lock().unwrap().accounts.push(serde_json::from_value(json!({
+            "id":"wb-fixture", "name":"WB fixture", "source":"test", "variant":"cn", "enabled":true,
+            "expiresAt": if needs_relogin { i64::MAX } else { 1 },
+        })).unwrap());
+        if needs_relogin {
+            f.hub.wb.runtime.lock().unwrap().presentations.insert("wb-fixture".into(), json!({"needsRelogin":true}));
+        }
+        f.hub.wb.update_models(vec![json!({"id":"wb-fixture-model"})], vec!["wb-fixture-model".into()], "cn".into()).unwrap();
+        assert_eq!(post_json(&f, "/qoder/cn/v1/chat/completions", chat("Shared")).await.status(), 200);
+        assert!(f.hub.wb.pool_accounts()[0].enabled, "unrelated scoped requests do not change other providers");
+        assert_eq!(post_json(&f, "/workbuddy/cn/v1/chat/completions", chat("wb-fixture-model")).await.status(), 503);
+        assert!(!f.hub.wb.pool_accounts()[0].enabled);
+        let saved = workbuddy::pool::AppState::new(f.hub.dir.join("workbuddy/store.json")).unwrap();
+        assert!(!saved.pool_accounts()[0].enabled);
+    }
+}
+
+#[tokio::test]
+async fn stale_credit_auth_failure_disables_proxy_but_network_failure_does_not() {
+    use agentdock_core::provider::ProviderKind;
+    let f = fixture().await;
+    f.hub.wb.update_store(|store| {
+        store.accounts.push(workbuddy::pool::Account { id:"fixture-wb".into(),name:"Fixture".into(),source:"test".into(),source_id:"fixture".into(),variant:"cn".into(),enabled:true,checkin_enabled:false,note:String::new(),display_field:String::new(),expires_at:None });
+        Ok(())
+    }).unwrap();
+    f.hub.wb.cache_credit("fixture-wb",json!({"ok":true,"totalRemaining":42,"updatedAt":123})).unwrap();
+    f.hub.wb.cache_credit("fixture-wb",json!({"ok":false,"error":"connection timeout","authFailed":false})).unwrap();
+    assert_eq!(f.hub.account_runtime()["workbuddy/fixture-wb"]["enabled"],true);
+    f.hub.wb.cache_credit("fixture-wb",json!({"ok":false,"error":"Unauthorized","authFailed":true})).unwrap();
+    let snapshot = f.hub.wb.snapshot();
+    assert_eq!(snapshot["accounts"][0]["credit"]["totalRemaining"],42);
+    assert_eq!(snapshot["accounts"][0]["credit"]["stale"],true);
+    assert_eq!(snapshot["accounts"][0]["credit"]["authFailed"],true);
+    assert_eq!(f.hub.account_runtime()["workbuddy/fixture-wb"]["enabled"],false);
+    let saved = crate::app::read_settings(&f.hub.dir.join("settings.json"));
+    assert!(saved.auth_disabled_accounts.contains("workbuddy/fixture-wb"));
+    let reopened = Hub::assemble(&f.hub.dir,saved,KEY,f.hub.qoder.clone(),f.hub.trae.clone());
+    assert_eq!(reopened.account_runtime()["workbuddy/fixture-wb"]["authFailed"],true);
+    reopened.set_account_enabled(ProviderKind::Workbuddy,"fixture-wb",true).unwrap();
+    assert_eq!(reopened.wb.snapshot()["accounts"][0]["credit"]["authFailed"],false);
+    assert_eq!(reopened.account_runtime()["workbuddy/fixture-wb"]["enabled"],true);
+    // Old versions persisted only the normalized HTML title, without authFailed.
+    reopened.wb.cache_credit("fixture-wb",json!({"ok":false,"error":"服务端返回 HTML 错误页：401 Authorization Required"})).unwrap();
+    reopened.wb.update_store(|store| { store.resources.get_mut("fixture-wb").unwrap().as_object_mut().unwrap().remove("authFailed"); Ok(()) }).unwrap();
+    let migrated = Hub::assemble(&f.hub.dir,reopened.settings(),KEY,f.hub.qoder.clone(),f.hub.trae.clone());
+    assert_eq!(migrated.account_runtime()["workbuddy/fixture-wb"]["authFailed"],true);
+    assert_eq!(migrated.account_runtime()["workbuddy/fixture-wb"]["enabled"],false);
+}
+
+#[tokio::test]
+async fn workbuddy_reauthorization_and_credit_verification_clear_stale_auth_without_enabling_proxy() {
+    let f = fixture().await;
+    let account = |id: &str| workbuddy::pool::Account {
+        id:id.into(), name:id.into(), source:"test".into(), source_id:id.into(), variant:"cn".into(),
+        enabled:true, checkin_enabled:true, note:"preserved note".into(), display_field:"note".into(), expires_at:None,
+    };
+    f.hub.wb.update_store(|store| { store.accounts.extend([account("relogin"),account("other")]); Ok(()) }).unwrap();
+    for id in ["relogin","other"] {
+        f.hub.wb.cache_credit(id,json!({"ok":true,"totalRemaining":42,"updatedAt":123})).unwrap();
+        f.hub.wb.cache_credit(id,json!({"ok":false,"authFailed":true,"error":"401"})).unwrap();
+    }
+    let future = chrono::Utc::now().timestamp_millis() + 86_400_000;
+    // The OAuth adapter has imported the fresh metadata before restoring login.
+    f.hub.wb.update_store(|store| { store.accounts[0].expires_at = Some(future); Ok(()) }).unwrap();
+    f.hub.wb.runtime.lock().unwrap().presentations.insert("relogin".into(),json!({"needsRelogin":true}));
+    f.hub.restore_workbuddy_login("relogin").unwrap();
+    let rt = f.hub.account_runtime();
+    assert_eq!(rt["workbuddy/relogin"]["authFailed"],false);
+    assert_eq!(rt["workbuddy/relogin"]["enabled"],false);
+    assert_eq!(rt["workbuddy/relogin"]["expiresAt"],future);
+    assert_eq!(rt["workbuddy/other"]["authFailed"],true);
+    let snapshot = f.hub.wb.snapshot();
+    let a = &snapshot["accounts"][0];
+    assert_eq!(a["credit"]["authFailed"],false);
+    assert_eq!(a["credit"]["totalRemaining"],42);
+    assert!(a["credit"].get("error").is_none());
+    assert_eq!(a["presentation"]["needsRelogin"],false);
+    assert_eq!(a["checkinEnabled"],true);
+    assert_eq!(a["note"],"preserved note");
+    assert!(f.hub.pool_accounts().iter().find(|a| a.id == "relogin").unwrap().blocked.is_none());
+    drop(f.hub.wb.acquire("credits",Some("relogin")).unwrap());
+    // Failed refreshes do not prove login recovery, and do not clear other accounts.
+    f.hub.wb.cache_credit("other",json!({"ok":false,"error":"network timeout"})).unwrap();
+    assert_eq!(f.hub.account_runtime()["workbuddy/other"]["authFailed"],true);
+    // A manually requested authenticated credit query can verify an external re-login.
+    drop(f.hub.wb.acquire("credits",Some("other")).unwrap());
+    f.hub.wb.cache_credit("other",json!({"ok":true,"totalRemaining":55,"updatedAt":456})).unwrap();
+    assert_eq!(f.hub.account_runtime()["workbuddy/other"]["authFailed"],false);
+    assert_eq!(f.hub.account_runtime()["workbuddy/other"]["enabled"],false);
+    let restarted = Hub::assemble(&f.hub.dir,crate::app::read_settings(&f.hub.dir.join("settings.json")),KEY,f.hub.qoder.clone(),f.hub.trae.clone());
+    for id in ["relogin","other"] {
+        assert_eq!(restarted.account_runtime()[format!("workbuddy/{id}")]["authFailed"],false);
+        assert_eq!(restarted.account_runtime()[format!("workbuddy/{id}")]["enabled"],false);
+    }
+    assert!(restarted.settings().auth_disabled_accounts.is_empty());
+    restarted.set_account_enabled(agentdock_core::provider::ProviderKind::Workbuddy,"relogin",true).unwrap();
+    restarted.wb.cache_credit("relogin",json!({"ok":true,"totalRemaining":66})).unwrap();
+    assert_eq!(restarted.account_runtime()["workbuddy/relogin"]["enabled"],true);
+}
+
+#[tokio::test]
+async fn qoder_and_trae_recovery_clear_auth_failure_keep_proxy_off_and_reject_stale_signals() {
+    use agentdock_core::provider::{credential_revision, ProviderKind};
+    let f = fixture().await;
+    let id = f.hub.trae.pool_accounts()[0].id.clone();
+    f.hub.disable_account_auth(ProviderKind::Trae, &id);
+    let old = f.hub.trae.store.account(&id).unwrap();
+    // Reimporting identical credentials cannot prove recovery.
+    f.hub.trae.import("cn", old.clone()).unwrap();
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["authFailed"], true);
+    let mut fresh = old;
+    fresh["user"]["token"] = json!("fresh-trae-fixture");
+    fresh["user"]["expiredAt"] = json!("2099-01-01T00:00:00Z");
+    f.hub.trae.import("cn", fresh).unwrap();
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["authFailed"], false);
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["enabled"], false);
+    f.hub.disable_account_auth_observed(ProviderKind::Trae, &id, Some(credential_revision("never-real")));
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["authFailed"], false);
+    f.hub.disable_account_auth(ProviderKind::Trae, &id);
+    f.hub.restore_login_observed(ProviderKind::Trae, &id, Some(credential_revision("never-real"))).unwrap();
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["authFailed"], true);
+    // A verified same-token response can recover too (the refresh API need not rotate).
+    f.hub.trae.store.login_restored(&f.hub.trae.store.account(&id).unwrap());
+
+    f.hub.disable_account_auth(ProviderKind::Qoder, "cn:u1");
+    let before = f.hub.credential_revisions(ProviderKind::Qoder);
+    f.hub.restore_changed_logins(ProviderKind::Qoder, &before).unwrap();
+    assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["authFailed"], true);
+    {
+        let mut accounts = f.hub.qoder.fixture_accounts.lock().unwrap();
+        let a = &mut accounts.as_mut().unwrap()[0];
+        a.token = "fresh-qoder-fixture".into();
+        a.expiresAt = "2000-01-01T00:00:00Z".into();
+    }
+    f.hub.restore_changed_logins(ProviderKind::Qoder, &before).unwrap();
+    assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["authFailed"], true, "an expired replacement is not recovery");
+    f.hub.qoder.fixture_accounts.lock().unwrap().as_mut().unwrap()[0].expiresAt = "2099-01-01T00:00:00Z".into();
+    f.hub.restore_changed_logins(ProviderKind::Qoder, &before).unwrap();
+    assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["authFailed"], false);
+    assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["enabled"], false);
+    f.hub.disable_account_auth_observed(ProviderKind::Qoder, "cn:u1", Some(credential_revision("never-real")));
+    assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["authFailed"], false);
+
+    let restarted = Hub::assemble(&f.hub.dir, crate::app::read_settings(&f.hub.dir.join("settings.json")), KEY, f.hub.qoder.clone(), f.hub.trae.clone());
+    for key in ["qoder/cn:u1".to_owned(), format!("trae/{id}")] {
+        assert_eq!(restarted.account_runtime()[&key]["authFailed"], false);
+        assert_eq!(restarted.account_runtime()[&key]["enabled"], false);
+    }
+}
+
+#[tokio::test]
+async fn trae_events_restore_in_runtime_logs_and_stay_cleared_after_restart() {
+    let f = fixture().await;
+    f.hub.trae.store.event("refresh", "fixture refresh complete");
+    f.hub.trae.store.event("error", "fixture check-in failed");
+    let reopened = trae::Provider::open(&f.hub.dir.join("trae")).unwrap();
+    let restarted = Hub::assemble(&f.hub.dir, f.hub.settings(), KEY, f.hub.qoder.clone(), reopened);
+    let entries = restarted.applog.query(&json!({"source":"trae"}));
+    assert_eq!(entries["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(entries["entries"][0]["message"], "[error] fixture check-in failed");
+    assert_eq!(restarted.applog.query(&json!({"level":"warn"}))["entries"].as_array().unwrap().len(), 1);
+    restarted.trae.store.clear_events_then(|| restarted.applog.clear()).unwrap();
+    assert_eq!(restarted.applog.query(&json!({}))["total"], 0);
+    let reopened = trae::Provider::open(&f.hub.dir.join("trae")).unwrap();
+    let cleared = Hub::assemble(&f.hub.dir, f.hub.settings(), KEY, f.hub.qoder.clone(), reopened);
+    assert_eq!(cleared.applog.query(&json!({}))["total"], 0);
+}
+
+#[tokio::test]
+async fn mixed_batch_export_roundtrips_without_mutating_fixture_credentials() {
+    use crate::account_json::{self, AccountRef};
+    let f = fixture().await;
+    let trae_id = f.hub.trae.pool_accounts()[0].id.clone();
+    let doc = account_json::export_batch(&f.hub,&[
+        AccountRef{provider:"qoder".into(),id:"cn:u1".into()},
+        AccountRef{provider:"trae".into(),id:trae_id.clone()},
+        AccountRef{provider:"trae".into(),id:trae_id.clone()},
+    ]).unwrap();
+    assert_eq!(doc["accounts"].as_array().unwrap().len(),2);
+    assert_eq!(doc["accounts"][0]["account"]["token"],"never-real");
+    assert_eq!(doc["accounts"][1]["account"]["user"]["token"],"never-real");
+    let single_provider_batch = json!({"format":account_json::BATCH_FORMAT,"accounts":[doc["accounts"][1]]});
+    let result = account_json::import(&f.hub,"auto",None,&single_provider_batch).unwrap();
+    assert_eq!(result["count"],1);
+    assert_eq!(f.hub.trae.pool_accounts()[0].id,trae_id);
+    let before = f.hub.trae.store.accounts();
+    let invalid = json!([doc["accounts"][1],{"format":account_json::FORMAT,"provider":"qoder","account":{"uid":"missing-edition"}}]);
+    assert!(account_json::import(&f.hub,"auto",None,&invalid).is_err());
+    assert_eq!(f.hub.trae.store.accounts(),before);
+}
+
+#[tokio::test]
+async fn automatic_disable_persistence_error_preserves_original_failure_and_runtime_exclusion() {
+    let f = fixture().await;
+    std::fs::create_dir(f.hub.dir.join("settings.json")).unwrap();
+    let response = post_json(&f, "/qoder/cn/v1/chat/completions", chat("AuthHttp")).await;
+    assert_eq!(response.status(), 401);
+    assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["enabled"], false);
+    assert_eq!(post_json(&f, "/qoder/cn/v1/chat/completions", chat("Shared")).await.status(), 503);
+    assert_eq!(f.qoder_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn expired_accounts_are_disabled_before_upstream_and_stay_off_after_restart() {
+    use agentdock_core::provider::ProviderKind;
+    let f = fixture().await;
+    let id = f.hub.trae.pool_accounts()[0].id.clone();
+    f.hub.trae.store.patch_account(&id, |a| a["user"]["expiredAt"] = json!("2000-01-01T00:00:00Z")).unwrap();
+    let response = post_json(&f, "/trae/cn/v1/chat/completions", chat("Shared")).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["enabled"], false);
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["authFailed"], true);
+    let saved = crate::app::read_settings(&f.hub.dir.join("settings.json"));
+    assert!(saved.auth_disabled_accounts.contains(&format!("trae/{id}")));
+    let reopened = trae::Provider::open(&f.hub.dir.join("trae")).unwrap();
+    let restarted = Hub::assemble(&f.hub.dir, saved, KEY, f.hub.qoder.clone(), reopened);
+    assert_eq!(restarted.account_runtime()[format!("trae/{id}")]["enabled"], false);
+    assert_eq!(restarted.account_runtime()[format!("trae/{id}")]["authFailed"], true);
+    // Updating login alone does not unexpectedly re-enable proxying.
+    restarted.trae.store.patch_account(&id, |a| a["user"]["expiredAt"] = json!("2099-01-01T00:00:00Z")).unwrap();
+    assert!(!restarted.pool_accounts().iter().find(|a| a.id == id).unwrap().enabled);
+    restarted.set_account_enabled(ProviderKind::Trae, &id, true).unwrap();
+    assert_eq!(restarted.account_runtime()[format!("trae/{id}")]["authFailed"], false);
+    assert_eq!(restarted.account_runtime()[format!("trae/{id}")]["enabled"], true);
+    assert!(crate::app::read_settings(&f.hub.dir.join("settings.json")).auth_disabled_accounts.is_empty());
+}
+
+#[tokio::test]
+async fn http_and_in_stream_auth_failures_disable_only_the_failing_account() {
+    for model in ["AuthHttp", "AuthStream", "AuthLate"] {
+        for stream in [false, true] {
+            let f = fixture().await;
+            let mut body = chat(model);
+            body["stream"] = json!(stream);
+            let response = post_json(&f, "/qoder/cn/v1/chat/completions", body).await;
+            let _ = response.text().await.unwrap();
+            wait_logs(&f, 1).await;
+            let rt = f.hub.account_runtime();
+            assert_eq!(rt["qoder/cn:u1"]["enabled"], false, "{model}/{stream}");
+            assert_eq!(rt["qoder/cn:u1"]["authFailed"], true);
+            assert_eq!(rt["qoder/intl:u2"]["enabled"], true);
+            assert!(f.hub.qoder.config().disabled_accounts.contains(&"cn:u1".to_owned()));
+            assert!(crate::app::read_settings(&f.hub.dir.join("settings.json")).auth_disabled_accounts.contains("qoder/cn:u1"));
+            let calls = f.qoder_calls.load(Ordering::SeqCst);
+            assert_eq!(post_json(&f, "/qoder/cn/v1/chat/completions", chat("Shared")).await.status(), 503);
+            assert_eq!(f.qoder_calls.load(Ordering::SeqCst), calls);
+        }
+    }
+}
+
+#[tokio::test]
+async fn trae_auth_failure_disables_proxy_but_permission_quota_and_server_errors_do_not() {
+    for status in [401, 403, 429, 500] {
+        let f = fixture().await;
+        f.trae_plan_mode.store(status, Ordering::SeqCst);
+        assert_eq!(post_json(&f, "/trae/cn/v1/chat/completions", chat("Shared")).await.status(), 502);
+        let id = f.hub.trae.pool_accounts()[0].id.clone();
+        let rt = f.hub.account_runtime();
+        assert_eq!(rt[format!("trae/{id}")]["enabled"], status != 401);
+        assert_eq!(rt[format!("trae/{id}")]["authFailed"], status == 401);
+        assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0, "catalog rejection must not create a session");
+    }
+}
+
+#[tokio::test]
+async fn html_auth_failure_during_trae_session_creation_disables_without_creating_a_session() {
+    for mode in [402, 404] {
+    let f = fixture().await;
+    f.trae_plan_mode.store(mode, Ordering::SeqCst);
+    assert_eq!(post_json(&f, "/trae/cn/v1/chat/completions", chat("Shared")).await.status(), 502);
+    let id = f.hub.trae.pool_accounts()[0].id.clone();
+    assert_eq!(f.hub.account_runtime()[format!("trae/{id}")]["enabled"], false);
+    let logs = wait_logs(&f, 1).await;
+    assert_eq!(logs[0].details["upstreamStatus"], if mode == 402 { 401 } else { 200 });
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(f.trae_events.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_account_suspensions_keep_all_native_and_durable_switches_in_step() {
+    use agentdock_core::provider::ProviderKind;
+    let f = fixture().await;
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        for id in ["cn:u1", "intl:u2"] {
+            let (hub, barrier) = (f.hub.clone(), barrier.clone());
+            scope.spawn(move || {
+                barrier.wait();
+                hub.disable_account_auth(ProviderKind::Qoder, id);
+            });
+        }
+    });
+    let saved = crate::app::read_settings(&f.hub.dir.join("settings.json"));
+    for id in ["cn:u1", "intl:u2"] {
+        assert!(saved.auth_disabled_accounts.contains(&format!("qoder/{id}")));
+        assert!(f.hub.qoder.config().disabled_accounts.contains(&id.to_owned()));
+        assert_eq!(f.hub.account_runtime()[format!("qoder/{id}")]["enabled"], false);
+    }
+    f.hub.set_account_enabled(ProviderKind::Qoder, "cn:u1", true).unwrap();
+    assert_eq!(f.hub.account_runtime()["qoder/cn:u1"]["enabled"], true);
+    assert_eq!(f.hub.account_runtime()["qoder/intl:u2"]["enabled"], false);
+    assert_eq!(f.hub.qoder.config().disabled_accounts, ["intl:u2"]);
 }
 
 #[tokio::test]

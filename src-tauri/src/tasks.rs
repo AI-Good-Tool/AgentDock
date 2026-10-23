@@ -15,6 +15,7 @@ pub async fn spawn_all(hub: Shared) {
     });
     // WorkBuddy: scheduled credit refresh and local client monitor.
     tokio::spawn(workbuddy::settings::run_scheduler(hub.wb.clone()));
+    tokio::spawn(workbuddy::auth::run_scheduler(hub.wb.clone()));
     tokio::spawn(workbuddy::switch_bridge::run_local_monitor(hub.wb.clone()));
     // Unified daily check-in / credit claim for all three platforms.
     tokio::spawn(checkin_loop(hub.clone()));
@@ -199,15 +200,21 @@ async fn qoder_pass(hub: &Shared) -> Value {
 
 /// Claim only when a campaign is claimable (or a token needs refreshing).
 pub async fn qoder_auto_claim(hub: &Shared) -> Option<Vec<Value>> {
-    let results = tokio::task::spawn_blocking(|| {
+    let recovery = hub.clone();
+    let results = tokio::task::spawn_blocking(move || {
         use qoder::qcore as qc;
+        let before = recovery.credential_revisions(agentdock_core::provider::ProviderKind::Qoder);
         let accounts = qc::load_accounts();
         let need = accounts.iter().filter(|a| !a.token.is_empty()).any(|acc| {
             let (status, data) = qc::get_campaigns(acc);
             (status == 200 && !qc::claimable_campaigns(&data).is_empty())
                 || (status == 401 && !acc.refreshToken.is_empty())
         });
-        need.then(|| qc::claim_all(None, false))
+        let results = need.then(|| qc::claim_all(None, false));
+        if recovery.restore_changed_logins(agentdock_core::provider::ProviderKind::Qoder, &before).is_err() {
+            agentdock_core::applog::warn("accounts", || ("签到续期后保存登录恢复状态失败".into(), json!({"provider":"qoder"})));
+        }
+        results
     })
     .await
     .ok()

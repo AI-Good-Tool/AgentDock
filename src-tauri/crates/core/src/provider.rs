@@ -134,6 +134,30 @@ pub fn account_key(provider: ProviderKind, id: &str) -> String {
     format!("{}/{}", provider.key(), id)
 }
 
+/// Only explicit authentication signals; never infer expiry from free-form
+/// error text, quota/model permission failures, or a generic HTTP 403.
+pub fn login_rejected(status: u16, error: &Value) -> bool {
+    status == 401 || [
+        &error["code"], &error["error"]["code"],
+        &error["type"], &error["error"]["type"],
+    ].into_iter().any(|code| {
+        code.as_u64() == Some(401) || code.as_str().is_some_and(|s| matches!(
+            s.to_ascii_lowercase().as_str(),
+            "401" | "unauthorized" | "authentication_error" | "token_expired"
+                | "access_token_expired" | "invalid_token" | "invalid_access_token"
+        ))
+    })
+}
+
+/// An opaque equality stamp for a credential snapshot; never a credential or
+/// an authentication check. Kept out of logs and client diagnostics.
+pub fn credential_revision(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hash);
+    hash.finish()
+}
+
 /// Request handed to a provider after protocol conversion and alias resolution.
 pub struct SendInput {
     /// Canonical chat.completions body; `model` is the real upstream id.
@@ -168,6 +192,7 @@ pub struct SendFailure {
     /// Native error type for Anthropic clients (e.g. permission_error).
     pub anthropic_type: Option<String>,
     pub retryable: Option<bool>,
+    pub credential_revision: Option<u64>,
 }
 impl SendFailure {
     pub fn local(status: u16, code: &str, message: impl Into<String>) -> Self {
@@ -179,6 +204,7 @@ impl SendFailure {
             error: Value::Null,
             anthropic_type: None,
             retryable: None,
+            credential_revision: None,
         }
     }
     pub fn with_effect(mut self, effect: AccountEffect) -> Self {
@@ -194,6 +220,16 @@ pub struct SendOk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn login_rejection_requires_explicit_authentication_evidence() {
+        assert!(login_rejected(401, &Value::Null));
+        assert!(login_rejected(200, &serde_json::json!({"code":401})));
+        assert!(login_rejected(403, &serde_json::json!({"error":{"code":"TOKEN_EXPIRED"}})));
+        for status in [200, 400, 403, 429, 500] {
+            assert!(!login_rejected(status, &serde_json::json!({"code":"model_not_allowed", "message":"token expired"})));
+            assert!(!login_rejected(status, &serde_json::json!({"code":"insufficient_quota"})));
+        }
+    }
     #[test]
     fn group_keys_merge_case_and_separators_only() {
         assert_eq!(group_key("GLM-5.3-Flash"), group_key("glm 5.3 flash"));

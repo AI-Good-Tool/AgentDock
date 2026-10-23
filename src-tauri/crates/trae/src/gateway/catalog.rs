@@ -13,7 +13,9 @@ const ATTEMPTS: u32 = 2;
 fn failure(details: &mut RequestDetails, code: &str, message: &str) -> SendFailure {
     details.local_error("upstream_catalog", message);
     let mut failure = SendFailure::local(502, code, message.to_owned());
-    if matches!(details.upstream_status, Some(401 | 403 | 429)) {
+    if details.upstream_status == Some(401) {
+        failure.effect = AccountEffect::AuthFailed;
+    } else if matches!(details.upstream_status, Some(403 | 429)) {
         failure.effect = AccountEffect::Cooldown(60);
     }
     failure
@@ -112,13 +114,18 @@ async fn fetch_with_timeout(
                 ))
             }
         };
-        if body["code"].as_i64().is_some_and(|code| code != 0) {
+        if body["code"].as_i64().is_some_and(|code| code != 0)
+            || agentdock_core::provider::login_rejected(200, &body)
+        {
             let mut error = failure(
                 details,
                 "upstream_protocol_error",
                 "官方 Remote 模型目录返回业务错误",
             );
             error.error = json!({"code":body["code"]});
+            if agentdock_core::provider::login_rejected(200, &body) {
+                error.effect = AccountEffect::AuthFailed;
+            }
             details.error["code"] = body["code"].clone();
             return Err(error);
         }
@@ -201,7 +208,7 @@ mod tests {
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(error.code, "upstream_http_error");
-        assert_eq!(error.effect, AccountEffect::Cooldown(60));
+        assert_eq!(error.effect, AccountEffect::AuthFailed);
         assert_eq!(details.upstream_status, Some(401));
         assert_eq!(details.error_stage.as_deref(), Some("upstream_catalog"));
         assert!(!serde_json::to_string(&details).unwrap().contains("SECRET"));

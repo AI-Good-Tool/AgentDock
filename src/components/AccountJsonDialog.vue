@@ -28,6 +28,17 @@ const save = () => act('json-save', () => call('account_json_save', { provider: 
 
 // import
 const text = ref('')
+const fileInput = ref<HTMLInputElement | null>(null)
+async function chooseFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  try {
+    if (file.size > 16 * 1024 * 1024) throw new Error(t('JSON 文件不能超过 16 MB', 'JSON must be at most 16 MB'))
+    text.value = (await file.text()).replace(/^\uFEFF/, '')
+  } catch (e) { Message.error(String(e)) }
+  finally { input.value = '' }
+}
 const region = ref<'cn' | 'intl'>('cn')
 const parsed = computed<{ value?: any; error?: string; count?: number }>(() => {
   const raw = text.value.trim()
@@ -48,11 +59,13 @@ async function doImport() {
     Message.error(parsed.value.error || t('请粘贴账号 JSON', 'Paste account JSON'))
     return false
   }
-  const r = await act('json-import', () => call('account_json_import', { provider: props.provider, region: region.value, json: parsed.value.value }), undefined, [refreshPool])
+  const provider = parsed.value.value?.format === 'agentdock-accounts' ? 'auto' : props.provider
+  const r = await act('json-import', () => call('account_json_import', { provider, region: region.value, json: parsed.value.value }), undefined, [refreshPool])
   if (r) emit('close')
   return !!r
 }
 const hints: Record<string, [string, string]> = {
+  auto: ['支持单账号、账号数组及 AgentDock 批量导出的 JSON，自动识别 WorkBuddy、Qoder、Trae 及其地区。文件包含登录凭据，请妥善保管。', 'Supports single accounts, arrays and AgentDock batch JSON; detects WorkBuddy, Qoder, Trae and their regions. Keep files with credentials private.'],
   workbuddy: ['WorkBuddy Switch 账号记录：需要 uid 与 access_token（可选 nickname、domain、variant）。会写入 ~/.wb-switch 账号库并加入号池。', 'WorkBuddy Switch record: needs uid and access_token (optional nickname, domain, variant). Saved to the ~/.wb-switch library and added to the pool.'],
   qoder: ['Qoder Switch 账号：需要 edition 与 uid，以及 token / refreshToken 等登录信息；同一账号会被更新。', 'Qoder Switch account: needs edition and uid plus token / refreshToken; an existing account is updated.'],
   trae: ['Trae 账号：需要 user.userId、user.token、user.expiredAt 与 user.account；同一账号会被更新。', 'Trae account: needs user.userId, user.token, user.expiredAt and user.account; an existing account is updated.'],
@@ -86,7 +99,7 @@ const hints: Record<string, [string, string]> = {
 
     <template v-else>
       <div class="json-head">
-        <span class="platform-opt"><ProviderMark :provider="provider" />{{ providerLabel(provider) }}</span>
+        <span class="platform-opt"><ProviderMark v-if="provider !== 'auto'" :provider="provider" />{{ provider === 'auto' ? t('自动识别平台', 'Detect provider automatically') : providerLabel(provider) }}</span>
         <span class="grow"></span>
         <template v-if="provider !== 'qoder'">
           <span class="muted">{{ t('未注明版本时导入为', 'Default version') }}</span>
@@ -95,11 +108,13 @@ const hints: Record<string, [string, string]> = {
             <a-radio value="intl">{{ t('国际版', 'International') }}</a-radio>
           </a-radio-group>
         </template>
+        <input ref="fileInput" type="file" accept=".json,application/json" hidden @change="chooseFile" />
+        <a-button size="small" @click="fileInput?.click()">{{ t('选择 JSON 文件', 'Choose JSON file') }}</a-button>
         <a-button size="small" :disabled="parsed.value === undefined" @click="format">{{ t('格式化', 'Format') }}</a-button>
       </div>
       <a-textarea v-model="text" class="json-input mono" :auto-size="{ minRows: 12, maxRows: 22 }" :placeholder="t('粘贴单个账号、账号数组，或从 AgentDock 导出的账号 JSON', 'Paste one account, an array, or an account JSON exported by AgentDock')" />
       <p v-if="parsed.error" class="error-text json-status">{{ parsed.error }}</p>
-      <p v-else-if="parsed.count" class="json-status muted">{{ t(`识别到 ${parsed.count} 个账号`, `${parsed.count} account(s) detected`) }}</p>
+      <p v-else-if="parsed.count" class="json-status muted">{{ t(`识别到 ${parsed.count} 条账号记录`, `${parsed.count} account record(s) detected`) }}<template v-if="parsed.value?.format === 'agentdock-accounts'"> · {{ t('按文件中的平台和地区批量导入', 'Import using each record’s provider and region') }}</template></p>
       <p class="hint">{{ t(...hints[provider]) }}</p>
     </template>
   </a-modal>

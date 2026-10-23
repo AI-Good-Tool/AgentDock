@@ -440,9 +440,16 @@ pub async fn send(
     let created = tokio::spawn(async move {
         let response = req.send().await.map_err(|_| "Trae 上游连接失败或超时")?;
         let status = response.status().as_u16();
-        let session: Value = response.json().await.map_err(|_| "Trae 会话响应不是 JSON")?;
+        let session: Value = match response.json().await {
+            Ok(session) => session,
+            // Preserve HTTP authentication/rate-limit errors even when an edge
+            // gateway responds with HTML. Never retain the untrusted body.
+            Err(_) if !(200..300).contains(&status) => Value::Null,
+            Err(_) => return Err("Trae 会话响应不是 JSON"),
+        };
         let data = if session["data"].is_object() { &session["data"] } else { &session };
-        let guard = if (200..300).contains(&status) && !session["code"].as_i64().is_some_and(|code| code != 0) {
+        let guard = if (200..300).contains(&status) && !session["code"].as_i64().is_some_and(|code| code != 0)
+            && !agentdock_core::provider::login_rejected(status, &session) {
             data["chat_session_id"].as_str().filter(|sid| !sid.is_empty()).map(|sid| {
                 cleanup.own(create_account, &create_base, sid, data["message_id"].as_str().map(str::to_owned))
             }).transpose().map_err(|_| "Trae 云端会话标识无效")?
@@ -452,11 +459,13 @@ pub async fn send(
         .map_err(|message| fail(details, 502, "upstream_unreachable", message))?;
     let (status, session, mut guard) = created;
     details.upstream_status = Some(status);
-    if !(200..300).contains(&status) || session["code"].as_i64().is_some_and(|c| c != 0) {
+    if !(200..300).contains(&status) || session["code"].as_i64().is_some_and(|c| c != 0)
+        || agentdock_core::provider::login_rejected(status, &session) {
         let msg = format!("Trae 创建会话失败（HTTP {status}）");
         let mut f = fail(details, 502, "upstream_http_error", &msg);
         if let Some(c) = session["code"].as_i64() { f.error = json!({"code":c.to_string()}); }
-        if matches!(status, 401 | 403 | 429) { f = f.with_effect(AccountEffect::Cooldown(60)); }
+        if agentdock_core::provider::login_rejected(status, &session) { f = f.with_effect(AccountEffect::AuthFailed); }
+        else if matches!(status, 403 | 429) { f = f.with_effect(AccountEffect::Cooldown(60)); }
         return Err(f);
     }
     let Some(mut guard) = guard.take() else {
@@ -489,8 +498,12 @@ pub async fn send(
         }
         let r = req.send().await.map_err(|_| fail(details, 502, "upstream_unreachable", "Trae 事件流连接失败或超时"))?;
         if !r.status().is_success() {
-            let msg = format!("Trae 事件流请求失败（HTTP {}）", r.status().as_u16());
-            return Err(fail(details, 502, "upstream_http_error", &msg));
+            let status = r.status().as_u16();
+            details.upstream_status = Some(status);
+            let msg = format!("Trae 事件流请求失败（HTTP {status}）");
+            let mut failure = fail(details, 502, "upstream_http_error", &msg);
+            if status == 401 { failure.effect = AccountEffect::AuthFailed; }
+            return Err(failure);
         }
         let mut frames = SseFrames::default();
         let mut stream = r.bytes_stream();
@@ -506,10 +519,12 @@ pub async fn send(
             for frame in frames.feed(&part).map_err(|e| fail(details, 502, "upstream_protocol_error", &e))? {
                 let Ok(data) = serde_json::from_slice::<Value>(&frame.data) else { continue };
                 let event = frame.event.as_deref().unwrap_or("message");
-                if event == "error" || data["code"].as_i64().is_some_and(|c| c != 0) {
+                if event == "error" || data["code"].as_i64().is_some_and(|c| c != 0)
+                    || agentdock_core::provider::login_rejected(0, &data) {
                     let code = data["code"].as_i64().map(|c| c.to_string()).unwrap_or_else(|| "upstream_error".into());
                     let mut f = fail(details, 502, "upstream_business_error", &format!("Trae 上游拒绝请求（{code}）"));
                     f.error = json!({"code": code});
+                    if agentdock_core::provider::login_rejected(0, &data) { f.effect = AccountEffect::AuthFailed; }
                     return Err(f);
                 }
                 match event {

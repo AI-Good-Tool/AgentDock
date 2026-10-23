@@ -4,7 +4,7 @@ import { Message, Modal as AModal, Space as ASpace } from '@arco-design/web-vue'
 import { call } from '../../wb-api'
 import { t } from '../../i18n'
 const emit = defineEmits<{ added: []; close: [] }>()
-const props = defineProps<{ initialVariant?: string }>()
+const props = defineProps<{ initialVariant?: string; expectedAccountId?: string }>()
 const variant = ref(props.initialVariant === 'ai' ? 'ai' : 'cn')
 const busy = ref(false),
   waiting = ref(false),
@@ -35,15 +35,19 @@ async function copyLink() {
 async function poll(loginId: string) {
   if (!alive) return
   try {
-    const result = await call<{ done: boolean; error?: string; added?: boolean }>('wb_oauth_poll', {
+    const result = await call<{ done: boolean; error?: string; added?: boolean; accountId?: string }>('wb_oauth_poll', {
       loginId,
     })
     if (!alive) return
     if (result.done) {
       waiting.value = false
       if (result.added) {
-        finished.value = true
         emit('added')
+        if (props.expectedAccountId && result.accountId !== props.expectedAccountId) {
+          error.value = t('授权的是另一个账号，已添加到账号池；原账号仍需重新登录。请使用原账号再次授权。', 'A different account was added. The original still needs sign-in; authorize the original account again.')
+          return
+        }
+        finished.value = true
       } else error.value = result.error || t('登录失败，请重新发起', 'Login failed; try again')
       return
     }
@@ -77,7 +81,7 @@ async function start() {
 }
 </script>
 <template>
-  <a-modal :visible="true" :title="t('添加 WorkBuddy 账号', 'Add WorkBuddy account')" :footer="false" @cancel="emit('close')">
+  <a-modal :visible="true" :title="expectedAccountId ? t('重新登录 WorkBuddy', 'Sign in to WorkBuddy again') : t('添加 WorkBuddy 账号', 'Add WorkBuddy account')" :footer="false" @cancel="emit('close')">
     <p>
       {{ t('通过官方 OAuth 授权，凭据仅保存到本机 Switch 账号库；成功后将本次账号接入反代池，不切换原客户端登录。', 'Authorize via official OAuth. Credentials stay in the local Switch store; the account joins the proxy pool without changing your client login.') }}
     </p>
@@ -95,7 +99,7 @@ async function start() {
       {{ t('正在等待官方授权…请勿重复提交。关闭窗口会停止后续轮询，已完成的账号保存不会撤销。', 'Waiting for authorization… Closing stops polling; a saved account is kept.') }}
     </p>
     <a-alert v-if="error" type="error">{{ error }}</a-alert>
-    <a-alert v-if="finished" type="success">{{ t('账号已接入，原有账号开关与设置保持不变。', 'Account added; existing settings are unchanged.') }}</a-alert>
+    <a-alert v-if="finished" type="success">{{ expectedAccountId ? t('授权已完成，登录状态已更新，积分正在刷新；反代开关保持原状，可按需手动开启。', 'Sign-in updated; credits are refreshing. The proxy switch is unchanged; enable it manually when needed.') : t('账号已接入，原有账号开关与设置保持不变。', 'Account added; existing settings are unchanged.') }}</a-alert>
     <div style="margin-top: 20px">
       <a-button v-if="!finished" type="primary" :loading="busy" :disabled="waiting" @click="start"
         >{{ t('同意保存账号并开始授权', 'Agree and start authorization') }}</a-button

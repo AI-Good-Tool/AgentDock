@@ -15,6 +15,7 @@ struct OAuthInfo {
     /// 国内版的 state 去国际版取 token（或反之）。
     variant: WbVariant,
     state: String,
+    headers: HashMap<String, String>,
     expires_at: i64,
     done: bool,
     result: Option<Value>,
@@ -27,11 +28,16 @@ fn oauth_states() -> &'static Mutex<HashMap<String, OAuthInfo>> {
     OAUTH_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Desktop login uses the WorkBuddy endpoint, independent of CodeBuddy billing.
+pub fn desktop_auth_endpoint(variant: WbVariant) -> &'static str {
+    match variant { WbVariant::Cn => "https://www.workbuddy.cn", WbVariant::Ai => "https://www.workbuddy.ai" }
+}
+
 /// 申请 state 的 URL（域名、前缀、platform 全部取自档位）。
 fn oauth_state_url(variant: WbVariant) -> String {
     format!(
         "{}{}/auth/state?platform={}",
-        variant.api_endpoint(),
+        desktop_auth_endpoint(variant),
         variant.api_prefix(),
         variant.oauth_platform()
     )
@@ -41,7 +47,7 @@ fn oauth_state_url(variant: WbVariant) -> String {
 fn oauth_token_url(variant: WbVariant, state: &str) -> String {
     format!(
         "{}{}/auth/token?state={state}",
-        variant.api_endpoint(),
+        desktop_auth_endpoint(variant),
         variant.api_prefix()
     )
 }
@@ -50,16 +56,22 @@ fn oauth_token_url(variant: WbVariant, state: &str) -> String {
 fn oauth_account_url(variant: WbVariant, state: &str) -> String {
     format!(
         "{}{}/login/account?state={state}",
-        variant.api_endpoint(),
+        desktop_auth_endpoint(variant),
         variant.api_prefix()
     )
 }
 
 /// 发起登录：向官方申请 state，返回 loginId / verificationUri / expiresIn。
 pub async fn oauth_start(variant: WbVariant) -> Result<Value, String> {
+    oauth_start_with_context(variant, HashMap::new(), None).await
+}
+
+pub async fn oauth_start_with_context(variant: WbVariant, mut headers: HashMap<String, String>, version: Option<&str>) -> Result<Value, String> {
+    headers.entry("X-Domain".into()).or_insert_with(|| desktop_auth_endpoint(variant).trim_start_matches("https://").into());
+    headers.entry("X-Custom-Channel-Id".into()).or_insert_with(|| "unknown".into());
     let login_id = format!("wb_{}", uuid::Uuid::new_v4().simple());
     let url = oauth_state_url(variant);
-    let resp = http_request(&url, "POST", Some(json!({})), None).await;
+    let resp = http_request(&url, "POST", Some(json!({})), Some(&headers)).await;
     let data = resp.get("data").cloned().unwrap_or_else(|| json!({}));
     let state = data
         .get("state")
@@ -80,14 +92,20 @@ pub async fn oauth_start(variant: WbVariant) -> Result<Value, String> {
         .or_else(|| data.get("auth_url").and_then(|v| v.as_str()))
         .or_else(|| data.get("url").and_then(|v| v.as_str()))
         .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("{}/login?state={state}", variant.api_endpoint()));
+        .unwrap_or_else(|| format!("{}/login?state={state}", desktop_auth_endpoint(variant)));
 
+    let auth_url = if let (Ok(mut parsed), Some(version)) = (reqwest::Url::parse(&auth_url), version) {
+        if !parsed.query_pairs().any(|(key, _)| key == "version") { parsed.query_pairs_mut().append_pair("version", version); }
+        parsed.to_string()
+    } else { auth_url };
     let mut map = oauth_states().lock().unwrap();
+    map.retain(|_, info| info.expires_at > now_secs());
     map.insert(
         login_id.clone(),
         OAuthInfo {
             variant,
             state,
+            headers,
             expires_at: now_secs() + OAUTH_TIMEOUT_SECONDS,
             done: false,
             result: None,
@@ -133,7 +151,7 @@ fn domain_mismatch_error(variant: WbVariant, domain: &str) -> Option<String> {
 
 /// 轮询一次官方 token 接口。成功则拉取账号信息并入库。
 pub async fn oauth_poll(login_id: &str) -> Value {
-    let (state, variant) = {
+    let (state, variant, mut headers) = {
         let mut map = oauth_states().lock().unwrap();
         let Some(info) = map.get_mut(login_id) else {
             return json!({"done": true, "error": "登录请求不存在"});
@@ -147,11 +165,11 @@ pub async fn oauth_poll(login_id: &str) -> Value {
             return json!({"done": true, "error": "登录超时"});
         }
         // 用发起档位拼域名与 platform，不跟随当前列表档位。
-        (info.state.clone(), info.variant)
+        (info.state.clone(), info.variant, info.headers.clone())
     };
 
     let url = oauth_token_url(variant, &state);
-    let resp = http_request(&url, "GET", None, None).await;
+    let resp = http_request(&url, "GET", None, Some(&headers)).await;
     let code = resp.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 && code != 200 {
         return json!({"done": false});
@@ -174,7 +192,6 @@ pub async fn oauth_poll(login_id: &str) -> Value {
 
     // 拉取账号信息
     let account_url = oauth_account_url(variant, &state);
-    let mut headers = HashMap::new();
     headers.insert(
         "Authorization".to_string(),
         format!("Bearer {access_token}"),
@@ -183,7 +200,16 @@ pub async fn oauth_poll(login_id: &str) -> Value {
         headers.insert("X-Domain".to_string(), domain.to_string());
     }
     let acc_resp = http_request(&account_url, "GET", None, Some(&headers)).await;
-    let acc_data = acc_resp.get("data").cloned().unwrap_or_else(|| json!({}));
+    if !matches!(acc_resp["code"].as_i64(), Some(0 | 200)) || !acc_resp["data"]["uid"].is_string() {
+        return json!({"done":false});
+    }
+    let mut acc_data = acc_resp.get("data").cloned().unwrap_or_else(|| json!({}));
+    // The account-scoped desktop flow fetches the authenticated profile as well.
+    let profile_url = format!("{}/v2/plugin/account", desktop_auth_endpoint(variant));
+    let profile = http_request(&profile_url, "GET", None, Some(&headers)).await;
+    if matches!(profile["code"].as_i64(), Some(0 | 200)) && profile["data"]["uid"] == acc_data["uid"] {
+        acc_data = profile["data"].clone();
+    }
 
     let profile_domain = acc_data
         .get("domain")
@@ -307,7 +333,7 @@ mod tests {
             oauth_state_url(WbVariant::Cn),
             format!(
                 "{}/v2/plugin/auth/state?platform={}",
-                WbVariant::Cn.api_endpoint(),
+                desktop_auth_endpoint(WbVariant::Cn),
                 WbVariant::Cn.oauth_platform()
             )
         );
@@ -339,7 +365,7 @@ mod tests {
             oauth_account_url(WbVariant::Cn, "st-1"),
             format!(
                 "{}/v2/plugin/login/account?state=st-1",
-                WbVariant::Cn.api_endpoint()
+                desktop_auth_endpoint(WbVariant::Cn)
             )
         );
     }
@@ -356,6 +382,7 @@ mod tests {
                 OAuthInfo {
                     variant,
                     state: "state-1".to_string(),
+                    headers: HashMap::new(),
                     expires_at: now_secs() + OAUTH_TIMEOUT_SECONDS,
                     done: false,
                     result: None,

@@ -4,6 +4,7 @@
 pub use agentdock_core::{anthropic, diagnostics, MAX_REQUEST_BODY_BYTES, REQUEST_TOO_LARGE_MESSAGE};
 
 pub mod account_priority;
+pub mod auth;
 pub mod checkin;
 pub mod conversation;
 pub mod model_registry;

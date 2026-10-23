@@ -25,6 +25,8 @@ pub struct Hub {
     pub dir: PathBuf,
     settings: Mutex<Settings>,
     settings_writer: Mutex<()>,
+    /// Keep native switches, durable suspension reasons and runtime marks in step.
+    account_writer: Mutex<()>,
     pub key: crate::api_key::LocalKey,
     pub wb: workbuddy::pool::Shared,
     pub qoder: Arc<qoder::gateway::Provider>,
@@ -112,10 +114,11 @@ impl Hub {
         *wb.log_sink.lock().unwrap() = Some(Arc::new(move |log: &workbuddy::pool::RequestLog| {
             sink_logs.push(from_workbuddy(log));
         }));
-        Ok(Arc::new(Self {
+        Ok(Self::wire_callbacks(Arc::new(Self {
             dir: dir.to_owned(),
             settings: Mutex::new(settings),
             settings_writer: Mutex::new(()),
+            account_writer: Mutex::new(()),
             key: crate::api_key::LocalKey::new(key),
             wb,
             qoder,
@@ -129,7 +132,7 @@ impl Hub {
             applog,
             checkin: Mutex::new(json!({})),
             checkin_wake: tokio::sync::Notify::new(),
-        }))
+        })))
     }
     /// Test assembly with fixture providers and no migration.
     #[cfg(test)]
@@ -141,10 +144,11 @@ impl Hub {
         trae: Arc<trae::Provider>,
     ) -> Shared {
         let wb = workbuddy::pool::AppState::new(dir.join("workbuddy/store.json")).unwrap();
-        Arc::new(Self {
+        Self::wire_callbacks(Arc::new(Self {
             dir: dir.to_owned(),
             settings: Mutex::new(settings),
             settings_writer: Mutex::new(()),
+            account_writer: Mutex::new(()),
             key: crate::api_key::LocalKey::new(key.into()),
             wb,
             qoder,
@@ -158,7 +162,37 @@ impl Hub {
             applog: crate::applog::AppLog::new(dir),
             checkin: Mutex::new(json!({})),
             checkin_wake: tokio::sync::Notify::new(),
-        })
+        }))
+    }
+    fn wire_callbacks(hub: Shared) -> Shared {
+        hub.applog.restore_trae_events(&hub.trae.store.snapshot()["events"]);
+        let weak = Arc::downgrade(&hub);
+        *hub.wb.login_status_sink.lock().unwrap() = Some(Arc::new(move |id, failed, revision| {
+            if let Some(hub) = weak.upgrade() {
+                if failed { hub.disable_account_auth_observed(ProviderKind::Workbuddy, id, revision); }
+                else if hub.restore_login_observed(ProviderKind::Workbuddy, id, revision).is_err() {
+                    agentdock_core::applog::warn("accounts", || ("登录验证成功，但保存账号恢复状态失败".into(), json!({"accountId":id})));
+                }
+            }
+        }));
+        let weak = Arc::downgrade(&hub);
+        *hub.trae.store.login_sink.lock().unwrap() = Some(Arc::new(move |id, revision| {
+            if let Some(hub) = weak.upgrade() {
+                if hub.restore_login_observed(ProviderKind::Trae, id, Some(revision)).is_err() {
+                    agentdock_core::applog::warn("accounts", || ("登录已更新，但保存账号恢复状态失败".into(), json!({"provider":"trae","accountId":id})));
+                }
+            }
+        }));
+        let ids: Vec<_> = {
+            let store = hub.wb.store.lock().unwrap();
+            store.accounts.iter().filter(|a| store.resources.get(&a.id).is_some_and(|c| c["authFailed"] == true)).map(|a| a.id.clone()).collect()
+        };
+        for id in ids {
+            if !hub.settings().auth_disabled_accounts.contains(&format!("workbuddy/{id}")) {
+                hub.disable_account_auth(ProviderKind::Workbuddy, &id);
+            }
+        }
+        hub
     }
     pub fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
@@ -236,6 +270,12 @@ impl Hub {
         let mut out = self.wb.pool_accounts();
         out.extend(self.qoder.pool_accounts());
         out.extend(self.trae.pool_accounts());
+        let disabled = self.settings().auth_disabled_accounts;
+        for account in &mut out {
+            if disabled.contains(&account.key()) {
+                account.enabled = false;
+            }
+        }
         out
     }
     pub fn eligibility(
@@ -279,6 +319,96 @@ impl Hub {
         }
     }
     pub fn set_account_enabled(&self, provider: ProviderKind, id: &str, enabled: bool) -> Result<(), String> {
+        let _writer = self.account_writer.lock().unwrap();
+        self.set_provider_enabled(provider, id, enabled)?;
+        if enabled {
+            // Re-enabling acknowledges a repaired login.
+            let key = agentdock_core::provider::account_key(provider, id);
+            if self.settings().auth_disabled_accounts.contains(&key) {
+                self.update_settings(|s| {
+                    s.auth_disabled_accounts.remove(&key);
+                    Ok(())
+                })?;
+            }
+            let mut rt = self.runtime.lock().unwrap();
+            rt.auth_failed.remove(&key);
+            rt.cooldown.remove(&key);
+        }
+        Ok(())
+    }
+    /// Called only after completed OAuth or a successful authenticated query.
+    /// Clear obsolete auth evidence without opting the account back into proxying.
+    pub fn restore_workbuddy_login(&self, id: &str) -> Result<(), String> {
+        self.restore_login_observed(ProviderKind::Workbuddy, id, None)
+    }
+    pub fn credential_revisions(&self, provider: ProviderKind) -> HashMap<String, u64> {
+        let accounts = match provider {
+            ProviderKind::Workbuddy => self.wb.pool_accounts(),
+            ProviderKind::Qoder => self.qoder.pool_accounts(),
+            ProviderKind::Trae => self.trae.pool_accounts(),
+        };
+        accounts.into_iter().filter_map(|a| self.credential_revision(provider, &a.id).map(|r| (a.id, r))).collect()
+    }
+    /// Imports are not authenticated queries. Only replacement credentials with
+    /// a future expiry can invalidate an earlier failure; reimporting an old
+    /// backup must not dismiss it.
+    pub fn restore_changed_logins(&self, provider: ProviderKind, before: &HashMap<String, u64>) -> Result<(), String> {
+        if provider == ProviderKind::Workbuddy { self.wb.refresh_login_metadata(); }
+        let now = chrono::Utc::now().timestamp_millis();
+        let accounts = match provider {
+            ProviderKind::Workbuddy => self.wb.pool_accounts(),
+            ProviderKind::Qoder => self.qoder.pool_accounts(),
+            ProviderKind::Trae => self.trae.pool_accounts(),
+        };
+        for a in accounts {
+            if !a.expires_at.is_some_and(|exp| exp > now) { continue; }
+            if let Some(revision) = self.credential_revision(provider, &a.id) {
+                if before.get(&a.id).is_some_and(|old| *old != revision) {
+                    self.restore_login_observed(provider, &a.id, Some(revision))?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn credential_revision(&self, provider: ProviderKind, id: &str) -> Option<u64> {
+        let token = match provider {
+            ProviderKind::Workbuddy => {
+                let account = self.wb.store.lock().unwrap().accounts.iter().find(|a| a.id == id).cloned();
+                account.and_then(|a| workbuddy::pool::credentials(&a).ok()).map(|c| c.token)
+            }
+            ProviderKind::Qoder => self.qoder.accounts().into_iter().find(|a| a.id() == id).map(|a| a.token),
+            ProviderKind::Trae => self.trae.store.account(id).ok().and_then(|a| a["user"]["token"].as_str().map(str::to_owned)),
+        };
+        token.filter(|t| !t.is_empty()).map(|t| agentdock_core::provider::credential_revision(&t))
+    }
+    fn current_credential_revision(&self, provider: ProviderKind, id: &str, revision: Option<u64>) -> bool {
+        revision.is_none_or(|expected| self.credential_revision(provider, id) == Some(expected))
+    }
+    pub fn restore_login_observed(&self, provider: ProviderKind, id: &str, revision: Option<u64>) -> Result<(), String> {
+        let _writer = self.account_writer.lock().unwrap();
+        if !self.current_credential_revision(provider, id, revision) { return Ok(()); }
+        let key = agentdock_core::provider::account_key(provider, id);
+        let suspended = self.settings().auth_disabled_accounts.contains(&key)
+            || self.runtime.lock().unwrap().auth_failed.contains(&key);
+        let provider_failed = if provider == ProviderKind::Workbuddy {
+            // Never hold runtime while acquiring store: snapshots take store
+            // before runtime. Keep the two reads in separate lock scopes.
+            let runtime_failed = self.wb.runtime.lock().unwrap().auth_failed.get(id).copied().unwrap_or(false);
+            let cached_failed = self.wb.store.lock().unwrap().resources.get(id).is_some_and(|c| c["authFailed"] == true);
+            runtime_failed || cached_failed
+        } else { false };
+        if !suspended && !provider_failed { return Ok(()); }
+        if suspended { self.set_provider_enabled(provider, id, false)?; }
+        if provider == ProviderKind::Workbuddy { self.wb.clear_login_failure(id)?; }
+        if self.settings().auth_disabled_accounts.contains(&key) {
+            self.update_settings(|s| { s.auth_disabled_accounts.remove(&key); Ok(()) })?;
+        }
+        let mut rt = self.runtime.lock().unwrap();
+        rt.auth_failed.remove(&key);
+        rt.cooldown.remove(&key);
+        Ok(())
+    }
+    fn set_provider_enabled(&self, provider: ProviderKind, id: &str, enabled: bool) -> Result<(), String> {
         match provider {
             ProviderKind::Workbuddy => self.wb.set_enabled(id, enabled)?,
             ProviderKind::Qoder => self.qoder.set_enabled(id, enabled)?,
@@ -287,14 +417,45 @@ impl Hub {
                     .update_account(id, &json!({"enabled": enabled}))?;
             }
         }
-        if enabled {
-            // Re-enabling acknowledges a repaired login.
-            let key = agentdock_core::provider::account_key(provider, id);
-            let mut rt = self.runtime.lock().unwrap();
-            rt.auth_failed.remove(&key);
-            rt.cooldown.remove(&key);
-        }
         Ok(())
+    }
+    /// Exclude immediately, then persist both the reason and the provider switch.
+    /// Persistence errors never replace the original upstream failure.
+    pub fn disable_account_auth(&self, provider: ProviderKind, id: &str) {
+        self.disable_account_auth_observed(provider, id, None);
+    }
+    pub fn disable_account_auth_observed(&self, provider: ProviderKind, id: &str, revision: Option<u64>) {
+        let _writer = self.account_writer.lock().unwrap();
+        if !self.current_credential_revision(provider, id, revision) { return; }
+        self.disable_account_auth_locked(provider, id);
+    }
+    pub fn disable_expired_account(&self, provider: ProviderKind, id: &str) {
+        let _writer = self.account_writer.lock().unwrap();
+        if provider == ProviderKind::Workbuddy { self.wb.refresh_login_metadata(); }
+        let current = self.pool_accounts().into_iter().find(|a| a.provider == provider && a.id == id);
+        if current.is_some_and(|a| a.enabled && (a.expires_at.is_some_and(|at| at <= chrono::Utc::now().timestamp_millis()) || a.blocked.is_some())) {
+            self.disable_account_auth_locked(provider, id);
+        }
+    }
+    fn disable_account_auth_locked(&self, provider: ProviderKind, id: &str) {
+        let key = agentdock_core::provider::account_key(provider, id);
+        self.runtime.lock().unwrap().auth_failed.insert(key.clone());
+        let saved = self.update_settings(|s| {
+            s.auth_disabled_accounts.insert(key.clone());
+            Ok(())
+        });
+        let switched = self.set_provider_enabled(provider, id, false);
+        if saved.is_err() || switched.is_err() {
+            agentdock_core::applog::error("gateway.auth", || (
+                "账号登录已失效，已排除调度；保存自动停用状态失败".into(),
+                json!({"provider": provider.key(), "accountId": id}),
+            ));
+        } else {
+            agentdock_core::applog::warn("gateway.auth", || (
+                "账号登录已过期或鉴权失效，已自动停用反代；修复登录后可手动开启".into(),
+                json!({"provider": provider.key(), "accountId": id}),
+            ));
+        }
     }
     /// Runtime state per account key for the UI.
     pub fn account_runtime(&self) -> Value {
@@ -308,8 +469,8 @@ impl Hub {
                 "inFlight": rt.in_flight.get(&key).copied().unwrap_or(0),
                 "concurrency": settings.scope(a.provider).concurrency,
                 "cooldownUntil": rt.cooldown.get(&key).filter(|t| **t > now),
-                "authFailed": rt.auth_failed.contains(&key),
-                "enabled": a.enabled,
+                "authFailed": rt.auth_failed.contains(&key) || settings.auth_disabled_accounts.contains(&key),
+                "enabled": a.enabled && !rt.auth_failed.contains(&key),
                 "credit": a.credit,
                 "expiresAt": a.expires_at,
                 "blocked": a.blocked,

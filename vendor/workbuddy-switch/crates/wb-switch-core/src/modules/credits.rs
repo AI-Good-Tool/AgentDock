@@ -321,7 +321,7 @@ fn response_code(response: &Value) -> Option<i64> {
 }
 
 fn is_success(response: &Value) -> bool {
-    if !response.is_object() {
+    if !response.is_object() || response["httpStatus"].as_u64().is_some_and(|s| s >= 400) {
         return false;
     }
     match response_code(response) {
@@ -804,6 +804,7 @@ pub async fn get_credit_expiry_read_only(account: &Value) -> Value {
         return json!({"ok":false,"error":error});
     }
     let now=now_ms();
+    let mut auth_failed = false;
     if uses_three_endpoint_query(variant_of(account)) {
         let variant=variant_of(account);
         let summary_paths=variant.billing_paths(RESOURCE_SUMMARY_PATH);
@@ -818,10 +819,27 @@ pub async fn get_credit_expiry_read_only(account: &Value) -> Value {
         if let Some(resources)=normalized_new_resources(&summary,&paid,&free,now) {
             return credit_result(account,resources,now);
         }
+        auth_failed = [&summary, &paid, &free].into_iter().any(credit_auth_failed);
     }
     let mut response=fetch_legacy_user_resource(account).await;
     if variant_of(account)==WbVariant::Cn { normalize_cn_billing_dates(&mut response); }
-    legacy_credit_result(account,&response,now)
+    let mut result = legacy_credit_result(account,&response,now);
+    if result["ok"] == false {
+        result["authFailed"] = json!(auth_failed || credit_auth_failed(&response));
+    }
+    result
+}
+
+// Only explicit authentication status/codes justify suspending an account.
+// Generic 403/WAF, quota errors, transport errors and message text do not.
+fn credit_auth_failed(response: &Value) -> bool {
+    if response["httpStatus"] == 401 { return true; }
+    [response, &response["data"], &response["error"]].into_iter().any(|v| {
+        ["code", "type"].into_iter().any(|key| {
+            v[key] == 401 || v[key].as_str().is_some_and(|s| matches!(s.to_ascii_lowercase().as_str(),
+                "401" | "unauthorized" | "authentication_error" | "token_expired" | "access_token_expired" | "invalid_token" | "invalid_access_token"))
+        })
+    })
 }
 
 pub async fn get_credit_expiry(account: &Value) -> Value {
@@ -910,6 +928,17 @@ fn legacy_credit_result(account: &Value, response: &Value, now: i64) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_credit_auth_requires_explicit_status_or_code() {
+        for response in [json!({"code":401}),json!({"httpStatus":401,"code":0}),json!({"data":{"code":"401"}}),json!({"error":{"type":"invalid_token"}})] {
+            assert!(credit_auth_failed(&response));
+            assert!(!is_success(&response));
+        }
+        for response in [json!({"code":-1,"message":"network error"}),json!({"code":403}),json!({"code":429}),json!({"code":10085}),json!({"code":500,"message":"token expired or quota"})] {
+            assert!(!credit_auth_failed(&response));
+        }
+    }
 
     #[test]
     fn cn_billing_dates_ignore_computer_timezone_and_keep_explicit_offsets() {

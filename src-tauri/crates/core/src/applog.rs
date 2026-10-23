@@ -38,6 +38,13 @@ static SINK: OnceLock<Sink> = OnceLock::new();
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
+impl Entry {
+    /// Allocate a process-unique UI key, including for restored history.
+    pub fn new(time: i64, level: Level, source: &str, message: String, fields: Value) -> Self {
+        Self { seq: SEQ.fetch_add(1, Ordering::Relaxed), time, level, source: source.into(), message, fields }
+    }
+}
+
 /// Install the process sink once; later calls are ignored.
 pub fn install(sink: impl Fn(Entry) + Send + Sync + 'static) {
     let _ = SINK.set(Box::new(sink));
@@ -58,14 +65,7 @@ pub fn emit(level: Level, source: &str, build: impl FnOnce() -> (String, Value))
     }
     let Some(sink) = SINK.get() else { return };
     let (message, fields) = build();
-    sink(Entry {
-        seq: SEQ.fetch_add(1, Ordering::Relaxed),
-        time: chrono::Utc::now().timestamp_millis(),
-        level,
-        source: source.to_owned(),
-        message,
-        fields,
-    });
+    sink(Entry::new(chrono::Utc::now().timestamp_millis(), level, source, message, fields));
 }
 pub fn info(source: &str, build: impl FnOnce() -> (String, Value)) {
     emit(Level::Info, source, build)

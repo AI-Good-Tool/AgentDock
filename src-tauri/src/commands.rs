@@ -55,9 +55,12 @@ pub fn app_logs(hub: State<'_, Shared>, filter: Option<Value>) -> Value {
     v
 }
 #[tauri::command]
-pub fn clear_app_logs(hub: State<'_, Shared>) -> Value {
-    hub.applog.clear();
-    json!({"ok": true})
+pub async fn clear_app_logs(hub: State<'_, Shared>) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || {
+        hub.trae.store.clear_events_then(|| hub.applog.clear())?;
+        Ok(json!({"ok": true}))
+    }).await?
 }
 
 // ── all-platform backup ──
@@ -157,6 +160,7 @@ pub async fn set_api_key(hub: State<'_, Shared>, value: String, expected: String
 pub async fn pool_snapshot(hub: State<'_, Shared>) -> Res {
     let h = hub.inner().clone();
     let (wb, qoder, trae, runtime) = blocking(move || {
+        h.wb.refresh_login_metadata();
         (
             h.wb.snapshot(),
             qoder_build_state(&h),
@@ -493,11 +497,25 @@ pub async fn launchd_install(hub: State<'_, Shared>, install: bool) -> Res {
 
 #[tauri::command]
 pub async fn wb_import_accounts(hub: State<'_, Shared>, source: String) -> Res {
-    let wb = hub.wb.clone();
-    blocking(move || wb.import_accounts(&source).map(|n| json!(n))).await?
+    if source == "local" || source == "local-ai" {
+        let variant = if source == "local-ai" { wb_switch_core::modules::variant::WbVariant::Ai } else { wb_switch_core::modules::variant::WbVariant::Cn };
+        let id = workbuddy::auth::import_current(&hub.wb, variant).await?;
+        let hub = hub.inner().clone();
+        let result_id = id.clone();
+        blocking(move || {
+            hub.restore_workbuddy_login(&id)?;
+            workbuddy::switch_bridge::refresh_local(&hub.wb)?;
+            let wb = hub.wb.clone();
+            tauri::async_runtime::spawn(async move { let _ = workbuddy::settings::refresh_accounts(wb, vec![id]).await; });
+            Ok(json!({"count":1,"accountId":result_id,"updated":true}))
+        }).await?
+    } else {
+        let wb = hub.wb.clone();
+        blocking(move || { let n = wb.import_accounts(&source)?; workbuddy::switch_bridge::refresh_local(&wb)?; Ok(json!({"count":n})) }).await?
+    }
 }
 #[tauri::command]
-pub async fn wb_oauth_start(variant: String, confirmed: bool) -> Res {
+pub async fn wb_oauth_start(hub: State<'_, Shared>, variant: String, confirmed: bool) -> Res {
     if !confirmed {
         return Err("请确认通过官方 OAuth 登录并保存账号到本机 Switch 账号库".into());
     }
@@ -506,7 +524,9 @@ pub async fn wb_oauth_start(variant: String, confirmed: bool) -> Res {
         "ai" | "intl" => wb_switch_core::modules::variant::WbVariant::Ai,
         _ => return Err("不支持的账号区域".into()),
     };
-    wb_switch_core::modules::oauth::oauth_start(variant)
+    let headers = workbuddy::auth::login_headers(&hub.wb, variant.as_str()).await;
+    let version = workbuddy::auth::installed_version(variant);
+    wb_switch_core::modules::oauth::oauth_start_with_context(variant, headers, version.as_deref())
         .await
         .map_err(|_| "无法发起官方登录，请检查网络后重试".into())
 }
@@ -518,12 +538,27 @@ pub async fn wb_oauth_poll(hub: State<'_, Shared>, login_id: String) -> Res {
     }
     if result["done"] == true {
         let id = result["result"]["id"].as_str().ok_or("授权结果缺少账号标识")?.to_string();
+        let h = hub.inner().clone();
+        let account_id = blocking(move || {
+            if h.wb.import_account_source("switch", Some(&id))? != 1 {
+                return Err("账号已保存至 Switch，但尚未接入账号池，请手动导入".to_owned());
+            }
+            let account_id = h.wb.store.lock().unwrap().accounts.iter()
+                .find(|a| a.source == "switch" && a.source_id == id)
+                .map(|a| a.id.clone()).ok_or("授权账号尚未接入账号池")?;
+            h.wb.refresh_login_metadata();
+            h.restore_workbuddy_login(&account_id)?;
+            Ok::<_, String>(account_id)
+        }).await??;
         let wb = hub.wb.clone();
-        let count = blocking(move || wb.import_account_source("switch", Some(&id))).await??;
-        if count != 1 {
-            return Err("账号已保存至 Switch，但尚未接入账号池，请手动导入".into());
-        }
-        return Ok(json!({"done":true,"added":true}));
+        let refresh_id = account_id.clone();
+        // Return the repaired login immediately; billing may be slow or offline.
+        // Its result is picked up by the normal pool refresh, and can mark a
+        // fresh explicit rejection again without misreporting OAuth as failed.
+        tauri::async_runtime::spawn(async move {
+            let _ = workbuddy::settings::refresh_accounts(wb, vec![refresh_id]).await;
+        });
+        return Ok(json!({"done":true,"added":true,"accountId":account_id}));
     }
     Ok(json!({"done":false}))
 }
@@ -590,6 +625,10 @@ pub async fn wb_refresh_statuses(hub: State<'_, Shared>) -> Res {
         workbuddy::switch_bridge::refresh_local(&wb).map(|_| json!({"ok":true}))
     })
     .await?
+}
+#[tauri::command]
+pub async fn wb_renew_token(hub: State<'_, Shared>, id: String) -> Res {
+    workbuddy::auth::renew_now(&hub.wb, &id).await
 }
 #[tauri::command]
 pub async fn wb_refresh_credits(hub: State<'_, Shared>, ids: Vec<String>) -> Res {
@@ -706,12 +745,14 @@ pub async fn qoder_state(hub: State<'_, Shared>) -> Res {
     blocking(move || qoder_build_state(&hub)).await
 }
 #[tauri::command]
-pub async fn qoder_capture(edition: String) -> Res {
-    blocking(move || match qoder::qcore::capture_current(&edition) {
-        Ok((acc, is_new)) => json!({"ok":true,"message":format!("{} {}", if is_new {"已采集新账号"} else {"已更新账号"}, acc.name)}),
-        Err(e) => json!({"ok":false,"message":e}),
-    })
-    .await
+pub async fn qoder_capture(hub: State<'_, Shared>, edition: String) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || {
+        let before = hub.credential_revisions(ProviderKind::Qoder);
+        let (acc, is_new) = qoder::qcore::capture_current(&edition)?;
+        hub.restore_changed_logins(ProviderKind::Qoder, &before)?;
+        Ok(json!({"ok":true,"message":format!("{} {}", if is_new {"已采集新账号"} else {"已更新账号"}, acc.name)}))
+    }).await?
 }
 #[tauri::command]
 pub async fn qoder_switch_account(id: String) -> Res {
@@ -746,8 +787,14 @@ pub fn qoder_claim_blocking(id: Option<String>) -> Value {
     }
 }
 #[tauri::command]
-pub async fn qoder_claim(id: Option<String>) -> Res {
-    blocking(move || qoder_claim_blocking(id)).await
+pub async fn qoder_claim(hub: State<'_, Shared>, id: Option<String>) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || {
+        let before = hub.credential_revisions(ProviderKind::Qoder);
+        let result = qoder_claim_blocking(id);
+        hub.restore_changed_logins(ProviderKind::Qoder, &before)?;
+        Ok(result)
+    }).await?
 }
 #[tauri::command]
 pub async fn qoder_credits(hub: State<'_, Shared>, id: String) -> Res {
@@ -767,6 +814,11 @@ pub async fn qoder_credits(hub: State<'_, Shared>, id: String) -> Res {
         let (s1, summary) = qc::credits_summary(acc);
         let (s2, camps) = qc::get_campaigns(acc);
         let (s3, usage) = qc::quota_info(acc);
+        if s1 == 200 || s2 == 200 || s3 == 200 {
+            if let Err(e) = hub.restore_login_observed(ProviderKind::Qoder, &id, Some(agentdock_core::provider::credential_revision(&acc.token))) {
+                return json!({"ok":false,"message":e});
+            }
+        }
         let usage = if s3 == 200 { usage.get("qoderUsage").cloned().unwrap_or(usage) } else { Value::Null };
         let data = json!({"summary": if s1 == 200 { summary } else { Value::Null },
             "campaigns": if s2 == 200 { camps.get("campaigns").cloned().unwrap_or(json!([])) } else { json!([]) },
@@ -855,16 +907,18 @@ pub async fn qoder_export_accounts() -> Res {
     .await
 }
 #[tauri::command]
-pub async fn qoder_import_accounts(path: String) -> Res {
+pub async fn qoder_import_accounts(hub: State<'_, Shared>, path: String) -> Res {
+    let hub = hub.inner().clone();
     let path = match path.trim().strip_prefix("~/") {
         Some(rest) => dirs::home_dir().unwrap_or_default().join(rest).to_string_lossy().into_owned(),
         None => path.trim().to_owned(),
     };
-    blocking(move || match qoder::qcore::import_accounts(&path) {
-        Ok(n) => json!({"ok":n > 0,"message":format!("成功导入/更新 {} 个账号", n)}),
-        Err(e) => json!({"ok":false,"message":e}),
-    })
-    .await
+    blocking(move || {
+        let before = hub.credential_revisions(ProviderKind::Qoder);
+        let n = qoder::qcore::import_accounts(&path)?;
+        hub.restore_changed_logins(ProviderKind::Qoder, &before)?;
+        Ok(json!({"ok":n > 0,"message":format!("成功导入/更新 {} 个账号", n)}))
+    }).await?
 }
 #[tauri::command]
 pub async fn qoder_list_sessions(edition: String, query: Option<String>, limit: Option<i64>) -> Res {
@@ -903,13 +957,15 @@ pub async fn qoder_login_begin(edition: String) -> Res {
     .await?
 }
 #[tauri::command]
-pub async fn qoder_login_poll(attempt: Value) -> Res {
+pub async fn qoder_login_poll(hub: State<'_, Shared>, attempt: Value) -> Res {
+    let hub = hub.inner().clone();
     blocking(move || {
         let att: qoder::qcore::LoginAttempt = serde_json::from_value(attempt).map_err(|e| e.to_string())?;
         match qoder::qcore::login_poll(&att)? {
             None => Ok(json!({"done":false})),
             Some(sess) => {
                 let (acc, is_new) = qoder::qcore::save_login_account(&att.edition, &sess)?;
+                hub.restore_login_observed(ProviderKind::Qoder, &acc.id(), Some(agentdock_core::provider::credential_revision(&acc.token)))?;
                 Ok(json!({"done":true,"ok":true,"isNew":is_new,"name":acc.name,"message":format!("{} {}", if is_new {"已添加账号"} else {"已更新账号"}, acc.name)}))
             }
         }
@@ -917,7 +973,8 @@ pub async fn qoder_login_poll(attempt: Value) -> Res {
     .await?
 }
 #[tauri::command]
-pub async fn qoder_refresh_account(id: String) -> Res {
+pub async fn qoder_refresh_account(hub: State<'_, Shared>, id: String) -> Res {
+    let hub = hub.inner().clone();
     blocking(move || {
         use qoder::qcore as qc;
         let mut accounts = qc::load_accounts();
@@ -930,6 +987,9 @@ pub async fn qoder_refresh_account(id: String) -> Res {
         if qc::refresh_account_token(&mut accounts[i]) {
             let acc = accounts[i].clone();
             qc::persist_and_writeback(&acc);
+            if let Err(e) = hub.restore_login_observed(ProviderKind::Qoder, &id, Some(agentdock_core::provider::credential_revision(&acc.token))) {
+                return json!({"ok":false,"message":e});
+            }
             json!({"ok":true,"expiresAt":acc.expiresAt,"message":format!("已刷新 {} 的登录凭证，有效期至 {}", acc.name, acc.expiresAt.get(..10).unwrap_or("未知"))})
         } else {
             json!({"ok":false,"message":"刷新失败：refreshToken 已失效或网络错误，请在客户端重新登录"})
@@ -1140,6 +1200,11 @@ pub async fn wb_unlink_session_group(group_id: String) -> Res {
 }
 
 // ── per-account JSON ──
+#[tauri::command]
+pub async fn account_json_save_batch(hub: State<'_, Shared>, accounts: Vec<crate::account_json::AccountRef>) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || crate::account_json::save_batch(&hub, &accounts)).await?
+}
 #[tauri::command]
 pub async fn account_json(hub: State<'_, Shared>, provider: String, id: String) -> Res {
     let hub = hub.inner().clone();

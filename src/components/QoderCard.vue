@@ -19,7 +19,8 @@ import {
   IconEmail,
 } from '@arco-design/web-vue/es/icon'
 import { t, fmtDate } from '../i18n'
-import { state, revealPhones } from '../store'
+import { state, revealPhones, runtimeOf } from '../store'
+import AccountAuthAlert from './AccountAuthAlert.vue'
 import { credits, updated, phoneText } from '../lib/account-display'
 import CardProxyRow from './CardProxyRow.vue'
 const props = defineProps<{ account: any; compact?: boolean }>()
@@ -34,6 +35,9 @@ const emit = defineEmits<{
   json: []
 }>()
 const a = computed(() => props.account)
+const rt = computed(() => runtimeOf('qoder', a.value.id))
+const expired = computed(() => Date.parse(a.value.expiresAt) <= state.now)
+const loginInvalid = computed(() => expired.value || a.value.hasToken === false || rt.value?.authFailed)
 const name = computed(() => a.value.note || a.value.name || a.value.email || a.value.phone || t('未命名', 'Unnamed'))
 const phone = computed(() => phoneText(a.value.phone, revealPhones.value))
 const usage = computed(() => a.value.credit?.usage)
@@ -61,7 +65,7 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
 const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
 </script>
 <template>
-  <article class="switch-card" :class="[{ 'current-card': a.isCurrent, 'compact-card': compact }, `tone-${color}`]">
+  <article class="switch-card" :class="[{ 'current-card': a.isCurrent, 'compact-card': compact, 'auth-invalid-card': loginInvalid }, `tone-${color}`]">
     <header class="switch-card-header">
       <div class="switch-avatar">{{ Array.from(String(name))[0] }}</div>
       <div class="switch-identity">
@@ -71,8 +75,9 @@ const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
         <p v-if="a.email" class="switch-contact" :title="a.email"><IconEmail /> {{ a.email }}</p>
         <div class="switch-badges">
           <span class="card-chip">{{ a.edition === 'cn' ? t('国内版', 'China') : t('国际版', 'Intl') }}</span>
-          <span v-if="a.isCurrent" class="card-chip ok">{{ t('当前登录', 'Signed in') }}</span>
-          <span class="card-chip" :class="expiry.cls || 'ok'">{{ expiry.text }}</span>
+          <span v-if="a.isCurrent" class="card-chip" :class="{ ok: !loginInvalid }">{{ loginInvalid ? t('客户端当前账号', 'Current in client') : t('当前登录', 'Signed in') }}</span>
+          <span v-if="loginInvalid" class="auth-invalid-chip">{{ expired ? t('登录已过期', 'Login expired') : t('需重新登录', 'Sign-in required') }}</span>
+          <span v-else class="card-chip" :class="expiry.cls || 'ok'">{{ expiry.text }}</span>
         </div>
       </div>
       <a-dropdown trigger="click"
@@ -89,12 +94,13 @@ const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
       >
       <span v-if="a.isCurrent" class="client-watermark">Q</span>
     </header>
+    <AccountAuthAlert v-if="loginInvalid" :expired="expired" :disabled="!(rt?.enabled ?? a.enabled)" />
     <section class="switch-credit-section">
       <div class="switch-credit-line">
         <IconStar /><strong>{{ known ? credits(total) : pending('qcredit') ? t('查询中', 'Loading') : '—' }}</strong
-        ><span>{{ t('剩余积分', 'credits left') }}</span
-        ><small :class="{ stale: a.credit?.stale }" :title="a.credit?.error"
-          ><IconClockCircle /> {{ a.credit?.stale ? t('旧数据 · ', 'Stale · ') : a.credit?.cached ? t('缓存 · ', 'Cached · ') : '' }}{{ a.credit?.updatedAt ? t(`${updated(a.credit.updatedAt)} 更新`, `Updated ${updated(a.credit.updatedAt)}`) : t('尚未查询', 'Not queried') }}</small
+        ><span>{{ loginInvalid ? t('缓存积分', 'Cached credits') : t('剩余积分', 'credits left') }}</span
+        ><small :class="{ stale: a.credit?.stale || loginInvalid }" :title="a.credit?.error"
+          ><IconClockCircle /> {{ a.credit?.stale || loginInvalid ? t('旧数据 · ', 'Stale · ') : a.credit?.cached ? t('缓存 · ', 'Cached · ') : '' }}{{ a.credit?.updatedAt ? t(`${updated(a.credit.updatedAt)} 更新`, `Updated ${updated(a.credit.updatedAt)}`) : t('尚未查询', 'Not queried') }}</small
         >
       </div>
       <p v-if="a.credit?.ok === false || a.credit?.stale" class="credit-error">

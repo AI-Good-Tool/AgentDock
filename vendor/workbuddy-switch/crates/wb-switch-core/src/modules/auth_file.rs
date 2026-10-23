@@ -285,7 +285,7 @@ pub fn import_from_auth_file(variant: WbVariant) -> Option<Value> {
     imported_account_from_root(read_auth_file(variant)?, variant)
 }
 
-fn imported_account_from_root(root: Value, variant: WbVariant) -> Option<Value> {
+pub fn imported_account_from_root(root: Value, variant: WbVariant) -> Option<Value> {
     let account_obj = root
         .get("account")
         .filter(|v| v.is_object())
