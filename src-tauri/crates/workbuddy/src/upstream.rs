@@ -130,6 +130,7 @@ pub async fn send(
         // Effort support comes from the selected model, never a substitute model.
         body.as_object_mut().unwrap().remove("reasoning_effort");
         anthropic::apply_effort(&input.effort_input, &mut body, &config);
+        details.request_summary["appliedEffort"] = body["reasoning_effort"].clone();
     }
     if input.client_profile.as_deref() == Some("zcode") {
         // Local provenance only; never disguise or strip a client's instructions.

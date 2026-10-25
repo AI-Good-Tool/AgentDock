@@ -47,16 +47,19 @@ pub fn tool_call_id() -> String {
 }
 
 /// Incremental SSE frame splitter with hard size limits. Yields the joined
-/// `data:` payload of each complete frame and its optional `event:` name.
+/// `data:` payload of each complete frame and its optional `event:` name and
+/// `id:` (for resuming with `Last-Event-ID`).
 #[derive(Default)]
 pub struct SseFrames {
     pending: Vec<u8>,
     frame: Vec<u8>,
     event: Option<String>,
+    id: Option<String>,
     retained: usize,
 }
 pub struct Frame {
     pub event: Option<String>,
+    pub id: Option<String>,
     pub data: Vec<u8>,
 }
 impl SseFrames {
@@ -87,14 +90,21 @@ impl SseFrames {
                 self.event = Some(String::from_utf8_lossy(name).trim().to_owned());
                 continue;
             }
+            if let Some(id) = line.strip_prefix(b"id:") {
+                let id = String::from_utf8_lossy(id).trim().to_owned();
+                self.id = (!id.is_empty() && id.len() <= 256 && !id.contains('\0')).then_some(id);
+                continue;
+            }
             if !line.is_empty() || self.frame.is_empty() {
                 if line.is_empty() {
                     self.event = None;
+                    self.id = None;
                 }
                 continue;
             }
             out.push(Frame {
                 event: self.event.take(),
+                id: self.id.take(),
                 data: std::mem::take(&mut self.frame),
             });
         }
@@ -107,6 +117,7 @@ impl SseFrames {
         }
         Some(Frame {
             event: self.event.take(),
+            id: self.id.take(),
             data: std::mem::take(&mut self.frame),
         })
     }
@@ -232,6 +243,9 @@ mod tests {
         assert_eq!(frames[0].data, b"{\"a\":1}");
         assert_eq!(frames[1].event, None);
         assert_eq!(frames[1].data, b"[DONE]");
+        let frames = p.feed(b"id: 41\nevent: plan_item\ndata: {}\n\nid: 42\n\ndata: {}\n\n").unwrap();
+        assert_eq!(frames[0].id.as_deref(), Some("41"));
+        assert_eq!(frames[1].id, None, "an id-only frame does not leak into the next event");
         assert!(SseFrames::default()
             .feed(&vec![b'x'; MAX_EVENT + 1])
             .is_err());

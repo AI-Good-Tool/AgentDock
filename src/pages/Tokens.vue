@@ -8,7 +8,7 @@ import RangePicker from '../components/RangePicker.vue'
 import BarChart from '../components/BarChart.vue'
 import { call } from '../api'
 import { t, fmtShort, duration, zoneOffset, isZh } from '../i18n'
-import { state, busy, act, providerLabel, regionLabel, PROVIDERS } from '../store'
+import { state, busy, act, providerLabel, regionLabel, keyName, PROVIDERS } from '../store'
 import { rangeMillis, daysOf, inRange, type RangeKey } from '../lib/range'
 import { protocolName, outcomeName } from '../lib/request-log'
 
@@ -37,19 +37,20 @@ function tok(n: unknown) {
 // ── Proxy (unified ledger) ──
 const provider = ref('all')
 const region = ref('all')
-const range = ref<RangeKey>('30d')
+const apiKey = ref('all')
+const range = ref<RangeKey>('today')
 const custom = ref<[string, string] | null>(null)
-const dist = ref<'models' | 'accounts' | 'providers' | 'regions' | 'realModels'>('models')
+const dist = ref<'models' | 'accounts' | 'providers' | 'regions' | 'realModels' | 'apiKeys'>('models')
 const stats = ref<any>(null)
 const page = ref(1)
 async function loadProxy() {
   const { from, to } = rangeMillis(range.value, custom.value)
   stats.value = await call('proxy_statistics', {
-    filter: { provider: provider.value, region: region.value, from, to },
+    filter: { provider: provider.value, region: region.value, keyId: apiKey.value, from, to },
     offsetMinutes: zoneOffset(),
   }).catch(() => stats.value)
 }
-watch([provider, region, range, custom], () => {
+watch([provider, region, apiKey, range, custom], () => {
   page.value = 1
   loadProxy()
 })
@@ -70,7 +71,10 @@ const chart = computed(() => {
 })
 const distRows = computed(() => (stats.value?.[dist.value] ?? []).slice(0, 12))
 const distMax = computed(() => Math.max(1, ...distRows.value.map((r: any) => r.total || 0)))
-const distLabel = (key: string) => {
+const distLabel = (row: any) => {
+  const key: string = row.key
+  if (dist.value === 'apiKeys')
+    return keyName({ keyId: key, keyHint: row.keyHint, keyAlias: row.keyAlias })
   if (dist.value === 'providers') return providerLabel(key)
   if (dist.value === 'regions') {
     const [p, r] = key.split(':')
@@ -79,10 +83,13 @@ const distLabel = (key: string) => {
   return key
 }
 const requests = computed(() => stats.value?.requests ?? [])
+const keyOptions = computed(() =>
+  (state.app?.apiKeys ?? []).map((k) => ({ value: k.id, label: keyName({ keyId: k.id }) }))
+)
 
 // ── Qoder local estimate ──
 const qEdition = ref<'cn' | 'intl'>('cn')
-const qRange = ref<RangeKey>('30d')
+const qRange = ref<RangeKey>('today')
 const qCustom = ref<[string, string] | null>(null)
 const qDist = ref<'projects' | 'models'>('projects')
 const qstats = ref<any>(null)
@@ -181,6 +188,10 @@ const qRequests = computed(() =>
         <a-option value="cn">{{ t('国内版', 'China') }}</a-option>
         <a-option value="intl">{{ t('国际版', 'International') }}</a-option>
       </a-select>
+      <a-select v-model="apiKey" style="width: 150px">
+        <a-option value="all">{{ t('全部 API Key', 'All API keys') }}</a-option>
+        <a-option v-for="k in keyOptions" :key="k.value" :value="k.value">{{ k.label }}</a-option>
+      </a-select>
       <RangePicker v-model="range" v-model:custom="custom" />
     </div>
     <div class="metric-row">
@@ -236,10 +247,11 @@ const qRequests = computed(() =>
           <a-radio value="providers">{{ t('按端', 'By provider') }}</a-radio>
           <a-radio value="regions">{{ t('按端/地区', 'By provider/region') }}</a-radio>
           <a-radio value="accounts">{{ t('按账号', 'By account') }}</a-radio>
+          <a-radio value="apiKeys">{{ t('按 API Key', 'By API key') }}</a-radio>
         </a-radio-group>
       </div>
       <div v-for="r in distRows" :key="r.key" class="dist-row">
-        <span :title="r.key">{{ distLabel(r.key) }}</span>
+        <span :title="r.key">{{ distLabel(r) }}</span>
         <div class="track"><i :style="{ width: `${((r.total || 0) / distMax) * 100}%` }"></i></div>
         <b>{{ tok(r.total) }} · {{ r.records }} {{ t('次', 'req') }}</b>
       </div>
@@ -274,7 +286,8 @@ const qRequests = computed(() =>
             ><template #cell="{ record }"
               ><div class="cell-2">
                 {{ providerLabel(record.provider) }} · {{ regionLabel(record.region)
-                }}<small>{{ record.accountName }}</small>
+                }}<small>{{ record.accountName
+                }}<template v-if="record.keyId"> · Key {{ keyName(record) }}</template></small>
               </div></template
             ></a-table-column
           >

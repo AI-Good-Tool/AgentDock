@@ -2,6 +2,7 @@
 //! providers and regions into one public route; same-catalog name collisions
 //! stay apart. Aliases and explicit upstream lists come from settings.
 use crate::settings::{RouteOverride, Settings};
+use agentdock_core::anthropic::{closest_effort, EFFORT_ORDER};
 use agentdock_core::provider::{group_key, ProviderKind, UpstreamModel};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -23,8 +24,22 @@ pub struct Route {
     pub configured: bool,
     pub custom: bool,
     pub disabled: bool,
+    /// Routes merged into this one (`RouteOverride::merge_into`).
+    pub linked: Vec<LinkedRoute>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedRoute {
+    pub route_id: String,
+    pub alias: String,
+    /// Keys of the upstreams it contributed.
+    pub targets: Vec<String>,
 }
 impl Route {
+    /// Names that select this route: its alias and those of merged routes.
+    fn answers_to(&self, name: &str) -> bool {
+        self.alias == name || self.linked.iter().any(|l| l.alias == name)
+    }
     pub fn available(&self) -> bool {
         !self.disabled && !self.targets.is_empty()
     }
@@ -36,6 +51,23 @@ impl Route {
     }
     pub fn scoped(&self, scope: &Scope) -> Vec<&UpstreamModel> {
         self.targets.iter().filter(|t| scope.allows(t)).collect()
+    }
+    /// Levels a client may offer for this route, in Codex's model-catalog
+    /// shape. Any of them is accepted: each request is mapped to the closest
+    /// level of the account that serves it.
+    pub fn reasoning_levels(&self, scope: &Scope) -> (Value, Value) {
+        let targets = self.scoped(scope);
+        let levels: Vec<&str> = EFFORT_ORDER
+            .into_iter()
+            .filter(|e| targets.iter().any(|t| t.efforts.iter().any(|x| x == e)))
+            .collect();
+        let default = targets
+            .iter()
+            .filter_map(|t| t.default_effort.as_deref())
+            .find(|e| levels.contains(e))
+            .or_else(|| closest_effort("high", &levels));
+        let described = levels.iter().map(|e| json!({"effort":e,"description":effort_label(e)})).collect();
+        (Value::Array(described), json!(default))
     }
     /// Capabilities shared by every in-scope upstream (never guess support).
     pub fn view(&self, scope: &Scope) -> Value {
@@ -75,7 +107,20 @@ impl Route {
             "targets": targets.iter().map(|t| target_view(t)).collect::<Vec<_>>(),
             "allTargets": self.all_targets.iter().map(target_view).collect::<Vec<_>>(),
             "missing": self.missing,
+            "linked": self.linked,
         })
+    }
+}
+fn effort_label(effort: &str) -> &'static str {
+    match effort {
+        "none" => "关闭思考",
+        "minimal" => "最少推理",
+        "low" => "轻量推理，响应更快",
+        "medium" => "均衡推理",
+        "high" => "增强推理",
+        "xhigh" => "深度推理",
+        "max" => "最大推理",
+        _ => "极限推理",
     }
 }
 pub fn target_view(t: &UpstreamModel) -> Value {
@@ -182,6 +227,31 @@ pub fn build(models: &[UpstreamModel], settings: &Settings) -> Vec<Route> {
             .unwrap_or_else(|| id.clone());
         routes.push(route(id.clone(), default_alias, members, Some(&settings.routes), &by_key, &in_scope));
     }
+    // Merged routes join their destination with whatever upstreams they have
+    // now. One hop only: a destination that is itself merged is ignored. A
+    // disabled source stays on its own so its upstreams remain unscheduled.
+    for (src, o) in &settings.routes {
+        let Some(dst) = o.merge_into.as_deref() else { continue };
+        if dst == src || settings.routes.get(dst).is_some_and(|d| d.merge_into.is_some())
+            || !routes.iter().any(|r| r.route_id == dst) {
+            continue;
+        }
+        let Some(at) = routes.iter().position(|r| r.route_id == *src && !r.disabled) else { continue };
+        let source = routes.remove(at);
+        let dest = routes.iter_mut().find(|r| r.route_id == dst).unwrap();
+        let mut keys = vec![];
+        for t in source.all_targets {
+            keys.push(t.key());
+            if !dest.all_targets.iter().any(|x| x.key() == t.key()) {
+                if in_scope(&t) {
+                    dest.targets.push(t.clone());
+                }
+                dest.all_targets.push(t);
+            }
+        }
+        dest.missing.extend(source.missing);
+        dest.linked.push(LinkedRoute { route_id: source.route_id, alias: source.alias, targets: keys });
+    }
     // Disambiguate colliding default aliases; configured aliases are validated on save.
     let snapshot: Vec<(String, String)> = routes
         .iter()
@@ -239,6 +309,7 @@ fn route(
         configured: o.is_some(),
         custom: o.is_some_and(|o| o.custom),
         disabled: o.is_some_and(|o| o.disabled),
+        linked: vec![],
         route_id: id,
     }
 }
@@ -264,7 +335,7 @@ pub fn resolve<'a>(routes: &'a [Route], requested: &str) -> Result<&'a Route, St
         return Err("model 必须为非空字符串".into());
     }
     let live = |r: &&Route| !r.disabled;
-    if let Some(r) = routes.iter().filter(live).find(|r| r.alias == requested) {
+    if let Some(r) = routes.iter().filter(live).find(|r| r.answers_to(requested)) {
         return Ok(r);
     }
     let by_id: Vec<&Route> = routes
@@ -286,12 +357,15 @@ pub fn resolve<'a>(routes: &'a [Route], requested: &str) -> Result<&'a Route, St
     let by_key: Vec<&Route> = routes
         .iter()
         .filter(live)
-        .filter(|r| group_key(&r.alias) == key || r.route_id == key)
+        .filter(|r| {
+            group_key(&r.alias) == key || r.route_id == key
+                || r.linked.iter().any(|l| group_key(&l.alias) == key || l.route_id == key)
+        })
         .collect();
     if by_key.len() == 1 {
         return Ok(by_key[0]);
     }
-    if routes.iter().any(|r| r.disabled && r.alias == requested) {
+    if routes.iter().any(|r| r.disabled && r.answers_to(requested)) {
         return Err("此模型已在模型目录中停用".into());
     }
     Err("模型或别名不存在（ID 有歧义时请使用别名），请先同步模型目录".into())
@@ -323,6 +397,20 @@ pub fn validate_override(
             return Err("上游模型重复".into());
         }
     }
+    if let Some(dst) = &o.merge_into {
+        if dst == route_id {
+            return Err("不能合并到自身".into());
+        }
+        if !build(models, settings).iter().any(|r| r.route_id == *dst) {
+            return Err("要合并到的模型不存在，请先同步模型目录".into());
+        }
+        if settings.routes.get(dst).is_some_and(|d| d.merge_into.is_some()) {
+            return Err("目标模型已合并到其他模型，请直接合并到最终模型".into());
+        }
+        if settings.routes.iter().any(|(id, other)| id != route_id && other.merge_into.as_deref() == Some(route_id)) {
+            return Err("已有其他模型合并到此模型，请先取消那些关联".into());
+        }
+    }
     let mut next = settings.clone();
     // A target can belong to one explicit route only.
     if let Some(targets) = &o.targets {
@@ -340,8 +428,11 @@ pub fn validate_override(
     let routes = build(models, &next);
     let mut used = HashSet::new();
     for r in &routes {
-        if !used.insert(r.alias.clone()) {
-            return Err(format!("模型别名重复：{}", r.alias));
+        let linked = r.linked.iter().map(|l| &l.alias).filter(|a| **a != r.alias);
+        for alias in std::iter::once(&r.alias).chain(linked) {
+            if !used.insert(alias.clone()) {
+                return Err(format!("模型别名重复：{alias}"));
+            }
         }
     }
     if !alias.is_empty()
@@ -408,14 +499,14 @@ pub mod tests {
         let models = catalog();
         let mut s = Settings::default();
         let glm = resolve(&build(&models, &s), "GLM-5.3-Flash").unwrap().route_id.clone();
-        let o = RouteOverride { alias: "my-glm".into(), targets: None, disabled: false, custom: false };
+        let o = RouteOverride { alias: "my-glm".into(), ..RouteOverride::default() };
         validate_override(&models, &s, &glm, &o).unwrap();
         s.routes.insert(glm.clone(), o);
         let routes = build(&models, &s);
         assert_eq!(resolve(&routes, "my-glm").unwrap().targets.len(), 3);
         assert!(resolve(&routes, "GLM-5.3-Flash").is_err() || resolve(&routes, "GLM-5.3-Flash").unwrap().alias == "my-glm");
         // Explicit split: Qoder GLM becomes its own custom route.
-        let custom = RouteOverride { alias: "qoder-glm".into(), targets: Some(vec!["qoder:cn:gfmodel".into()]), disabled: false, custom: true };
+        let custom = RouteOverride { alias: "qoder-glm".into(), targets: Some(vec!["qoder:cn:gfmodel".into()]), custom: true, ..RouteOverride::default() };
         validate_override(&models, &s, "custom:1", &custom).unwrap();
         s.routes.insert("custom:1".into(), custom);
         let routes = build(&models, &s);
@@ -437,6 +528,54 @@ pub mod tests {
         assert_eq!(scope.key(), "qoder");
     }
     #[test]
+    fn merged_route_pools_both_upstream_sets_and_keeps_old_names() {
+        use ProviderKind::*;
+        let models = vec![
+            model(Workbuddy, "cn", "deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
+            model(Trae, "cn", "deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
+            model(Qoder, "cn", "dfmodel", "DeepSeek-Flash"),
+            model(Qoder, "intl", "dfmodel", "DeepSeek-Flash"),
+            model(Workbuddy, "cn", "glm", "GLM"),
+        ];
+        let mut s = Settings::default();
+        let routes = build(&models, &s);
+        let v41 = resolve(&routes, "DeepSeek-V4.1-Flash").unwrap().route_id.clone();
+        let flash = resolve(&routes, "DeepSeek-Flash").unwrap().route_id.clone();
+        let glm = resolve(&routes, "GLM").unwrap().route_id.clone();
+        let link = |to: &str| RouteOverride { merge_into: Some(to.into()), ..RouteOverride::default() };
+        validate_override(&models, &s, &flash, &link(&v41)).unwrap();
+        s.routes.insert(flash.clone(), link(&v41));
+        let routes = build(&models, &s);
+        assert_eq!(routes.len(), 2, "the merged route is no longer listed on its own");
+        let merged = resolve(&routes, "DeepSeek-V4.1-Flash").unwrap();
+        assert_eq!(merged.targets.len(), 4);
+        assert_eq!(merged.linked.len(), 1);
+        assert_eq!(merged.linked[0].alias, "DeepSeek-Flash");
+        assert_eq!(merged.linked[0].targets, ["qoder:cn:dfmodel", "qoder:intl:dfmodel"]);
+        for name in ["DeepSeek-Flash", "dfmodel", "deepseek flash"] {
+            assert_eq!(resolve(&routes, name).unwrap().route_id, v41, "{name}");
+        }
+        // Scope still applies per upstream; the link itself is kept.
+        s.providers.get_mut(&Qoder).unwrap().regions = vec!["cn".into()];
+        let merged = build(&models, &s).into_iter().find(|r| r.route_id == v41).unwrap();
+        assert_eq!((merged.all_targets.len(), merged.targets.len()), (4, 3));
+        // One hop only, never into itself.
+        assert!(validate_override(&models, &s, &glm, &link(&glm)).is_err());
+        assert!(validate_override(&models, &s, &glm, &link(&flash)).is_err());
+        assert!(validate_override(&models, &s, &v41, &link(&glm)).is_err());
+        assert!(validate_override(&models, &s, &glm, &link("missing")).is_err());
+        validate_override(&models, &s, &glm, &link(&v41)).unwrap();
+        // A disabled source is not merged, so its upstreams stay unscheduled.
+        s.routes.get_mut(&flash).unwrap().disabled = true;
+        let routes = build(&models, &s);
+        assert_eq!(resolve(&routes, "DeepSeek-V4.1-Flash").unwrap().targets.len(), 2);
+        assert_eq!(resolve(&routes, "DeepSeek-Flash").unwrap_err(), "此模型已在模型目录中停用");
+        s.routes.get_mut(&flash).unwrap().disabled = false;
+        // A destination that disappears leaves the source on its own.
+        s.routes.get_mut(&flash).unwrap().merge_into = Some("gone".into());
+        assert_eq!(resolve(&build(&models, &s), "DeepSeek-Flash").unwrap().route_id, flash);
+    }
+    #[test]
     fn shared_capabilities_use_intersection() {
         let mut a = model(ProviderKind::Workbuddy, "cn", "m", "Shared");
         a.efforts = vec!["low".into(), "high".into()];
@@ -451,5 +590,20 @@ pub mod tests {
         assert_eq!(v["supportsImages"], false);
         assert_eq!(v["supportsTools"], true);
         assert_eq!(v["contextWindow"], 100000);
+        // Clients may offer every level of any account, ordered by depth.
+        let (levels, default) = routes[0].reasoning_levels(&Scope::default());
+        let names: Vec<&Value> = levels.as_array().unwrap().iter().map(|l| &l["effort"]).collect();
+        assert_eq!(names, [&json!("low"), &json!("high")]);
+        assert_eq!(default, "high");
+        let mut c = model(ProviderKind::Qoder, "cn", "c", "Other");
+        c.efforts = vec!["max".into(), "low".into(), "none".into()];
+        c.default_effort = Some("max".into());
+        let routes = build(&[c, model(ProviderKind::Qoder, "cn", "plain", "Plain")], &Settings::default());
+        let (levels, default) = resolve(&routes, "Other").unwrap().reasoning_levels(&Scope::default());
+        let names: Vec<&Value> = levels.as_array().unwrap().iter().map(|l| &l["effort"]).collect();
+        assert_eq!(names, [&json!("none"), &json!("low"), &json!("max")]);
+        assert_eq!(default, "max");
+        let (levels, default) = resolve(&routes, "Plain").unwrap().reasoning_levels(&Scope::default());
+        assert_eq!((levels, default), (json!([]), Value::Null));
     }
 }

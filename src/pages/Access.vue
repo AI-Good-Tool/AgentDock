@@ -1,14 +1,13 @@
 <script setup lang="ts">
 import ProviderMark from "../components/ProviderMark.vue"
 import { computed, ref, watch } from 'vue'
-import { Modal, Message } from '@arco-design/web-vue'
 import { IconCopy } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
-import ApiKeyField from '../components/workbuddy/ApiKeyField.vue'
+import ApiKeysPanel from '../components/ApiKeysPanel.vue'
 import RuntimeSettings from '../components/workbuddy/RuntimeSettings.vue'
 import { call, type Settings, type ProviderKey } from '../api'
 import { t } from '../i18n'
-import { state, act, busy, saveSettings, copy, refreshApp, refreshPool, PROVIDERS, providerLabel, regionLabel } from '../store'
+import { state, act, busy, saveSettings, copy, refreshPool, PROVIDERS, providerLabel, regionLabel } from '../store'
 
 const draft = ref<Settings | null>(null)
 const dirty = ref(false)
@@ -31,7 +30,7 @@ const strategies = computed(() => [
 function save() {
   const d = draft.value!
   return saveSettings(
-    { port: d.port, strategy: d.strategy, providers: d.providers, pinned: d.pinned, rejectBrowserOrigin: d.rejectBrowserOrigin, autoStart: d.autoStart },
+    { port: d.port, strategy: d.strategy, providers: d.providers, pinned: d.pinned, rejectBrowserOrigin: d.rejectBrowserOrigin, autoStart: d.autoStart, recentImages: d.recentImages ?? null },
     t('接入设置已保存，对新请求立即生效', 'Saved; applies to new requests')
   ).then(() => (dirty.value = false))
 }
@@ -56,14 +55,6 @@ function setPin(scope: string, value: string) {
   else delete pinned[scope]
   draft.value!.pinned = pinned
   touch()
-}
-// API key
-function saveKey(value: string, expected: string) {
-  Modal.confirm({
-    title: t('确认更换本地 API Key', 'Replace the local API key?'),
-    content: t('保存后旧 Key 立即无法发起新请求，请同步更新客户端配置；已开始的请求不受影响。不会修改任何官方账号令牌。', 'The old key stops working for new requests immediately; update your clients. In-flight requests continue. Official tokens are not touched.'),
-    onOk: () => act('api-key', () => call('set_api_key', { value, expected }), t('本地 API Key 已更新，请同步修改客户端配置', 'Local API key updated; update your clients'), [refreshApp]),
-  })
 }
 // Client configuration
 const client = ref<'claude' | 'codex' | 'openai' | 'zcode'>('claude')
@@ -117,7 +108,7 @@ function saveQoder() {
           <div class="control"><a-input-number v-model="draft.port" :min="1024" :max="65535" :disabled="state.app?.running" style="width: 140px" @change="touch" /></div>
         </div>
         <div class="field-row">
-          <div><b>{{ t('调度策略', 'Scheduling') }}</b><small>{{ t('同一模型在所有提供它的端、地区和账号之间统一调度', 'One pool per model across every provider, region and account that offers it') }}</small></div>
+          <div><b>{{ t('默认调度策略', 'Default scheduling') }}</b><small>{{ t('同一模型在所有提供它的端、地区和账号之间统一调度；API Key 可单独设置', 'One pool per model across every provider, region and account that offers it; each API key may override it') }}</small></div>
           <div class="control" style="flex-direction: column; align-items: stretch">
             <a-radio-group v-model="draft.strategy" direction="vertical" @change="touch">
               <a-radio v-for="s in strategies" :key="s.value" :value="s.value"><b>{{ s.label }}</b> <span class="muted" style="font-size: 12px">· {{ s.desc }}</span></a-radio>
@@ -129,12 +120,19 @@ function saveQoder() {
           <div class="control"><a-switch v-model="draft.rejectBrowserOrigin" @change="touch" /></div>
         </div>
         <div class="field-row">
+          <div><b>{{ t('历史图片只转发最近几张', 'Forward only recent images') }}</b><small>{{ t('客户端每轮都会重发全部历史，截图越积越多；开启后更早的图片换成一句说明再转发给上游，本轮新图片始终保留', 'Clients resend the whole history each turn; older images are replaced by a short note upstream. Images in the current turn are always kept') }}</small></div>
+          <div class="control">
+            <a-switch :model-value="draft.recentImages != null" @change="(v) => { draft!.recentImages = v ? 6 : null; touch() }" />
+            <a-input-number v-if="draft.recentImages != null" v-model="draft.recentImages" :min="1" :max="100" size="small" style="width: 90px" @change="touch"><template #suffix>{{ t('张', '') }}</template></a-input-number>
+          </div>
+        </div>
+        <div class="field-row">
           <div><b>{{ t('打开应用时自动启动服务', 'Start with the app') }}</b></div>
           <div class="control"><a-switch v-model="draft.autoStart" @change="touch" /></div>
         </div>
       </section>
       <section class="box">
-        <div class="box-head"><div><h2>{{ t('参与反代的端与地区', 'Providers and regions') }}</h2><p>{{ t('关闭后该端/地区的账号不再接收新请求；模型目录仍可见。', 'Disabled providers/regions take no new requests; models stay visible.') }}</p></div></div>
+        <div class="box-head"><div><h2>{{ t('参与反代的端与地区', 'Providers and regions') }}</h2><p>{{ t('关闭后该端/地区的账号不再接收新请求；模型目录仍可见。API Key 只能在此范围内进一步收窄。', 'Disabled providers/regions take no new requests; models stay visible. API keys can only narrow this further.') }}</p></div></div>
         <div v-for="p in PROVIDERS" :key="p.key" class="field-row">
           <div><b><ProviderMark :provider="p.key" style="margin-right: 8px" />{{ p.label }}</b></div>
           <div class="control">
@@ -186,8 +184,8 @@ function saveQoder() {
     </div>
     <div>
       <section class="box">
-        <div class="box-head"><div><h2>{{ t('本地 API Key', 'Local API key') }}</h2><p>{{ t('三端共用一个本地密钥，与任何官方令牌无关。', 'One local key for all providers, independent of official tokens.') }}</p></div></div>
-        <ApiKeyField :value="state.app?.apiKey ?? ''" :saving="busy('api-key')" @copy="copy" @save="saveKey" />
+        <div class="box-head"><div><h2>{{ t('本地 API Key', 'Local API keys') }}</h2><p>{{ t('可创建多个本地密钥分给不同客户端，与任何官方令牌无关。', 'Create several local keys for different clients, independent of official tokens.') }}</p></div></div>
+        <ApiKeysPanel :strategies="strategies" />
       </section>
       <section class="box">
         <div class="box-head"><div><h2>{{ t('接入地址', 'Endpoints') }}</h2><p>{{ t('路径前缀可限定端和地区，模型列表随之过滤。', 'Path prefixes restrict providers and regions; /models follows.') }}</p></div></div>

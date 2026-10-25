@@ -190,17 +190,18 @@ pub fn router(hub: Shared) -> Router {
         .with_state(hub)
 }
 
-fn authorized(headers: &HeaderMap, key: &str) -> bool {
+/// The local key a request presents (Bearer or x-api-key) and the settings it runs under.
+pub struct Caller {
+    pub key: crate::api_key::ApiKey,
+    pub settings: crate::settings::Settings,
+}
+fn caller(hub: &Shared, headers: &HeaderMap) -> Option<crate::api_key::ApiKey> {
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|v| v == key);
-    let api_key = headers
-        .get("x-api-key")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v == key);
-    bearer || api_key
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let api_key = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+    [bearer, api_key].into_iter().flatten().find_map(|v| hub.keys.find(v))
 }
 
 async fn dispatch(State(hub): State<Shared>, OriginalUri(uri): OriginalUri, request: Request) -> Response {
@@ -210,10 +211,14 @@ async fn dispatch(State(hub): State<Shared>, OriginalUri(uri): OriginalUri, requ
     let method = request.method().clone();
     let headers = request.headers().clone();
     // Authenticate before reading any body.
-    if !authorized(&headers, &hub.api_key()) {
+    let Some(key) = caller(&hub, &headers) else {
         return error_for(ep.kind, 401, "本地 API Key 不正确", "invalid_api_key");
+    };
+    if !key.enabled {
+        return error_for(ep.kind, 401, "此本地 API Key 已停用", "api_key_disabled");
     }
-    if hub.settings().reject_browser_origin
+    let caller = Caller { settings: key.apply(hub.settings()), key };
+    if caller.settings.reject_browser_origin
         && headers
             .get("origin")
             .and_then(|v| v.to_str().ok())
@@ -222,8 +227,8 @@ async fn dispatch(State(hub): State<Shared>, OriginalUri(uri): OriginalUri, requ
         return error_for(ep.kind, 403, "不接受网页跨域请求（可在接入设置中允许）", "origin_rejected");
     }
     match ep.kind {
-        Kind::Models if method == Method::GET => return models(&hub, &ep),
-        Kind::ModelDetail if method == Method::GET => return model_detail(&hub, &ep),
+        Kind::Models if method == Method::GET => return models(&hub, &caller, &ep),
+        Kind::ModelDetail if method == Method::GET => return model_detail(&hub, &caller, &ep),
         Kind::Models | Kind::ModelDetail => return openai_error(405, "请求方法不支持", "method_not_allowed"),
         _ if method != Method::POST => return openai_error(405, "请求方法不支持", "method_not_allowed"),
         _ => {}
@@ -239,7 +244,7 @@ async fn dispatch(State(hub): State<Shared>, OriginalUri(uri): OriginalUri, requ
                 .and_then(|v| v.parse::<u64>().ok()));
             details.request_summary["bodyLimitBytes"] = json!(agentdock_core::MAX_REQUEST_BODY_BYTES);
             details.local_error("request_body", agentdock_core::REQUEST_TOO_LARGE_MESSAGE);
-            reject(&hub, &ep, "unknown", 413, "request_too_large", details);
+            reject(&hub, &caller, &ep, "unknown", 413, "request_too_large", details);
             return error_for(ep.kind, 413, agentdock_core::REQUEST_TOO_LARGE_MESSAGE, "request_too_large");
         }
     };
@@ -248,13 +253,13 @@ async fn dispatch(State(hub): State<Shared>, OriginalUri(uri): OriginalUri, requ
         Err(_) => return error_for(ep.kind, 400, "请求体不是有效 JSON", "invalid_request"),
     };
     if ep.kind == Kind::CountTokens {
-        return count_tokens(&hub, &ep, input);
+        return count_tokens(&hub, &caller, &ep, input);
     }
-    execute(hub, ep, path, headers, input).await
+    execute(hub, caller, ep, path, headers, input).await
 }
 
 /// Record a request that never reached an account.
-fn reject(hub: &Shared, ep: &Endpoint, model: &str, status: u16, outcome: &str, details: RequestDetails) {
+fn reject(hub: &Shared, caller: &Caller, ep: &Endpoint, model: &str, status: u16, outcome: &str, details: RequestDetails) {
     let alias = details.request_summary["modelAlias"].as_str().unwrap_or(model).to_owned();
     hub.logs.push(RequestLog {
         id: uuid::Uuid::new_v4().simple().to_string(),
@@ -268,33 +273,33 @@ fn reject(hub: &Shared, ep: &Endpoint, model: &str, status: u16, outcome: &str, 
         status,
         outcome: outcome.into(),
         message: details.error["message"].as_str().unwrap_or("").into(),
-        strategy: format!("{:?}", hub.settings().strategy),
+        strategy: format!("{:?}", caller.settings.strategy),
         details: serde_json::to_value(&details).unwrap_or_default(),
         ..RequestLog::default()
-    });
+    }.with_key(&caller.key));
 }
 
-fn models(hub: &Shared, ep: &Endpoint) -> Response {
-    let settings = hub.settings();
-    let routes = hub.routes(&settings);
+fn models(hub: &Shared, caller: &Caller, ep: &Endpoint) -> Response {
+    let routes = hub.routes(&caller.settings);
     let data: Vec<Value> = routes
         .iter()
         .filter(|r| !r.disabled && !r.scoped(&ep.scope).is_empty())
         .map(|r| {
             let v = r.view(&ep.scope);
             let first = r.scoped(&ep.scope)[0];
+            let (levels, default_level) = r.reasoning_levels(&ep.scope);
             json!({"id":r.alias,"object":"model","type":"model","created":0,"created_at":"1970-01-01T00:00:00Z",
                 "owned_by":"agentdock","name":r.alias,"display_name":r.alias,"real_model":first.id,
                 "providers":v["providers"],"regions":v["regions"],"upstreams":v["targets"],
-                "supports_images":v["supportsImages"],"supports_tools":v["supportsTools"],"context_window":v["contextWindow"]})
+                "supports_images":v["supportsImages"],"supports_tools":v["supportsTools"],"context_window":v["contextWindow"],
+                "supported_reasoning_levels":levels,"default_reasoning_level":default_level})
         })
         .collect();
     Json(json!({"object":"list","first_id":data.first().map(|m|&m["id"]),"last_id":data.last().map(|m|&m["id"]),"has_more":false,"data":data})).into_response()
 }
 
-fn model_detail(hub: &Shared, ep: &Endpoint) -> Response {
-    let settings = hub.settings();
-    let routes = hub.routes(&settings);
+fn model_detail(hub: &Shared, caller: &Caller, ep: &Endpoint) -> Response {
+    let routes = hub.routes(&caller.settings);
     let requested = ep.model.as_deref().unwrap_or("");
     let Ok(route) = catalog::resolve(&routes, requested) else {
         return anthropic_error(404, "模型不存在");
@@ -310,7 +315,7 @@ fn model_detail(hub: &Shared, ep: &Endpoint) -> Response {
     .into_response()
 }
 
-fn count_tokens(hub: &Shared, ep: &Endpoint, mut input: Value) -> Response {
+fn count_tokens(hub: &Shared, caller: &Caller, ep: &Endpoint, mut input: Value) -> Response {
     if !input.is_object() {
         return anthropic_error(400, "请求体必须是 JSON 对象");
     }
@@ -320,8 +325,7 @@ fn count_tokens(hub: &Shared, ep: &Endpoint, mut input: Value) -> Response {
         Ok(v) => v,
         Err(e) => return anthropic_error(400, &e),
     };
-    let settings = hub.settings();
-    let routes = hub.routes(&settings);
+    let routes = hub.routes(&caller.settings);
     match catalog::resolve(&routes, chat["model"].as_str().unwrap_or("")) {
         Ok(r) if !r.scoped(&ep.scope).is_empty() => {}
         Ok(_) => return anthropic_error(400, "所选端或地区不提供此模型"),
@@ -441,11 +445,39 @@ fn effort_of(kind: Kind, input: &Value) -> Value {
             let effort = input["reasoning"]["effort"].as_str().filter(|e| EFFORTS.contains(e));
             json!({"output_config":{"effort":effort}})
         }
+        Kind::Chat => match input["reasoning_effort"].as_str().filter(|e| EFFORTS.contains(e)) {
+            Some(effort) => json!({"output_config":{"effort":effort}}),
+            None => Value::Null,
+        },
         _ => Value::Null,
     }
 }
 
-pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap, input: Value) -> Response {
+const OMITTED_IMAGE: &str = "[An earlier image was omitted by the gateway to limit request size.]";
+
+/// Keep the newest `keep` images of a chat body and replace older ones with a
+/// note. Images after the last assistant message (this turn's input or tool
+/// results) always stay. Returns the number and URL bytes omitted.
+fn omit_older_images(body: &mut Value, keep: usize) -> (usize, usize) {
+    let Some(messages) = body["messages"].as_array_mut() else { return (0, 0) };
+    let current = messages.iter().rposition(|m| m["role"] == "assistant").map_or(0, |i| i + 1);
+    let (mut seen, mut omitted, mut bytes) = (0, 0, 0);
+    for (index, message) in messages.iter_mut().enumerate().rev() {
+        let Some(parts) = message["content"].as_array_mut() else { continue };
+        for part in parts.iter_mut().rev().filter(|p| p["type"] == "image_url") {
+            seen += 1;
+            if index >= current || seen <= keep {
+                continue;
+            }
+            bytes += part["image_url"]["url"].as_str().map_or(0, str::len);
+            *part = json!({"type":"text","text":OMITTED_IMAGE});
+            omitted += 1;
+        }
+    }
+    (omitted, bytes)
+}
+
+pub async fn execute(hub: Shared, caller: Caller, ep: Endpoint, path: String, headers: HeaderMap, input: Value) -> Response {
     let kind = ep.kind;
     let mut details = RequestDetails::incoming(protocol(&ep), &path, &input);
     if ep.zcode {
@@ -472,7 +504,7 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
         Ok(v) => v,
         Err(e) => {
             details.local_error("conversion", &e);
-            reject(&hub, &ep, &requested, 400, "invalid_request", details);
+            reject(&hub, &caller, &ep, &requested, 400, "invalid_request", details);
             return error_for(kind, 400, &e, "invalid_request");
         }
     };
@@ -485,7 +517,7 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
     }
     if !body["messages"].as_array().is_some_and(|a| !a.is_empty()) {
         details.local_error("validation", "messages 必须为非空数组");
-        reject(&hub, &ep, &requested, 400, "invalid_request", details);
+        reject(&hub, &caller, &ep, &requested, 400, "invalid_request", details);
         return error_for(kind, 400, "messages 必须为非空数组", "invalid_request");
     }
     if body.get("n").is_some_and(|n| n != 1) {
@@ -496,13 +528,27 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
     if effort_input.is_object() {
         details.request_summary["effortInput"] = effort_input.clone();
     }
-    let settings = hub.settings();
-    let routes = hub.routes(&settings);
+    if kind == Kind::Responses {
+        let skipped: Vec<&Value> = input["tools"].as_array().into_iter().flatten()
+            .filter(|t| responses::is_hosted_search(t)).map(|t| &t["type"]).collect();
+        if !skipped.is_empty() {
+            details.request_summary["skippedHostedTools"] = json!(skipped);
+        }
+    }
+    let settings = &caller.settings;
+    if let Some(keep) = settings.recent_images {
+        let (omitted, bytes) = omit_older_images(&mut body, keep as usize);
+        if omitted > 0 {
+            details.request_summary["omittedImages"] = json!(omitted);
+            details.request_summary["omittedImageBytes"] = json!(bytes);
+        }
+    }
+    let routes = hub.routes(settings);
     let route = match catalog::resolve(&routes, &requested) {
         Ok(r) => r.clone(),
         Err(e) => {
             details.local_error("model", &e);
-            reject(&hub, &ep, &requested, 400, "model_not_found", details);
+            reject(&hub, &caller, &ep, &requested, 400, "model_not_found", details);
             return error_for(kind, 400, &e, "model_not_found");
         }
     };
@@ -513,11 +559,13 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
     if targets.is_empty() {
         let message = if route.all_targets.is_empty() {
             "此模型映射的上游当前不在目录中，请同步模型目录"
+        } else if caller.key.scope.is_some() {
+            "所选端或地区不提供此模型（或不在此 API Key 允许的端与地区内）"
         } else {
             "所选端或地区不提供此模型（或已在接入设置中停用）"
         };
         details.local_error("model", message);
-        reject(&hub, &ep, &requested, 400, "model_not_available", details);
+        reject(&hub, &caller, &ep, &requested, 400, "model_not_available", details);
         return error_for(kind, 400, message, "model_not_available");
     }
     let pinned = match headers.get("x-account-id").and_then(|v| v.to_str().ok()) {
@@ -525,11 +573,18 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
             Ok(k) => Some(k),
             Err(e) => {
                 details.local_error("account_selection", &e);
-                reject(&hub, &ep, &requested, 503, "no_available_account", details);
+                reject(&hub, &caller, &ep, &requested, 503, "no_available_account", details);
                 return error_for(kind, 503, &e, "no_available_account");
             }
         },
-        None => settings.pinned.get(&ep.scope.key()).filter(|s| !s.is_empty()).cloned(),
+        // A global pin outside this key's narrowed scope does not apply to it.
+        None => settings.pinned.get(&ep.scope.key()).filter(|s| !s.is_empty()).filter(|pin| {
+            caller.key.scope.is_none()
+                || hub.pool_accounts().iter().any(|a| {
+                    let s = settings.scope(a.provider);
+                    a.key() == **pin && s.enabled && s.regions.contains(&a.region)
+                })
+        }).cloned(),
     };
     if targets.iter().any(|t| t.provider() == ProviderKind::Workbuddy) {
         hub.wb.refresh_login_metadata();
@@ -564,10 +619,12 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
         }
     }
     let accounts = hub.pool_accounts();
+    // One copy for every eligibility check: bodies can be tens of MiB.
+    let probe = std::sync::Mutex::new(body.clone());
     let choose = |tried: &HashSet<String>| {
         let now = chrono::Utc::now().timestamp_millis();
         let check = |a: &agentdock_core::provider::PoolAccount, t: &agentdock_core::provider::UpstreamModel| {
-            let mut probe = body.clone();
+            let mut probe = probe.lock().unwrap();
             probe["model"] = json!(t.id);
             hub.eligibility(a, t, &probe, &headers)
         };
@@ -594,7 +651,7 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
             Err(e) => {
                 let mut details = details.clone();
                 details.local_error("account_selection", &e);
-                reject(&hub, &ep, &requested, 503, "no_available_account", details);
+                reject(&hub, &caller, &ep, &requested, 503, "no_available_account", details);
                 return if kind == Kind::Messages {
                     let mut v = anthropic::error_value(503, &e);
                     v["error"]["type"] = json!("overloaded_error");
@@ -643,7 +700,8 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
             attempt,
             request_group: group.clone(),
             ..RequestLog::default()
-        };
+        }
+        .with_key(&caller.key);
         hub.active.lock().unwrap().insert(id.clone(), log.clone());
         let mut lease = Lease {
             hub: hub.clone(),
@@ -698,6 +756,17 @@ pub async fn execute(hub: Shared, ep: Endpoint, path: String, headers: HeaderMap
                 }
                 if can_fail_over && [401, 403, 429].contains(&f.status) && attempt < MAX_ATTEMPTS {
                     tried.insert(lease.key.clone());
+                    if let Ok(p) = choose(&tried) {
+                        lease.finish(f.status, "retried", &f.message);
+                        next = Some(p);
+                        continue;
+                    }
+                }
+                if f.code == "context_length_exceeded" || f.code == "request_too_large" {
+                    // The provider's limit (its window, or a body its own
+                    // signing/encoding grew), not the account's: every other
+                    // account of that provider would refuse it the same way.
+                    tried.extend(accounts.iter().filter(|a| a.provider == pick.account.provider).map(|a| a.key()));
                     if let Ok(p) = choose(&tried) {
                         lease.finish(f.status, "retried", &f.message);
                         next = Some(p);

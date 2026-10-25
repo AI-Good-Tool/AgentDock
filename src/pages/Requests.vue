@@ -7,13 +7,20 @@ import PageHead from '../components/PageHead.vue'
 import RequestDrawer from '../components/RequestDrawer.vue'
 import { call, type RequestLog } from '../api'
 import { t, fmtShort, duration } from '../i18n'
-import { state, act, refreshLogs, providerLabel, regionLabel, PROVIDERS } from '../store'
+import { state, act, refreshLogs, providerLabel, regionLabel, keyName, PROVIDERS } from '../store'
 import { outcomeName, protocolName, logError } from '../lib/request-log'
 import { requestTokenUsage, tokenCount, requestTokenBreakdown } from '../lib/request-usage'
 
 const provider = ref('all')
 const region = ref('all')
 const result = ref('all')
+const apiKey = ref('all')
+const keyOptions = computed(() => {
+  const ids = new Map<string, string>()
+  for (const k of state.app?.apiKeys ?? []) ids.set(k.id, keyName({ keyId: k.id }))
+  for (const l of state.logs) if (l.keyId && !ids.has(l.keyId)) ids.set(l.keyId, keyName(l))
+  return [...ids].map(([value, label]) => ({ value, label }))
+})
 const showInternal = ref(false)
 const query = ref('')
 const selected = ref<RequestLog | null>(null)
@@ -27,6 +34,7 @@ const rows = computed(() => {
       (showInternal.value || l.protocol !== 'internal') &&
       (provider.value === 'all' || l.provider === provider.value) &&
       (region.value === 'all' || l.region === region.value) &&
+      (apiKey.value === 'all' || l.keyId === apiKey.value) &&
       (result.value === 'all' ||
         (result.value === 'success'
           ? l.outcome === 'completed'
@@ -34,7 +42,7 @@ const rows = computed(() => {
             ? l.outcome === result.value
             : !['completed', 'running', 'retried'].includes(l.outcome))) &&
       (!q ||
-        `${l.model} ${l.requestedModel} ${l.realModel} ${l.accountName} ${l.protocol} ${l.provider}`
+        `${l.model} ${l.requestedModel} ${l.realModel} ${l.accountName} ${l.protocol} ${l.provider} ${keyName(l)}`
           .toLowerCase()
           .includes(q))
   )
@@ -113,6 +121,10 @@ function rowClass(record: any) {
       <a-option value="cn">{{ t('国内版', 'China') }}</a-option>
       <a-option value="intl">{{ t('国际版', 'International') }}</a-option>
     </a-select>
+    <a-select v-model="apiKey" style="width: 150px">
+      <a-option value="all">{{ t('全部 API Key', 'All API keys') }}</a-option>
+      <a-option v-for="k in keyOptions" :key="k.value" :value="k.value">{{ k.label }}</a-option>
+    </a-select>
     <a-radio-group v-model="result" type="button">
       <a-radio value="all">{{ t('全部结果', 'All') }}</a-radio>
       <a-radio value="success">{{ t('成功', 'Success') }}</a-radio>
@@ -140,7 +152,7 @@ function rowClass(record: any) {
       :bordered="false"
       :pagination="{ pageSize: 15 }"
       :row-class="rowClass"
-      :scroll="{ x: 1200 }"
+      :scroll="{ x: 1330 }"
       @row-click="(r: any) => (selected = r)"
     >
       <template #columns>
@@ -170,6 +182,9 @@ function rowClass(record: any) {
         </a-table-column>
         <a-table-column :title="t('账号', 'Account')" :width="150"
           ><template #cell="{ record }">{{ record.accountName || '—' }}</template></a-table-column
+        >
+        <a-table-column title="API Key" :width="130"
+          ><template #cell="{ record }">{{ keyName(record) || '—' }}</template></a-table-column
         >
         <a-table-column :title="t('协议', 'Protocol')" :width="170"
           ><template #cell="{ record }"

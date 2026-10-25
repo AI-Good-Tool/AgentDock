@@ -87,6 +87,16 @@ pub fn normalize_chat(mut body: Value) -> Result<Value, String> {
     Ok(body)
 }
 
+/// OpenAI-hosted web search (Codex enables it by default). The model can only
+/// use it on OpenAI's own servers, so for other upstreams it is an unavailable
+/// capability rather than part of the conversation contract.
+pub fn is_hosted_search(tool: &Value) -> bool {
+    matches!(
+        tool["type"].as_str(),
+        Some("web_search" | "web_search_preview" | "web_search_2025_08_26" | "web_search_preview_2025_03_11")
+    )
+}
+
 pub fn to_chat(input: &Value) -> Result<Value, String> {
     to_chat_with_tools(input).map(|(body, _)| body)
 }
@@ -299,6 +309,9 @@ fn to_chat_flat(input: &Value) -> Result<Value, String> {
             .iter()
             .enumerate()
         {
+            if is_hosted_search(tool) {
+                continue;
+            }
             if tool["type"] != "function" {
                 let kind = tool["type"].as_str().unwrap_or("missing");
                 let kind: String = kind
@@ -818,7 +831,8 @@ mod tests {
             json!({"background":true}),
             json!({"conversation":"c"}),
             json!({"include":["file_search_call.results"]}),
-            json!({"tools":[{"type":"web_search"}]}),
+            json!({"tools":[{"type":"file_search","vector_store_ids":["vs"]}]}),
+            json!({"tools":[{"type":"web_search"}],"tool_choice":{"type":"web_search"}}),
             json!({"input":[{"type":"reasoning","summary":[],"encrypted_content":"opaque"}]}),
             json!({"input":[{"role":"user","content":[{"type":"input_file","file_id":"f"}]}]}),
             json!({"stream":"yes"}),
@@ -864,12 +878,24 @@ mod tests {
             assert_eq!(replay["messages"][1]["tool_calls"][0]["id"], "ping-call");
             assert_eq!(replay["messages"][2]["tool_call_id"], "ping-call");
         }
-        for kind in ["web_search", "file_search"] {
+        for kind in ["file_search", "image_generation"] {
             let error =
                 to_chat(&json!({"model":"m","input":"hello","tools":[{"type":kind,"name":"x"}]}))
                     .unwrap_err();
             assert!(error.contains("tools[0]") && error.contains(kind));
         }
+        // Codex's default hosted web search can't run upstream; the request
+        // proceeds with the remaining tools instead of failing.
+        let chat = to_chat(&json!({"model":"m","input":"hello","tools":[
+            {"type":"function","name":"ping"},
+            {"type":"web_search","external_web_access":true},
+            {"type":"web_search_preview"}
+        ]}))
+        .unwrap();
+        assert_eq!(chat["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["tools"][0]["function"]["name"], "ping");
+        let chat = to_chat(&json!({"model":"m","input":"hello","tools":[{"type":"web_search"}]})).unwrap();
+        assert!(chat.get("tools").is_none());
         assert!(to_chat(&json!({"model":"m","input":"hello","tools":[{"type":"function","name":"ping","parameters":null}]})).unwrap_err().contains("parameters"));
     }
     #[test]

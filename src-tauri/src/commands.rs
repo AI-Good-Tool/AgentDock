@@ -30,6 +30,7 @@ pub fn app_snapshot(hub: State<'_, Shared>) -> Value {
         "running": running.is_some(),
         "port": running.unwrap_or(settings.port),
         "apiKey": hub.api_key(),
+        "apiKeys": hub.keys.list(),
         "error": *hub.error.lock().unwrap(),
         "settings": settings,
         "active": active,
@@ -151,9 +152,27 @@ pub fn generate_api_key() -> String {
 }
 
 #[tauri::command]
-pub async fn set_api_key(hub: State<'_, Shared>, value: String, expected: String) -> Res {
+pub async fn set_api_key(hub: State<'_, Shared>, id: String, value: String, expected: String) -> Res {
     let hub = hub.inner().clone();
-    blocking(move || hub.set_api_key(value, &expected).map(|_| json!({"ok":true}))).await?
+    blocking(move || hub.keys.replace(&id, value, &expected).map(|_| json!({"ok":true}))).await?
+}
+
+#[tauri::command]
+pub async fn create_api_key(hub: State<'_, Shared>, value: Option<String>, fields: crate::api_key::KeyFields) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || hub.keys.create(value.filter(|v| !v.trim().is_empty()), fields).map(|k| json!({"ok":true,"id":k.id}))).await?
+}
+
+#[tauri::command]
+pub async fn update_api_key(hub: State<'_, Shared>, id: String, fields: crate::api_key::KeyFields) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || hub.keys.update(&id, fields).map(|_| json!({"ok":true}))).await?
+}
+
+#[tauri::command]
+pub async fn delete_api_key(hub: State<'_, Shared>, id: String) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || hub.keys.delete(&id).map(|_| json!({"ok":true}))).await?
 }
 
 #[tauri::command]
@@ -304,11 +323,18 @@ pub async fn sync_catalog(hub: State<'_, Shared>, provider_key: Option<String>, 
 pub async fn save_route(hub: State<'_, Shared>, route_id: String, alias: String, targets: Option<Vec<String>>, disabled: bool) -> Res {
     let hub = hub.inner().clone();
     blocking(move || {
-        let custom = hub.settings().routes.get(&route_id).is_some_and(|o| o.custom);
-        hub.save_route(&route_id, RouteOverride { alias: alias.trim().to_owned(), targets, disabled, custom })
+        let saved = hub.settings().routes.get(&route_id).cloned().unwrap_or_default();
+        hub.save_route(&route_id, RouteOverride { alias: alias.trim().to_owned(), targets, disabled, ..saved })
             .map(|_| json!({"ok":true}))
     })
     .await?
+}
+
+/// Merge a route into another (`into`), or undo the merge (`None`).
+#[tauri::command]
+pub async fn link_route(hub: State<'_, Shared>, route_id: String, into: Option<String>) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || hub.link_route(&route_id, into).map(|_| json!({"ok":true}))).await?
 }
 
 #[tauri::command]
@@ -319,7 +345,7 @@ pub async fn create_route(hub: State<'_, Shared>, alias: String, targets: Vec<St
         if alias.trim().is_empty() {
             return Err("请填写对外模型别名".into());
         }
-        hub.save_route(&id, RouteOverride { alias: alias.trim().to_owned(), targets: Some(targets), disabled: false, custom: true })
+        hub.save_route(&id, RouteOverride { alias: alias.trim().to_owned(), targets: Some(targets), custom: true, ..RouteOverride::default() })
             .map(|_| json!({"ok":true,"routeId":id}))
     })
     .await?

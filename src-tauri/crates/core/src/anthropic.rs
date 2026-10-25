@@ -270,16 +270,35 @@ pub fn to_chat(input: &Value) -> Result<Value, String> {
     Ok(result)
 }
 
-/// Claude effort names aren't universally supported by WorkBuddy models. Use a
-/// requested effort only when advertised, otherwise retain the model default.
+pub const EFFORT_ORDER: [&str; 8] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+/// The advertised effort closest to `requested`, so every step of a client's
+/// effort slider (Claude Code: low…max, Codex: minimal…xhigh) lands on a real
+/// model level without ever going down as the slider goes up. Ties round up;
+/// "none" (thinking off) is never chosen as a substitute.
+pub fn closest_effort<'a>(requested: &str, supported: &[&'a str]) -> Option<&'a str> {
+    if let Some(e) = supported.iter().find(|e| **e == requested) {
+        return Some(e);
+    }
+    let rank = |e: &str| EFFORT_ORDER.iter().position(|x| *x == e);
+    let want = rank(requested)?;
+    supported
+        .iter()
+        .filter(|e| **e != "none")
+        .filter_map(|e| rank(e).map(|r| (*e, r)))
+        .min_by_key(|(_, r)| (want.abs_diff(*r), std::cmp::Reverse(*r)))
+        .map(|(e, _)| e)
+}
+
+/// Map the client's effort onto the levels the selected model advertises;
+/// without a requested or mappable level the model default applies.
 pub fn apply_effort(input: &Value, chat: &mut Value, model: &Value) {
     let requested = input["output_config"]["effort"]
         .as_str()
         .or_else(|| input["reasoning_effort"].as_str());
     let choices = model["reasoning"]["supportedEfforts"].as_array();
-    if let Some(effort) =
-        requested.filter(|effort| choices.is_some_and(|a| a.iter().any(|v| v == *effort)))
-    {
+    let supported: Vec<&str> = choices.into_iter().flatten().filter_map(Value::as_str).collect();
+    if let Some(effort) = requested.and_then(|r| closest_effort(r, &supported)) {
         chat["reasoning_effort"] = json!(effort);
     }
     if input["thinking"]["type"] == "disabled"
@@ -703,17 +722,38 @@ mod tests {
         }
     }
     #[test]
-    fn k3_medium_uses_declared_default_instead_of_unsupported_effort() {
+    fn client_effort_steps_map_to_the_closest_advertised_level() {
         let mut input = request();
-        input["output_config"] = json!({"effort":"medium"});
-        let model =
-            json!({"reasoning":{"defaultEffort":"high","supportedEfforts":["low","high","xhigh"]}});
+        let k3 = json!({"reasoning":{"defaultEffort":"high","supportedEfforts":["low","high","xhigh"]}});
+        let qwen = json!({"reasoning":{"defaultEffort":"medium","supportedEfforts":["low","medium","xhigh","none"]}});
+        let flash = json!({"reasoning":{"defaultEffort":"max","supportedEfforts":["high","max"]}});
+        // Claude Code low…max and Codex minimal…xhigh.
+        for (model, steps) in [
+            (&k3, [("minimal", "low"), ("low", "low"), ("medium", "high"), ("high", "high"), ("xhigh", "xhigh"), ("max", "xhigh")]),
+            (&qwen, [("minimal", "low"), ("low", "low"), ("medium", "medium"), ("high", "xhigh"), ("xhigh", "xhigh"), ("max", "xhigh")]),
+            (&flash, [("minimal", "high"), ("low", "high"), ("medium", "high"), ("high", "high"), ("xhigh", "max"), ("max", "max")]),
+        ] {
+            for (asked, used) in steps {
+                input["output_config"] = json!({"effort":asked});
+                let mut chat = to_chat(&input).unwrap();
+                apply_effort(&input, &mut chat, model);
+                assert_eq!(chat["reasoning_effort"], used, "{asked} on {model}");
+            }
+        }
+        // Thinking off uses "none" only where the model offers it.
+        input["thinking"] = json!({"type":"disabled"});
         let mut chat = to_chat(&input).unwrap();
-        apply_effort(&input, &mut chat, &model);
+        apply_effort(&input, &mut chat, &qwen);
+        assert_eq!(chat["reasoning_effort"], "none");
+        // Unknown names and models without levels keep the model default.
+        input["output_config"] = json!({"effort":"turbo"});
+        let mut chat = to_chat(&input).unwrap();
+        apply_effort(&input, &mut chat, &k3);
         assert!(chat.get("reasoning_effort").is_none());
-        input["output_config"]["effort"] = json!("low");
-        apply_effort(&input, &mut chat, &model);
-        assert_eq!(chat["reasoning_effort"], "low");
+        input["thinking"] = Value::Null;
+        input["output_config"] = json!({"effort":"high"});
+        apply_effort(&input, &mut chat, &json!({}));
+        assert!(chat.get("reasoning_effort").is_none());
     }
     #[test]
     fn claude_code_system_updates_are_merged_before_conversation_in_order() {

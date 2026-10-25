@@ -86,9 +86,20 @@ const route = (routeId: string, alias: string, targets: any[], extra: any = {}) 
   targets,
   allTargets: targets,
   missing: [],
+  linked: [],
   ...extra,
 })
+const v41 = [
+  target('workbuddy', 'cn', 'deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash'),
+  target('trae', 'cn', 'deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash'),
+  target('trae', 'cn', 'deepseek-v4-flash', 'DeepSeek-V4-Flash'),
+  target('trae', 'intl', 'deepseek-v4-flash', 'DeepSeek-V4-Flash'),
+]
 const routes = [
+  route('deepseek-v4.1-flash', 'DeepSeek-V4.1-Flash', v41, {
+    configured: true,
+    linked: [{ routeId: 'deepseek-v4-flash', alias: 'DeepSeek-V4-Flash', targets: ['trae:cn:deepseek-v4-flash', 'trae:intl:deepseek-v4-flash'] }],
+  }),
   route('glm-5.3-flash', 'GLM-5.3-Flash', glm),
   route('kimi-k3', 'Kimi-K3', kimi),
   route('deepseek-flash', 'DeepSeek-Flash', [target('qoder', 'intl', 'dfmodel', 'DeepSeek-Flash')]),
@@ -230,7 +241,7 @@ function stats() {
 export function preview(command: string, args?: Record<string, any>): unknown {
   switch (command) {
     case 'app_snapshot':
-      return { version: appVersion, dataDir: '/Users/****/.agentdock', running: true, port: 24800, apiKey: 'ad-preview0000000000000000000000000000', error: '', settings: structuredClone(settings), active: [], checkin: checkinStatus, migration: { workbuddy: { files: 1, usageRows: 3262 }, qoder: { files: 31, usageRows: 0 }, trae: { files: 4, requests: 0 } } }
+      return { version: appVersion, dataDir: '/Users/****/.agentdock', running: true, port: 24800, apiKey: 'ad-preview0000000000000000000000000000', apiKeys: [{ id: 'default', key: 'ad-preview0000000000000000000000000000', alias: '', enabled: true, strategy: null, scope: null, createdAt: 0 }], error: '', settings: structuredClone(settings), active: [], checkin: checkinStatus, migration: { workbuddy: { files: 1, usageRows: 3262 }, qoder: { files: 31, usageRows: 0 }, trae: { files: 4, requests: 0 } } }
     case 'save_settings':
       for (const [k, v] of Object.entries(args?.patch ?? {})) settings[k] = k === 'checkin' ? { ...settings.checkin, ...(v as object) } : v
       return settings

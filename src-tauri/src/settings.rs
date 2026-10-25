@@ -110,6 +110,10 @@ pub struct RouteOverride {
     pub disabled: bool,
     /// User-created route (not derived from a catalog name).
     pub custom: bool,
+    /// Route id this route's upstreams join; its accounts are then scheduled
+    /// with the destination's, and its names resolve to the destination.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_into: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -129,6 +133,9 @@ pub struct Settings {
     pub reject_browser_origin: bool,
     /// Start the gateway automatically when AgentDock opens.
     pub auto_start: bool,
+    /// Images sent upstream per request, counted from the newest; older ones
+    /// become a text note. `None` sends every image.
+    pub recent_images: Option<u32>,
     pub theme: String,
     pub lang: String,
     pub timezone: String,
@@ -155,6 +162,7 @@ impl Default for Settings {
             auth_disabled_accounts: BTreeSet::new(),
             reject_browser_origin: true,
             auto_start: false,
+            recent_images: None,
             theme: "light".into(),
             lang: "system".into(),
             timezone: "system".into(),
@@ -199,6 +207,9 @@ impl Settings {
             if !(1..=16).contains(&s.concurrency) {
                 return Err("单账号并发需为 1–16".into());
             }
+        }
+        if self.recent_images.is_some_and(|n| !(1..=100).contains(&n)) {
+            return Err("保留的图片数量需为 1–100".into());
         }
         self.checkin.schedule().validate()?;
         crate::checkin_schedule::validate_zone(&self.timezone)?;

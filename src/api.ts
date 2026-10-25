@@ -26,6 +26,7 @@ export interface RouteOverride {
   targets?: string[] | null
   disabled: boolean
   custom: boolean
+  mergeInto?: string | null
 }
 export interface Settings {
   port: number
@@ -34,6 +35,8 @@ export interface Settings {
   routes: Record<string, RouteOverride>
   pinned: Record<string, string>
   rejectBrowserOrigin: boolean
+  /** Images sent upstream per request, newest first; null sends all. */
+  recentImages?: number | null
   autoStart: boolean
   theme: 'light' | 'dark' | 'system'
   lang: 'system' | 'zh' | 'en'
@@ -101,7 +104,22 @@ export interface RequestLog {
   attempt?: number
   /** Id of the first attempt; shared by every attempt of one request. */
   requestGroup?: string
+  /** Local API key that made the request (empty for internal/legacy records). */
+  keyId?: string
+  keyHint?: string
+  keyAlias?: string
   details?: any
+}
+export interface ApiKeyInfo {
+  id: string
+  key: string
+  alias: string
+  enabled: boolean
+  /** null follows the global strategy. */
+  strategy: Strategy | null
+  /** Allowed regions per provider; null follows the global scope. */
+  scope: Partial<Record<ProviderKey, Region[]>> | null
+  createdAt: number
 }
 export interface AppSnapshot {
   version: string
@@ -109,6 +127,7 @@ export interface AppSnapshot {
   running: boolean
   port: number
   apiKey: string
+  apiKeys?: ApiKeyInfo[]
   error: string
   settings: Settings
   active: RequestLog[]
@@ -143,6 +162,8 @@ export interface RouteView {
   targets: Target[]
   allTargets: Target[]
   missing: string[]
+  /** Routes merged into this one; their upstreams are part of `allTargets`. */
+  linked: { routeId: string; alias: string; targets: string[] }[]
 }
 export interface AccountRuntime {
   inFlight: number

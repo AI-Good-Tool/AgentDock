@@ -47,11 +47,25 @@ pub struct RequestLog {
     pub attempt: u32,
     /// Id of the first attempt; shared by every attempt of one request.
     pub request_group: String,
+    /// Local API key that made the request: id, abbreviated value and the
+    /// alias at request time (empty for internal and legacy records).
+    pub key_id: String,
+    pub key_hint: String,
+    pub key_alias: String,
     pub details: Value,
 }
 impl RequestLog {
     pub fn success(&self) -> bool {
         self.outcome == "completed"
+    }
+    pub fn with_key(mut self, key: &crate::api_key::ApiKey) -> Self {
+        self.key_id = key.id.clone();
+        self.key_hint = key.hint();
+        self.key_alias = key.alias.clone();
+        self
+    }
+    fn key_label(&self) -> &str {
+        if self.key_alias.is_empty() { &self.key_hint } else { &self.key_alias }
     }
 }
 
@@ -142,14 +156,16 @@ impl LogStore {
             || {
                 (
                     format!(
-                        "{} {} → {} · {} ms",
+                        "{} {} → {} · {} ms{}",
                         if log.model.is_empty() { &log.requested_model } else { &log.model },
                         log.provider,
                         log.status,
-                        log.duration_ms
+                        log.duration_ms,
+                        if log.key_id.is_empty() { String::new() } else { format!(" · Key {}", log.key_label()) },
                     ),
                     serde_json::json!({
                         "requestId": log.id,
+                        "apiKey": log.key_label(),
                         "account": log.account_name,
                         "region": log.region,
                         "realModel": log.real_model,
@@ -199,6 +215,7 @@ impl LogStore {
             "realModel":diagnostics::bounded(&log.real_model,128),"modelName":diagnostics::bounded(&log.model_name,128),
             "provider":log.provider,"region":log.region,"protocol":log.protocol,
             "accountId":log.account_id,"accountName":diagnostics::bounded(&log.account_name,128),
+            "keyId":log.key_id,"keyHint":log.key_hint,"keyAlias":log.key_alias,
             "status":log.status,"outcome":log.outcome,"durationMs":log.duration_ms,
             "usage":diagnostics::usage(&log.usage)});
         let _ = append_private(&self.usage_path(), &row.to_string());
@@ -301,9 +318,10 @@ pub fn statistics(rows: &[Value], filter: &Value, offset_minutes: i64) -> Value 
     let mut groups: [BTreeMap<String, Value>; 5] = Default::default();
     let mut daily = BTreeMap::<String, Value>::new();
     let mut hours = BTreeMap::<String, Value>::new();
+    let mut api_keys = BTreeMap::<String, Value>::new();
     let mut requests = vec![];
     for r in rows.iter().filter(|r| {
-        ["provider", "region", "model", "accountId"].iter().all(|k| pass(r, k))
+        ["provider", "region", "model", "accountId", "keyId"].iter().all(|k| pass(r, k))
             && from.is_none_or(|f| r["timestamp"].as_i64().unwrap_or(0) >= f)
             && to.is_none_or(|t| r["timestamp"].as_i64().unwrap_or(0) < t)
     }) {
@@ -328,10 +346,20 @@ pub fn statistics(rows: &[Value], filter: &Value, offset_minutes: i64) -> Value 
         for (g, key) in groups.iter_mut().zip(keys) {
             add(g.entry(key.clone()).or_insert_with(|| json!({"key":key})), r);
         }
+        if let Some(id) = r["keyId"].as_str().filter(|id| !id.is_empty()) {
+            // Rows are chronological: the newest alias and hint win.
+            let label = r["keyAlias"].as_str().filter(|a| !a.is_empty()).or(r["keyHint"].as_str()).unwrap_or(id);
+            let entry = api_keys.entry(id.to_owned()).or_insert_with(|| json!({"key":id}));
+            add(entry, r);
+            entry["keyHint"] = r["keyHint"].clone();
+            entry["keyAlias"] = r["keyAlias"].clone();
+            entry["label"] = json!(label);
+        }
         add(daily.entry(day.clone()).or_insert_with(|| json!({"key":day})), r);
         add(hours.entry(hour.clone()).or_insert_with(|| json!({"key":hour})), r);
         let mut detail = json!({"id":r["id"],"timestamp":r["timestamp"],"time":at.to_rfc3339(),"model":r["model"],"realModel":r["realModel"],
             "provider":r["provider"],"region":r["region"],"protocol":r["protocol"],"accountName":r["accountName"],"accountId":r["accountId"],
+            "keyId":r["keyId"],"keyHint":r["keyHint"],"keyAlias":r["keyAlias"],
             "status":r["status"],"outcome":r["outcome"],"durationMs":r["durationMs"],"usageKnown":r["usage"]["prompt_tokens"].is_number()});
         add(&mut detail, r);
         requests.push(detail);
@@ -347,6 +375,7 @@ pub fn statistics(rows: &[Value], filter: &Value, offset_minutes: i64) -> Value 
     requests.truncate(2000);
     json!({"summary":summary,"daily":daily.into_values().collect::<Vec<_>>(),"hours":hours.into_values().collect::<Vec<_>>(),
         "models":sort(models),"accounts":sort(accounts),"providers":sort(providers),"regions":sort(regions),"realModels":sort(real),
+        "apiKeys":sort(api_keys),
         "requests":requests,"requestCount":total,"offsetMinutes":offset_minutes})
 }
 

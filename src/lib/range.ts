@@ -22,9 +22,12 @@ const shift = (key: string, days: number) => {
   d.setUTCDate(d.getUTCDate() + days)
   return d.toISOString().slice(0, 10)
 }
-/** Inclusive [from, to] day keys; null = unbounded. */
-export function rangeDays(k: RangeKey, custom?: [string, string] | null): [string | null, string | null] {
-  const today = dayKey(Date.now())
+/** Inclusive [from, to] day keys; null = unbounded. `today` defaults to the display zone's. */
+export function rangeDays(
+  k: RangeKey,
+  custom?: [string, string] | null,
+  today = dayKey(Date.now())
+): [string | null, string | null] {
   switch (k) {
     case 'today':
       return [today, today]
@@ -49,8 +52,8 @@ export function rangeDays(k: RangeKey, custom?: [string, string] | null): [strin
       return [null, null]
   }
 }
-export function inRange(key: string, k: RangeKey, custom?: [string, string] | null) {
-  const [from, to] = rangeDays(k, custom)
+export function inRange(key: string, k: RangeKey, custom?: [string, string] | null, today?: string) {
+  const [from, to] = rangeDays(k, custom, today)
   return (!from || key >= from) && (!to || key <= to)
 }
 /** Millisecond bounds [from, to) for a day range in the display zone. */

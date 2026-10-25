@@ -502,7 +502,7 @@ body[arco-theme='dark'] {
 }
 .target-row {
   display: grid;
-  grid-template-columns: auto auto 1fr auto;
+  grid-template-columns: auto auto 1fr auto auto;
   gap: 8px;
   align-items: center;
   font-size: 12px;
@@ -524,6 +524,75 @@ body[arco-theme='dark'] {
   gap: 6px;
   flex-wrap: wrap;
 }
+.target-row .via-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 5px;
+  cursor: help;
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+  background: var(--accent-soft);
+}
+.linked-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  border: 1px dashed color-mix(in srgb, var(--accent) 40%, var(--line));
+  background: color-mix(in srgb, var(--accent-soft) 60%, transparent);
+}
+.linked-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--accent);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.linked-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  height: 22px;
+  padding: 0 3px 0 9px;
+  border-radius: 99px;
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--line));
+  background: var(--surface);
+  color: var(--text-2);
+}
+.linked-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.linked-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+.linked-x:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.linked-x:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
 .cap-tags span {
   font-size: 11px;
   border-radius: 99px;
@@ -536,9 +605,22 @@ body[arco-theme='dark'] {
   justify-content: space-between;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
   border-top: 1px solid var(--line);
   padding-top: 10px;
   margin-top: auto;
+}
+.route-count {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.route-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-left: auto;
 }
 .code-block {
   position: relative;

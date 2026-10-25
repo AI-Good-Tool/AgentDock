@@ -71,11 +71,14 @@ async function main(input) {
   } finally { ctx.free(); }
 }
 
-let text = '';
+const chunks = [];
+let size = 0;
 for await (const part of process.stdin) {
-  text += part;
-  if (Buffer.byteLength(text) > 36 * 1024 * 1024) throw new Error('输入超过上限');
+  size += part.length;
+  if (size > 72 * 1024 * 1024) throw new Error('输入超过上限');
+  chunks.push(part);
 }
+const text = Buffer.concat(chunks).toString('utf8');
 try {
   const output = await main(JSON.parse(text));
   process.stdout.write(JSON.stringify({ok:true,data:output}));

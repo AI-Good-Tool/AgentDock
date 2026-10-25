@@ -93,12 +93,12 @@ pub fn select_excluding(
             continue;
         }
         let scope = settings.scope(a.provider);
+        // A merged route can offer one account several targets; use the first
+        // that this account may serve now.
+        let mut served = targets.iter().filter(|t| t.provider() == a.provider && t.region == a.region).peekable();
         let reason = if !scope.enabled || !scope.regions.iter().any(|r| *r == a.region) {
             Err("端或地区未参与反代")
-        } else if let Some(target) = targets
-            .iter()
-            .find(|t| t.provider() == a.provider && t.region == a.region)
-        {
+        } else if served.peek().is_some() {
             if excluded.contains(&a.key()) {
                 Err("本次请求已尝试")
             } else if !a.enabled {
@@ -109,14 +109,21 @@ pub fn select_excluding(
                 Err("登录已过期")
             } else if rt.cooldown.get(&a.key()).is_some_and(|t| *t > now) {
                 Err("账号冷却中")
-            } else if rt.model_cooldown.get(&(a.key(), target.id.clone())).is_some_and(|t| *t > now) {
-                Err("该模型冷却中")
             } else if rt.auth_failed.contains(&a.key()) {
                 Err("鉴权已失败")
             } else if rt.in_flight.get(&a.key()).copied().unwrap_or(0) >= scope.concurrency {
                 Err("并发已满")
             } else {
-                eligible(a, target).map(|exec| (*target, exec))
+                let mut first = None;
+                let found = served.find_map(|target| {
+                    let result = if rt.model_cooldown.get(&(a.key(), target.id.clone())).is_some_and(|t| *t > now) {
+                        Err("该模型冷却中")
+                    } else {
+                        eligible(a, target).map(|exec| (*target, exec))
+                    };
+                    result.map_err(|e| { first.get_or_insert(e); }).ok()
+                });
+                found.ok_or_else(|| first.unwrap())
             }
         } else {
             Err("该端或地区不提供此模型")

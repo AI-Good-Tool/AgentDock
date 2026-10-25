@@ -2,7 +2,14 @@
 import ProviderMark from '../components/ProviderMark.vue'
 import { computed, ref, onMounted } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
-import { IconRefresh, IconPlus, IconCopy, IconEdit } from '@arco-design/web-vue/es/icon'
+import {
+  IconRefresh,
+  IconPlus,
+  IconCopy,
+  IconEdit,
+  IconLink,
+  IconClose,
+} from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
 import { call, type RouteView, type Target } from '../api'
 import { t, fmtNumber, fmtShort } from '../i18n'
@@ -45,7 +52,7 @@ const routes = computed(() =>
           new Set(r.allTargets.map((x) => `${x.provider}:${x.region}`)).size > 1) ||
         (cap.value === 'tools' && r.supportsTools) ||
         (cap.value === 'images' && r.supportsImages) ||
-        (cap.value === 'custom' && r.configured) ||
+        (cap.value === 'custom' && (r.configured || r.linked.length > 0)) ||
         (cap.value === 'disabled' && (r.disabled || !r.available)))
     )
   })
@@ -117,6 +124,71 @@ function reset(r: RouteView) {
       ]),
   })
 }
+// Merge other models into one: their accounts join this model's scheduling.
+const linking = ref<null | { route: RouteView; selected: string[]; query: string }>(null)
+function openLink(r: RouteView) {
+  linking.value = { route: r, selected: r.linked.map((l) => l.routeId), query: '' }
+}
+const linkCandidates = computed(() => {
+  const l = linking.value
+  if (!l) return []
+  const q = l.query.trim().toLowerCase()
+  const merged = l.route.linked.map((x) => ({
+    routeId: x.routeId,
+    alias: x.alias,
+    targets: l.route.allTargets.filter((t) => x.targets.includes(t.key)),
+    blocked: '',
+  }))
+  const others = (state.catalog?.routes ?? [])
+    .filter((r) => r.routeId !== l.route.routeId)
+    .map((r) => ({
+      routeId: r.routeId,
+      alias: r.alias,
+      targets: r.allTargets,
+      blocked: r.linked.length
+        ? t('已有其他模型关联到它，不能再并入别的模型', 'Other models are linked into it')
+        : r.disabled
+          ? t('已停用的模型不能关联，请先启用', 'Enable this model before linking it')
+          : '',
+    }))
+  return [...merged, ...others].filter(
+    (c) =>
+      !q ||
+      `${c.alias} ${c.targets.map((x) => `${x.id} ${x.name}`).join(' ')}`.toLowerCase().includes(q)
+  )
+})
+async function saveLinks() {
+  const l = linking.value!
+  const before = l.route.linked.map((x) => x.routeId)
+  const ok = await act(
+    'link',
+    async () => {
+      try {
+        for (const id of before.filter((x) => !l.selected.includes(x)))
+          await call('link_route', { routeId: id, into: null })
+        for (const id of l.selected.filter((x) => !before.includes(x)))
+          await call('link_route', { routeId: id, into: l.route.routeId })
+      } catch (e) {
+        await refreshCatalog()
+        throw e
+      }
+      return { ok: true }
+    },
+    t('关联已保存，对新请求立即生效', 'Links saved; applies to new requests'),
+    [refreshCatalog]
+  )
+  if (ok !== undefined) linking.value = null
+}
+function unlink(routeId: string) {
+  return act(
+    'link',
+    () => call('link_route', { routeId, into: null }),
+    t('已取消关联', 'Unlinked'),
+    [refreshCatalog]
+  )
+}
+const linkedFrom = (x: Target, r: RouteView) =>
+  r.linked.find((l) => l.targets.includes(x.key))?.alias
 const tags = (r: RouteView) =>
   [
     ...r.efforts.map((x) =>
@@ -266,6 +338,12 @@ const regionCount = (targets: Target[]) => new Set(targets.map((x) => x.provider
           >{{ x.name !== x.id ? x.name + ' · ' : '' }}{{ x.id }}</code
         >
         <span
+          v-if="linkedFrom(x, r)"
+          class="rtag via-tag"
+          :title="t('由关联的模型「', 'From linked model “') + linkedFrom(x, r) + t('」合并而来', '”')"
+          ><IconLink /></span
+        >
+        <span
           v-if="x.supportsTools === false"
           class="rtag text-only"
           :title="t('带工具或图片的请求（Claude Code、Codex 等）不会调度到这里', 'Requests with tools or images (Claude Code, Codex…) are not routed here')"
@@ -276,6 +354,21 @@ const regionCount = (targets: Target[]) => new Set(targets.map((x) => x.provider
         <span class="state-pill warn">{{ t('缺失', 'Missing') }}</span
         ><span></span><code>{{ m }}</code>
       </div>
+      <div v-if="r.linked.length" class="linked-row">
+        <span class="linked-label"><IconLink />{{ t('已关联', 'Linked') }}</span>
+        <span v-for="l in r.linked" :key="l.routeId" class="linked-chip" :title="l.alias"
+          ><span class="linked-name">{{ l.alias }}</span
+          ><button
+            type="button"
+            class="linked-x"
+            :disabled="busy('link')"
+            :title="t('取消关联', 'Unlink')"
+            :aria-label="t('取消关联 ', 'Unlink ') + l.alias"
+            @click="unlink(l.routeId)"
+          >
+            <IconClose /></button
+        ></span>
+      </div>
       <div class="cap-tags">
         <span v-for="tag in tags(r)" :key="tag">{{ tag }}</span>
         <span v-if="!tags(r).length">{{
@@ -283,17 +376,20 @@ const regionCount = (targets: Target[]) => new Set(targets.map((x) => x.provider
         }}</span>
       </div>
       <div class="route-foot">
-        <span class="muted" style="font-size: 12px"
+        <span class="route-count"
           >{{ regionCount(r.targets) }} {{ t('个端/地区参与调度', 'provider-regions scheduled')
           }}<template v-if="regionCount(r.targets.filter((x) => x.supportsTools !== false)) < regionCount(r.targets)">
             · {{ t('工具请求', 'with tools') }}
             {{ regionCount(r.targets.filter((x) => x.supportsTools !== false)) }}</template
           ></span
         >
-        <div style="display: flex; gap: 6px">
+        <div class="route-actions">
           <a-button v-if="r.configured" size="mini" @click="reset(r)">{{
             t('恢复自动', 'Reset')
           }}</a-button>
+          <a-button size="mini" @click="openLink(r)"
+            ><template #icon><IconLink /></template>{{ t('关联模型', 'Link models') }}</a-button
+          >
           <a-button size="mini" @click="open(r)"
             ><template #icon><IconEdit /></template
             >{{ t('别名 / 路由', 'Alias / routing') }}</a-button
@@ -383,5 +479,49 @@ const regionCount = (targets: Target[]) => new Set(targets.map((x) => x.provider
           .join('、')
       }}
     </p>
+  </a-modal>
+
+  <a-modal
+    v-if="linking"
+    :visible="true"
+    :width="680"
+    :title="t('关联模型到 ', 'Link models into ') + linking.route.alias"
+    :ok-loading="busy('link')"
+    @ok="saveLinks"
+    @cancel="linking = null"
+  >
+    <p class="hint" style="margin-top: 0">
+      {{
+        t(
+          `勾选的模型并入「${linking.route.alias}」：它们所属的账号与此模型的账号一起按调度策略轮询；客户端用原名称或原模型 ID 请求也会走这里；模型列表只显示「${linking.route.alias}」。之后同步到的新账号、新地区会自动加入。能力按所有上游取交集（如上下文取最小值）。`,
+          `Checked models merge into "${linking.route.alias}": their accounts are scheduled together with this model's; requests using their old names or IDs land here, and only "${linking.route.alias}" is listed. Newly synced accounts and regions join automatically. Capabilities are the intersection of all upstreams.`
+        )
+      }}
+    </p>
+    <a-input-search
+      v-model="linking.query"
+      :placeholder="t('搜索模型', 'Search models')"
+      style="margin-bottom: 8px"
+      allow-clear
+    />
+    <div class="pick-list">
+      <a-checkbox-group v-model="linking.selected" direction="vertical" style="width: 100%">
+        <label
+          v-for="c in linkCandidates"
+          :key="c.routeId"
+          class="pick-row"
+          style="grid-template-columns: auto auto 1fr"
+          :title="c.blocked"
+        >
+          <a-checkbox :value="c.routeId" :disabled="!!c.blocked" />
+          <strong style="white-space: nowrap">{{ c.alias }}</strong>
+          <code>{{
+            c.targets
+              .map((x) => `${providerLabel(x.provider)}/${regionLabel(x.region)}/${x.id}`)
+              .join('、')
+          }}</code>
+        </label>
+      </a-checkbox-group>
+    </div>
   </a-modal>
 </template>

@@ -5,7 +5,7 @@ import type { RequestLog } from '../api'
 import { requestTokenUsage, tokenCount } from '../lib/request-usage'
 import { outcomeName, protocolName, stageName, logTime, logError, logExplanation } from '../lib/request-log'
 import { t, zone } from '../i18n'
-import { copy, providerLabel, regionLabel } from '../store'
+import { copy, providerLabel, regionLabel, keyName } from '../store'
 const props = defineProps<{ record: RequestLog | null }>()
 const emit = defineEmits<{ close: [] }>()
 const details = computed(() => props.record?.details)
@@ -54,6 +54,11 @@ const cloudCleanup = computed(() => {
           <a-descriptions-item :label="t('调用账号', 'Account')">{{ record.accountName || (record.accountId ? t('账号名称未采集', 'Name not captured') : t('未分配账号', 'Unassigned')) }}</a-descriptions-item>
           <a-descriptions-item :label="t('调度策略', 'Strategy')">{{ strategyName[record.strategy] ? t(...strategyName[record.strategy]) : record.strategy || '—' }}</a-descriptions-item>
           <a-descriptions-item :label="t('账号标识', 'Account ID')" :span="2"><span class="mono">{{ record.accountId || '—' }}</span></a-descriptions-item>
+          <a-descriptions-item label="API Key">{{ keyName(record) || '—' }}</a-descriptions-item>
+          <a-descriptions-item :label="t('Key 缩写', 'Key hint')"><span class="mono">{{ record.keyHint || '—' }}</span></a-descriptions-item>
+          <a-descriptions-item v-if="details?.requestSummary?.omittedImages" :label="t('省略的历史图片', 'Omitted images')" :span="2">
+            {{ details.requestSummary.omittedImages }} {{ t('张', '') }} · {{ (details.requestSummary.omittedImageBytes / 1048576).toFixed(1) }} MiB
+          </a-descriptions-item>
           <a-descriptions-item v-if="skipped.length" :label="t('未参与本次调度', 'Skipped this time')" :span="2">
             <div v-for="(s, i) in skipped" :key="i">{{ providerLabel(s.provider) }} · {{ regionLabel(s.region) }} · {{ s.count }} {{ t('个账号', s.count === 1 ? 'account' : 'accounts') }}：{{ s.reason }}</div>
           </a-descriptions-item>

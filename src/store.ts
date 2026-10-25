@@ -12,6 +12,18 @@ export const PROVIDERS: Array<{ key: ProviderKey; label: string; mark: string }>
 ]
 export const providerLabel = (p?: string) => PROVIDERS.find((x) => x.key === p)?.label ?? (p || '—')
 export const regionLabel = (r?: string) => (r === 'cn' ? t('国内版', 'China') : r === 'intl' ? t('国际版', 'International') : '—')
+/** Same short form the backend stores in records ("ad-1…9f0e"). */
+export function keyHint(value: string) {
+  const [head, tail] = value.length >= 24 ? [4, 4] : [2, 2]
+  return value.length <= head + tail ? '…' : `${value.slice(0, head)}…${value.slice(-tail)}`
+}
+/** Which local API key a record came from: the key's current alias or abbreviation; for deleted keys, what the record stored. */
+export function keyName(r: { keyId?: string; keyHint?: string; keyAlias?: string }) {
+  if (!r.keyId) return ''
+  const live = state.app?.apiKeys?.find((k) => k.id === r.keyId)
+  if (live) return live.alias || keyHint(live.key)
+  return r.keyAlias || r.keyHint || r.keyId
+}
 
 export const state = reactive({
   app: null as AppSnapshot | null,

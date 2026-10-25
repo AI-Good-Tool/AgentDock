@@ -27,7 +27,7 @@ pub struct Hub {
     settings_writer: Mutex<()>,
     /// Keep native switches, durable suspension reasons and runtime marks in step.
     account_writer: Mutex<()>,
-    pub key: crate::api_key::LocalKey,
+    pub keys: crate::api_key::KeyStore,
     pub wb: workbuddy::pool::Shared,
     pub qoder: Arc<qoder::gateway::Provider>,
     pub trae: Arc<trae::Provider>,
@@ -85,15 +85,7 @@ impl Hub {
         let existed = settings_path.exists();
         let mut settings = read_settings(&settings_path);
         let migrate_checkin_switches = existed && settings.version < 2;
-        let key_path = dir.join("api-key");
-        let key = match std::fs::read_to_string(&key_path) {
-            Ok(k) if crate::api_key::validate(k.trim()).is_ok() => k.trim().to_owned(),
-            _ => {
-                let k = crate::api_key::generate();
-                write_private(&key_path, k.as_bytes())?;
-                k
-            }
-        };
+        let keys = crate::api_key::KeyStore::open(dir)?;
         let wb = workbuddy::pool::AppState::new(dir.join("workbuddy/store.json"))?;
         let qoder = qoder::gateway::Provider::new()?;
         let trae = trae::Provider::open(&dir.join("trae"))?;
@@ -119,7 +111,7 @@ impl Hub {
             settings: Mutex::new(settings),
             settings_writer: Mutex::new(()),
             account_writer: Mutex::new(()),
-            key: crate::api_key::LocalKey::new(key),
+            keys,
             wb,
             qoder,
             trae,
@@ -149,7 +141,7 @@ impl Hub {
             settings: Mutex::new(settings),
             settings_writer: Mutex::new(()),
             account_writer: Mutex::new(()),
-            key: crate::api_key::LocalKey::new(key.into()),
+            keys: crate::api_key::KeyStore::fixed(dir, key),
             wb,
             qoder,
             trae,
@@ -201,10 +193,7 @@ impl Hub {
         self.server.lock().unwrap().is_some()
     }
     pub fn api_key(&self) -> String {
-        self.key.get()
-    }
-    pub fn set_api_key(&self, value: String, expected: &str) -> Result<(), String> {
-        self.key.replace(&self.dir.join("api-key"), value, expected)
+        self.keys.primary()
     }
     /// Validate, persist, then publish. Port changes require a stopped gateway.
     pub fn update_settings(&self, change: impl FnOnce(&mut Settings) -> Result<(), String>) -> Result<Settings, String> {
@@ -251,6 +240,24 @@ impl Hub {
     pub fn save_route(&self, route_id: &str, o: RouteOverride) -> Result<(), String> {
         let models = self.upstream_models();
         self.update_settings(|s| {
+            catalog::validate_override(&models, s, route_id, &o)?;
+            s.routes.insert(route_id.to_owned(), o);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+    pub fn link_route(&self, route_id: &str, into: Option<String>) -> Result<(), String> {
+        let models = self.upstream_models();
+        self.update_settings(|s| {
+            let mut o = s.routes.get(route_id).cloned().unwrap_or_default();
+            o.merge_into = into.clone();
+            if into.is_some() && o.disabled {
+                return Err("已停用的模型不能关联，请先启用".into());
+            }
+            if o == RouteOverride::default() {
+                s.routes.remove(route_id);
+                return Ok(());
+            }
             catalog::validate_override(&models, s, route_id, &o)?;
             s.routes.insert(route_id.to_owned(), o);
             Ok(())

@@ -428,6 +428,7 @@ impl Provider {
         let upstream_model = body["model"].as_str().unwrap_or("").to_owned();
         if input.effort_input.is_object() {
             anthropic::apply_effort(&input.effort_input, &mut body, &model_info);
+            details.request_summary["appliedEffort"] = body["reasoning_effort"].clone();
         }
         if let Some(effort) = body["reasoning_effort"].as_str() {
             if model_info["reasoning"]["supportedEfforts"]
@@ -454,12 +455,9 @@ impl Provider {
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         body["metadata"] = json!({"context":{"request_id":request_id,"request_set_id":request_id,"session_id":session,"client_type":"qodercli"},"business":{"id":request_id,"name":"chat","product":"Qoder","version":CLIENT_VERSION,"type":"cli","begin_at":chrono::Utc::now().timestamp_millis()}});
         if body.to_string().len() > MAX_BODY {
-            details.local_error("encoding", "转换后请求超过 32 MiB");
-            return Err(SendFailure::local(
-                413,
-                "request_too_large",
-                "转换后请求超过 32 MiB",
-            ));
+            let message = "Qoder 转换后的请求超过 64 MiB，请压缩会话或使用其他端";
+            details.local_error("encoding", message);
+            return Err(SendFailure::local(413, "request_too_large", message));
         }
         details.upstream_summary = agentdock_core::diagnostics::summary(&body);
         details.upstream_summary["transport"] = json!(config.transport);
@@ -484,12 +482,9 @@ impl Provider {
                 .ok()
                 .map(|u| format!("{}{}", u.origin().ascii_serialization(), u.path()));
             if prepared["body"].as_str().unwrap_or("").len() > MAX_BODY {
-                details.local_error("encoding", "签名后请求超过 32 MiB");
-                return Err(SendFailure::local(
-                    413,
-                    "request_too_large",
-                    "签名后请求超过 32 MiB",
-                ));
+                let message = "Qoder 签名后的请求超过 64 MiB，请压缩会话或使用其他端";
+                details.local_error("encoding", message);
+                return Err(SendFailure::local(413, "request_too_large", message));
             }
             let mut request = self.client.post(url);
             for (name, value) in prepared["headers"].as_object().into_iter().flatten() {

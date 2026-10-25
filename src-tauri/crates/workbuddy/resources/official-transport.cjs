@@ -150,7 +150,7 @@ function createBridge({ key, tokens, variant, connect = https.request }) {
         res.end(JSON.stringify({ error: { type: code, message: code === 'device_token_unavailable'
           ? '官方设备 SDK 暂未取得有效令牌，请检查 WorkBuddy 安装与设备服务状态后重试'
           : code === 'sdk_region_unavailable' ? '设备 SDK 与目标账号区域不匹配，请关闭设备 SDK 后使用跨地区反代'
-          : code === 'request_too_large' ? '请求体超过本地 32 MiB 上限，请缩短会话历史或减少附件后重试'
+          : code === 'request_too_large' ? '请求体超过本地 64 MiB 上限，请缩短会话历史或减少附件后重试'
           : '本机官方请求传输不可用' } }));
       } else res.destroy();
     };
@@ -189,12 +189,12 @@ function createBridge({ key, tokens, variant, connect = https.request }) {
       const chunks = []; let size = 0;
       for await (const chunk of req) {
         size += chunk.length;
-        if (size > 32 * 1024 * 1024) return fail(413, 'request_too_large');
+        if (size > 64 * 1024 * 1024) return fail(413, 'request_too_large');
         chunks.push(chunk);
       }
       const bytes = Buffer.concat(chunks);
       const plain = req.headers['content-encoding'] === 'gzip'
-        ? zlib.gunzipSync(bytes, { maxOutputLength: 32 * 1024 * 1024 }) : bytes;
+        ? zlib.gunzipSync(bytes, { maxOutputLength: 64 * 1024 * 1024 }) : bytes;
       const body = JSON.parse(plain);
       const wire = encode(body);
       // Opt-in only. Never load native SDK, use a cached token or auto-fallback when off.

@@ -240,30 +240,95 @@ fn remote_context(chat: &Value) -> Result<RemoteContext, &'static str> {
     })
 }
 
+const CALL_OPEN: &str = "<client_tool_call>";
+const CALL_CLOSE: &str = "</client_tool_call>";
+
+/// Skip whitespace and a Markdown fence line (```json) around a tool call.
+fn skip_fence(s: &str) -> &str {
+    let s = s.trim_start();
+    match s.strip_prefix("```") {
+        Some(rest) => rest.trim_start_matches(|c: char| c.is_ascii_alphanumeric()).trim_start(),
+        None => s,
+    }
+}
+
+/// Escape raw control characters inside JSON strings (models often write
+/// multi-line file contents or patches with literal newlines).
+fn escape_raw_controls(s: &str) -> String {
+    let (mut out, mut in_string, mut escaped) = (String::with_capacity(s.len() + 64), false, false);
+    for c in s.chars() {
+        if in_string && !escaped && (c as u32) < 0x20 {
+            match c {
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                _ => out.push_str(&format!("\\u{:04x}", c as u32)),
+            }
+            continue;
+        }
+        if in_string && c == '\\' && !escaped {
+            escaped = true;
+        } else {
+            if c == '"' && !escaped {
+                in_string = !in_string;
+            }
+            escaped = false;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The tool call JSON right after an opening tag and the text after its
+/// closing tag. The value is read as JSON first, so a closing tag quoted in
+/// the arguments does not end the call.
+fn read_call(after: &str) -> Result<(Value, &str), String> {
+    let body = skip_fence(after);
+    let mut values = serde_json::Deserializer::from_str(body).into_iter::<Value>();
+    let (call, tail) = match values.next() {
+        Some(Ok(call)) => {
+            let used = values.byte_offset();
+            (call, &body[used..])
+        }
+        Some(Err(strict)) => {
+            let end = body.find(CALL_CLOSE).unwrap_or(body.len());
+            let segment = body[..end].trim_end().trim_end_matches('`').trim_end();
+            let call = serde_json::from_str(&escape_raw_controls(segment))
+                .map_err(|_| format!("tool_call_json:{:?}@{}:{}", strict.classify(), strict.line(), strict.column()))?;
+            (call, &body[end..])
+        }
+        None => return Err("tool_call_empty".into()),
+    };
+    let tail = skip_fence(tail.trim_start().trim_start_matches('`'));
+    match tail.strip_prefix(CALL_CLOSE) {
+        Some(rest) => Ok((call, rest)),
+        // A complete call that ends the reply is unambiguous without its tag.
+        None if tail.trim().is_empty() => Ok((call, "")),
+        None => Err("tool_call_unclosed".into()),
+    }
+}
+
 /// Split the final text into plain text and validated client tool calls.
+/// Errors are content-free issue codes for diagnostics.
 fn parse_tool_reply(text: &str, tools: &[Value], choice: &Value) -> Result<(String, Vec<Value>), String> {
-    const OPEN: &str = "<client_tool_call>";
-    const CLOSE: &str = "</client_tool_call>";
     let mut clean = String::new();
     let mut calls = vec![];
     let mut rest = text;
-    while let Some(at) = rest.find(OPEN) {
+    while let Some(at) = rest.find(CALL_OPEN) {
         clean.push_str(&rest[..at]);
-        let after = &rest[at + OPEN.len()..];
-        let end = after.find(CLOSE).ok_or("invalid_tool_output")?;
-        let call: Value = serde_json::from_str(after[..end].trim()).map_err(|_| "invalid_tool_output")?;
+        let (call, after) = read_call(&rest[at + CALL_OPEN.len()..])?;
         let requested = call["name"].as_str().unwrap_or("");
         // Restore request-local bridge aliases. Exact registered names remain
         // accepted for older conversation history, but unknown names never do.
         let tool = tools.iter().enumerate().find(|(index, _)| tool_alias(*index, tools) == requested)
             .map(|(_, tool)| tool).or_else(|| tools.iter().find(|tool| tool["name"] == requested))
-            .ok_or("invalid_tool_output")?;
-        let name = tool["name"].as_str().ok_or("invalid_tool_output")?;
-        if !call["input"].is_object()
-            || choice["type"] == "none"
-            || (choice["type"] == "tool" && choice["name"] != name)
-        {
-            return Err("invalid_tool_output".into());
+            .ok_or("tool_call_unknown_name")?;
+        let name = tool["name"].as_str().ok_or("tool_call_unknown_name")?;
+        if !call["input"].is_object() {
+            return Err("tool_call_input_not_object".into());
+        }
+        if choice["type"] == "none" || (choice["type"] == "tool" && choice["name"] != name) {
+            return Err("tool_call_against_policy".into());
         }
         calls.push(json!({
             "index": calls.len(),
@@ -271,12 +336,15 @@ fn parse_tool_reply(text: &str, tools: &[Value], choice: &Value) -> Result<(Stri
             "type": "function",
             "function": {"name": name, "arguments": call["input"].to_string()},
         }));
-        rest = &after[end + CLOSE.len()..];
+        rest = after;
     }
     clean.push_str(rest);
     let clean = clean.trim().to_owned();
-    if clean.contains(CLOSE) || (["any", "tool"].contains(&choice["type"].as_str().unwrap_or("")) && calls.is_empty()) {
-        return Err("invalid_tool_output".into());
+    if clean.contains(CALL_CLOSE) {
+        return Err("tool_call_stray_close".into());
+    }
+    if ["any", "tool"].contains(&choice["type"].as_str().unwrap_or("")) && calls.is_empty() {
+        return Err("tool_call_required".into());
     }
     Ok((clean, calls))
 }
@@ -324,6 +392,294 @@ impl RemotePlans {
         } else {
             Ok(self.thoughts.into_iter().map(|(_, thought)| thought).collect::<Vec<_>>().join("\n"))
         }
+    }
+}
+
+/// The Remote agent's own prompt; a one-line turn reports ~23k prompt tokens.
+const REMOTE_PROMPT_TOKENS: u64 = 25_000;
+/// The Remote service fails a session at once when its first message (the
+/// JSON-escaped transcript) exceeds about 1 MiB; 967 KB is accepted.
+const QUERY_LIMIT: usize = 1_000_000;
+
+/// Deliberately high estimate: ~3 UTF-8 bytes per token matches CJK text and
+/// overstates English/code; each image counts ~1.5k tokens.
+fn estimate_tokens(text: &str, images: usize) -> u64 {
+    REMOTE_PROMPT_TOKENS + text.len() as u64 / 3 + images as u64 * 1_500
+}
+
+/// `model_selection_strategy` for a turn of `estimate` tokens: the normal
+/// window, else Max mode (`context_window_tokens.max`) when the model offers
+/// it. `Err(limit)` when neither fits. Models without declared windows keep
+/// the normal mode.
+fn context_strategy(model: &Value, estimate: u64) -> Result<&'static str, u64> {
+    let window = &model["context_window_tokens"];
+    let Some(dev) = window["dev"].as_u64() else { return Ok("manual") };
+    if estimate <= dev {
+        return Ok("manual");
+    }
+    match window["max"].as_u64().filter(|_| model["max_mode"] == true) {
+        Some(max) if estimate <= max => Ok("max"),
+        Some(max) => Err(max),
+        None => Err(dev),
+    }
+}
+
+const SETTLE_POLL: Duration = Duration::from_secs(3);
+
+async fn get_data(url: reqwest::Url, headers: &[(&'static str, String)]) -> Option<Value> {
+    let mut req = http().get(url).timeout(Duration::from_secs(15));
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    let mut body: Value = req.send().await.ok()?.json().await.ok()?;
+    if body["code"].as_i64().is_some_and(|c| c != 0) {
+        return None;
+    }
+    Some(if body["data"].is_object() { body["data"].take() } else { body })
+}
+
+/// The turn's assistant message as the server stored it. Like the official
+/// client's final-message refresh, this polls until the message settles, the
+/// session stops/fails/freezes, or `deadline`. Returns the last assistant
+/// message seen and the last session status.
+async fn settled_reply(base: &str, sid: &str, headers: &[(&'static str, String)], deadline: Instant) -> (Option<Value>, Option<i64>) {
+    let mut session = reqwest::Url::parse(base).expect("remote base");
+    session.path_segments_mut().expect("remote base").push("chat_sessions").push(sid);
+    let mut messages = session.clone();
+    messages.path_segments_mut().expect("remote base").push("messages");
+    messages.query_pairs_mut().append_pair("page_size", "20");
+    let ended = |m: &Value| matches!(m["status"].as_str(), Some("failed" | "error" | "stopped" | "cancelled" | "canceled" | "interrupted" | "aborted"));
+    // A Finished session stores its reply moments later; allow a few polls.
+    let mut finished_polls = 0;
+    loop {
+        let reply = get_data(messages.clone(), headers).await.and_then(|data| {
+            data["items"].as_array()?.iter().rev().find(|m| m["role"] == "assistant").cloned()
+        });
+        if reply.as_ref().is_some_and(|m| m["status"] == "completed") {
+            return (reply, None);
+        }
+        let status = get_data(session.clone(), headers).await.and_then(|data| data["status"].as_i64());
+        finished_polls = if status == Some(5) { finished_polls + 1 } else { 0 };
+        if reply.as_ref().is_some_and(ended) || matches!(status, Some(4 | 6 | 7)) || finished_polls >= 3
+            || Instant::now() + SETTLE_POLL >= deadline {
+            return (reply, status);
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// Status and failure fields (never content) of a stored assistant message.
+fn reply_outcome(reply: Option<&Value>, session_status: Option<i64>) -> Value {
+    let mut out = json!({});
+    for key in ["status", "fail_reason", "error_code", "error_message"] {
+        let value = reply.map_or(&Value::Null, |m| &m[key]);
+        if let Some(text) = value.as_str().filter(|s| !s.is_empty()) {
+            out[key] = json!(text.chars().filter(|c| !c.is_control()).take(300).collect::<String>());
+        } else if value.is_number() {
+            out[key] = json!(value.to_string());
+        }
+    }
+    if let Some(status) = session_status {
+        out["sessionStatus"] = json!(status);
+    }
+    out
+}
+
+fn blocked_tool(details: &mut RequestDetails, name: &str) {
+    // Record only an identifier, never upstream tool arguments/results.
+    let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || "_:-./".contains(*c)).take(128).collect();
+    details.upstream_summary["blockedRemoteTool"] = json!(name);
+}
+
+/// The official client's events-stream resume limits.
+const MAX_RECONNECTS: u32 = 3;
+const MAX_TOTAL_RECONNECTS: u32 = 10;
+
+/// One Remote turn's state, kept across events-stream reconnects.
+struct Turn<'a> {
+    model_name: &'a str,
+    plans: RemotePlans,
+    usage: Option<Value>,
+    confirmed: bool,
+    /// Session reached Finished; the stream may still carry final updates.
+    session_finished: bool,
+    /// Session reported Failed; a stream closing after this is final.
+    session_failed: bool,
+    last_id: Option<String>,
+    progressed: bool,
+    trace: EventTrace,
+}
+impl<'a> Turn<'a> {
+    fn new(model_name: &'a str) -> Self {
+        Self {
+            model_name,
+            plans: RemotePlans::default(),
+            usage: None,
+            confirmed: false,
+            session_finished: false,
+            session_failed: false,
+            last_id: None,
+            progressed: false,
+            trace: EventTrace::default(),
+        }
+    }
+
+    /// `Ok(None)` once the turn has ended; `Ok(Some(reason))` when the stream
+    /// closed first and may be resumed.
+    async fn read(
+        &mut self,
+        response: reqwest::Response,
+        guard: &mut cleanup::Session,
+        details: &mut RequestDetails,
+        started: Instant,
+    ) -> Result<Option<&'static str>, SendFailure> {
+        let mut frames = SseFrames::default();
+        let mut stream = response.bytes_stream();
+        while let Some(part) = stream.next().await {
+            let Ok(part) = part else { return Ok((!self.session_finished).then_some("error")) };
+            if details.first_byte_ms.is_none() {
+                details.first_byte_ms = Some(started.elapsed().as_millis());
+            }
+            details.response_bytes += part.len();
+            for frame in frames.feed(&part).map_err(|e| fail(details, 502, "upstream_protocol_error", &e))? {
+                if frame.id.is_some() {
+                    self.last_id = frame.id;
+                }
+                let Ok(data) = serde_json::from_slice::<Value>(&frame.data) else { continue };
+                let event = frame.event.as_deref().unwrap_or("message");
+                self.progressed = true;
+                self.trace.push(details, event_label(event, &data));
+                if event == "error" || data["code"].as_i64().is_some_and(|c| c != 0)
+                    || agentdock_core::provider::login_rejected(0, &data) {
+                    let code = data["code"].as_i64().map(|c| c.to_string()).unwrap_or_else(|| "upstream_error".into());
+                    let mut f = fail(details, 502, "upstream_business_error", &format!("Trae 上游拒绝请求（{code}）"));
+                    f.error = json!({"code": code});
+                    if agentdock_core::provider::login_rejected(0, &data) { f.effect = AccountEffect::AuthFailed; }
+                    return Err(f);
+                }
+                match event {
+                    "model_config" => {
+                        if data["config_name"].as_str().is_some_and(|n| n != self.model_name) {
+                            return Err(fail(details, 502, "upstream_model_mismatch", "上游实际模型与请求模型不一致，已停止该请求"));
+                        }
+                        self.confirmed = true;
+                    }
+                    "plan_item" => {
+                        if let Err(name) = self.plans.update(&data) {
+                            blocked_tool(details, &name);
+                            details.upstream_summary["remoteStopConfirmed"] = json!(guard.stop().await);
+                            return Err(fail(details, 502, "remote_tool_execution", "上游尝试执行内置工具，已请求停止该会话；详见 blockedRemoteTool"));
+                        }
+                    }
+                    "token_usage" => {
+                        if let (Some(i), Some(o)) = (data["prompt_tokens"].as_u64(), data["completion_tokens"].as_u64()) {
+                            self.usage = Some(json!({"prompt_tokens": i, "completion_tokens": o, "total_tokens": i + o}));
+                        }
+                    }
+                    _ => {}
+                }
+                match turn_end(event, &data) {
+                    Some(TurnEnd::Done) => return Ok(None),
+                    Some(TurnEnd::SessionFinished) => self.session_finished = true,
+                    Some(TurnEnd::Failed(message)) => return Err(fail(details, 502, "truncated_stream", message)),
+                    None => {}
+                }
+                if event == "status_changed" {
+                    self.session_failed = data["new_status"] == 6;
+                }
+            }
+        }
+        Ok(if self.session_finished { None } else { Some("eof") })
+    }
+
+    /// Rebuild the turn from its completed, stored assistant message: the same
+    /// `plan_item`s the stream carries, plus the served model and usage.
+    fn recover(&mut self, reply: &Value, details: &mut RequestDetails) -> Result<(), SendFailure> {
+        let parse = |field: &Value| field.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok());
+        let served = parse(&reply["user_message_context"]).and_then(|c| c["model_info"]["config_name"].as_str().map(str::to_owned));
+        match served.as_deref() {
+            Some(name) if name != self.model_name => {
+                return Err(fail(details, 502, "upstream_model_mismatch", "上游实际模型与请求模型不一致，已停止该请求"));
+            }
+            None if !self.confirmed => {
+                return Err(fail(details, 502, "upstream_protocol_error", "Trae 已完成消息缺少实际模型信息"));
+            }
+            _ => self.confirmed = true,
+        }
+        let content = parse(&reply["content"])
+            .ok_or_else(|| fail(details, 502, "upstream_protocol_error", "Trae 已完成消息的内容无效"))?;
+        for item in content["messages"].as_array().into_iter().flatten().filter(|m| m["type"] == "plan_item") {
+            if let Err(name) = self.plans.update(&item["plan_item"]) {
+                blocked_tool(details, &name);
+                return Err(fail(details, 502, "remote_tool_execution", "上游执行了内置工具，已丢弃该回复；详见 blockedRemoteTool"));
+            }
+        }
+        if let Some(usage) = parse(&reply["token_usage"]) {
+            if let (Some(i), Some(o)) = (usage["prompt_tokens"].as_u64(), usage["completion_tokens"].as_u64()) {
+                self.usage = Some(json!({"prompt_tokens": i, "completion_tokens": o, "total_tokens": i + o}));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TurnEnd {
+    Done,
+    SessionFinished,
+    Failed(&'static str),
+}
+
+/// Terminal events as the official client defines them: `done`, or the
+/// session status moving to Stopped (4) or Finished (5). Failed (6) is not
+/// terminal because the server may retry the turn itself.
+fn turn_end(event: &str, data: &Value) -> Option<TurnEnd> {
+    match event {
+        "done" if data["status"] == "completed" => Some(TurnEnd::Done),
+        "done" => Some(TurnEnd::Failed("Trae 本轮未正常完成")),
+        "status_changed" => match data["new_status"].as_i64() {
+            Some(5) => Some(TurnEnd::SessionFinished),
+            Some(4) => Some(TurnEnd::Failed("Trae 本轮已被停止")),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Content-free outline of the events stream (names, statuses, reconnects)
+/// for diagnosing turns that end early.
+#[derive(Default)]
+struct EventTrace(Vec<(String, u32)>);
+impl EventTrace {
+    fn push(&mut self, details: &mut RequestDetails, label: String) {
+        if let Some((_, count)) = self.0.last_mut().filter(|(last, _)| *last == label) {
+            *count += 1;
+        } else if self.0.len() < 48 {
+            self.0.push((label, 1));
+        } else {
+            return;
+        }
+        details.upstream_summary["events"] = json!(self
+            .0
+            .iter()
+            .map(|(label, n)| if *n > 1 { format!("{label}×{n}") } else { label.clone() })
+            .collect::<Vec<_>>());
+    }
+}
+
+fn event_label(event: &str, data: &Value) -> String {
+    let safe = |s: &str| -> String {
+        s.chars().filter(|c| c.is_ascii_alphanumeric() || "_-.".contains(*c)).take(32).collect()
+    };
+    let detail = match event {
+        "done" => data["status"].as_str().map(safe),
+        "status_changed" => data["new_status"].as_i64().map(|s| s.to_string()),
+        "error" => data["code"].as_i64().map(|c| c.to_string()).or_else(|| data["code"].as_str().map(safe)),
+        _ => None,
+    };
+    match detail {
+        Some(detail) => format!("{}:{detail}", safe(event)),
+        None => safe(event),
     }
 }
 
@@ -382,6 +738,24 @@ pub async fn send(
         )
     })?;
     let model_name = model["name"].as_str().unwrap_or("").to_owned();
+    // Trae fails or drops a turn larger than its window or message cap, so
+    // choose the window before creating anything, like the official picker.
+    let estimate = estimate_tokens(&context.text, context.images.len());
+    let query_bytes = serde_json::to_string(&context.text).map_or(usize::MAX, |s| s.len());
+    let strategy = if query_bytes > QUERY_LIMIT {
+        Err(format!("对话约 {} KB，超过 Trae 单条消息约 1MB 的上限；未创建云端会话，请压缩对话或使用其他端", query_bytes / 1000))
+    } else {
+        context_strategy(&model, estimate).map_err(|limit| {
+            format!("对话约 {estimate} tokens，超过 Trae 此模型 {limit} tokens 的上下文上限；未创建云端会话，请压缩对话或使用其他端")
+        })
+    }
+    .map_err(|message| {
+        let mut failure = fail(details, 400, "context_length_exceeded", &message);
+        details.upstream_summary["estimatedTokens"] = json!(estimate);
+        details.upstream_summary["queryBytes"] = json!(query_bytes);
+        failure.error = json!({"code":"context_length_exceeded"});
+        failure
+    })?;
     let host = base.strip_suffix("/api/remote/v1").unwrap();
     let mut query = vec![json!({"type":"text","data":{"content":context.text}})];
     for (index, image) in images.into_iter().enumerate() {
@@ -405,6 +779,9 @@ pub async fn send(
         "toolBridgeVersion": 2,
         "contextChars": context.text.chars().count(),
         "imageCount": context.images.len(),
+        "estimatedTokens": estimate,
+        "queryBytes": query_bytes,
+        "contextMode": strategy,
     });
 
     // 2) Create the session with the whole conversation as its first message.
@@ -425,7 +802,7 @@ pub async fn send(
             "model_config_source": model["config_source"].as_i64().unwrap_or(1),
             "model_is_preset": model["is_preset"] != false,
             "agent_type": AGENT, "agent_id": AGENT,
-            "model_selection_strategy": "manual",
+            "model_selection_strategy": strategy,
             "common_params": common.to_string(),
         },
     });
@@ -488,80 +865,83 @@ pub async fn send(
             url
         };
 
-        // 3) Read the turn's events until `done`.
-        let mut req = http()
-            .get(session_url)
-            .query(&[("reply_to_message_id", mid)])
-            .timeout(TURN_TIMEOUT);
-        for (k, v) in &headers {
-            req = req.header(*k, v);
-        }
-        let r = req.send().await.map_err(|_| fail(details, 502, "upstream_unreachable", "Trae 事件流连接失败或超时"))?;
-        if !r.status().is_success() {
-            let status = r.status().as_u16();
-            details.upstream_status = Some(status);
-            let msg = format!("Trae 事件流请求失败（HTTP {status}）");
-            let mut failure = fail(details, 502, "upstream_http_error", &msg);
-            if status == 401 { failure.effect = AccountEffect::AuthFailed; }
-            return Err(failure);
-        }
-        let mut frames = SseFrames::default();
-        let mut stream = r.bytes_stream();
-        let mut plans = RemotePlans::default();
-        let mut usage = None;
-        let (mut confirmed, mut finished) = (false, false);
-        'read: while let Some(part) = stream.next().await {
-            let part = part.map_err(|_| fail(details, 502, "truncated_stream", "Trae 事件流意外中断"))?;
-            if details.first_byte_ms.is_none() {
-                details.first_byte_ms = Some(started.elapsed().as_millis());
+        // 3) Read the turn's events until it ends. Like the official client, a
+        // stream that closes before the terminal event is resumed with
+        // `Last-Event-ID`; replayed events are idempotent for `RemotePlans`.
+        let deadline = Instant::now() + TURN_TIMEOUT;
+        let mut turn = Turn::new(&model_name);
+        let (mut consecutive, mut reconnects) = (0u32, 0u32);
+        let finished = loop {
+            let mut req = http()
+                .get(session_url.clone())
+                .query(&[("reply_to_message_id", mid)])
+                .timeout(deadline.saturating_duration_since(Instant::now()));
+            for (k, v) in &headers {
+                req = req.header(*k, v);
             }
-            details.response_bytes += part.len();
-            for frame in frames.feed(&part).map_err(|e| fail(details, 502, "upstream_protocol_error", &e))? {
-                let Ok(data) = serde_json::from_slice::<Value>(&frame.data) else { continue };
-                let event = frame.event.as_deref().unwrap_or("message");
-                if event == "error" || data["code"].as_i64().is_some_and(|c| c != 0)
-                    || agentdock_core::provider::login_rejected(0, &data) {
-                    let code = data["code"].as_i64().map(|c| c.to_string()).unwrap_or_else(|| "upstream_error".into());
-                    let mut f = fail(details, 502, "upstream_business_error", &format!("Trae 上游拒绝请求（{code}）"));
-                    f.error = json!({"code": code});
-                    if agentdock_core::provider::login_rejected(0, &data) { f.effect = AccountEffect::AuthFailed; }
-                    return Err(f);
+            if let Some(id) = &turn.last_id {
+                req = req.header("Last-Event-ID", id);
+            }
+            let ended = match req.send().await {
+                Err(_) => "connect",
+                Ok(r) if !r.status().is_success() => {
+                    let status = r.status().as_u16();
+                    details.upstream_status = Some(status);
+                    let msg = format!("Trae 事件流请求失败（HTTP {status}）");
+                    let mut failure = fail(details, 502, "upstream_http_error", &msg);
+                    if status == 401 { failure.effect = AccountEffect::AuthFailed; }
+                    return Err(failure);
                 }
-                match event {
-                    "model_config" => {
-                        if data["config_name"].as_str().is_some_and(|n| n != model_name) {
-                            return Err(fail(details, 502, "upstream_model_mismatch", "上游实际模型与请求模型不一致，已停止该请求"));
-                        }
-                        confirmed = true;
+                Ok(r) => match turn.read(r, &mut guard, details, started).await? {
+                    None => break true,
+                    Some(ended) => ended,
+                },
+            };
+            if turn.session_failed {
+                break false;
+            }
+            // Attempts reset once a connection delivers events again.
+            if std::mem::take(&mut turn.progressed) {
+                consecutive = 0;
+            }
+            consecutive += 1;
+            let delay = Duration::from_secs(3 << (consecutive - 1));
+            if consecutive > MAX_RECONNECTS || reconnects >= MAX_TOTAL_RECONNECTS || Instant::now() + delay >= deadline {
+                break false;
+            }
+            reconnects += 1;
+            turn.trace.push(details, format!("reconnect:{ended}"));
+            details.upstream_summary["eventReconnects"] = json!(reconnects);
+            tokio::time::sleep(delay).await;
+        };
+        if !finished || !turn.confirmed {
+            // Long prompts can outlast the events stream; the official client
+            // then reads the finished turn from the message list.
+            let (reply, session_status) = settled_reply(&base, sid, &headers, deadline).await;
+            let outcome = reply_outcome(reply.as_ref(), session_status);
+            details.upstream_summary["finalMessage"] = outcome.clone();
+            match reply.filter(|m| m["status"] == "completed") {
+                Some(reply) => {
+                    turn.recover(&reply, details)?;
+                    turn.trace.push(details, "recovered:messages".into());
+                }
+                None => {
+                    let reason = ["error_message", "fail_reason", "error_code"].into_iter().find_map(|k| outcome[k].as_str());
+                    let message = match (reason, session_status, reconnects) {
+                        (Some(reason), _, _) => format!("Trae 本轮执行失败：{reason}"),
+                        (None, Some(6), _) => "Trae 云端会话执行失败且未给出原因（对话过长时常见），请压缩对话或使用其他端".to_owned(),
+                        (None, _, 0) => "Trae 事件流在完成前结束".to_owned(),
+                        (None, _, n) => format!("Trae 事件流在完成前结束（已按官方方式续传 {n} 次）"),
+                    };
+                    let mut failure = fail(details, 502, "truncated_stream", &message);
+                    if let Some(code) = outcome["error_code"].as_str() {
+                        failure.error = json!({"code": code});
                     }
-                    "plan_item" => {
-                        if let Err(name) = plans.update(&data) {
-                            // Record only an identifier, never upstream tool arguments/results.
-                            let name: String = name.chars().filter(|c| c.is_ascii_alphanumeric() || "_:-./".contains(*c)).take(128).collect();
-                            details.upstream_summary["blockedRemoteTool"] = json!(name);
-                            details.upstream_summary["remoteStopConfirmed"] = json!(guard.stop().await);
-                            return Err(fail(details, 502, "remote_tool_execution", "上游尝试执行内置工具，已请求停止该会话；详见 blockedRemoteTool"));
-                        }
-                    }
-                    "token_usage" => {
-                        if let (Some(i), Some(o)) = (data["prompt_tokens"].as_u64(), data["completion_tokens"].as_u64()) {
-                            usage = Some(json!({"prompt_tokens": i, "completion_tokens": o, "total_tokens": i + o}));
-                        }
-                    }
-                    "done" => {
-                        if data["status"] != "completed" {
-                            return Err(fail(details, 502, "truncated_stream", "Trae 本轮未正常完成"));
-                        }
-                        finished = true;
-                        break 'read;
-                    }
-                    _ => {}
+                    return Err(failure);
                 }
             }
         }
-        if !finished || !confirmed {
-            return Err(fail(details, 502, "truncated_stream", "Trae 事件流在完成前结束"));
-        }
+        let Turn { plans, usage, .. } = turn;
         guard.finished = true;
         details.stream_complete = true;
         let text = plans.output().map_err(|message| fail(details, 502, "invalid_tool_output", message))?;
@@ -571,8 +951,13 @@ pub async fn send(
         if text.len() > OUTPUT_LIMIT {
             return Err(fail(details, 502, "output_limit", "上游输出超过 1MB"));
         }
-        let (clean, calls) = parse_tool_reply(&text, &tools, &choice)
-            .map_err(|_| fail(details, 502, "invalid_tool_output", "上游返回的客户端工具调用格式无效"))?;
+        let (clean, calls) = parse_tool_reply(&text, &tools, &choice).map_err(|issue| {
+            // Shape only (issue code, sizes), never the reply itself.
+            details.upstream_summary["toolOutputIssue"] = json!(issue);
+            details.upstream_summary["replyChars"] = json!(text.chars().count());
+            details.upstream_summary["toolCallTags"] = json!(text.matches(CALL_OPEN).count());
+            fail(details, 502, "invalid_tool_output", &format!("上游返回的客户端工具调用格式无效（{issue}）"))
+        })?;
         let finish = if calls.is_empty() { "stop" } else { "tool_calls" };
         details.finish_reason = Some(finish.into());
 
@@ -652,16 +1037,26 @@ mod tests {
         assert_eq!(calls[0]["function"]["name"], "ls");
         assert_eq!(calls[0]["function"]["arguments"], "{\"p\":1}");
         assert_eq!(parse_tool_reply("plain", &tools, &auto).unwrap(), ("plain".into(), vec![]));
-        for bad in [
-            "<client_tool_call>{\"name\":\"rm\",\"input\":{}}</client_tool_call>",
-            "<client_tool_call>{\"name\":\"ls\",\"input\":[]}</client_tool_call>",
-            "<client_tool_call>{oops</client_tool_call>",
-            "<client_tool_call>{\"name\":\"ls\",\"input\":{}}",
+        for (bad, issue) in [
+            ("<client_tool_call>{\"name\":\"rm\",\"input\":{}}</client_tool_call>", "tool_call_unknown_name"),
+            ("<client_tool_call>{\"name\":\"ls\",\"input\":[]}</client_tool_call>", "tool_call_input_not_object"),
+            ("<client_tool_call>{oops</client_tool_call>", "tool_call_json:Syntax@1:2"),
+            ("<client_tool_call>{\"name\":\"ls\",\"input\":{}} then more text", "tool_call_unclosed"),
+            ("done</client_tool_call>", "tool_call_stray_close"),
         ] {
-            assert!(parse_tool_reply(bad, &tools, &auto).is_err(), "{bad}");
+            assert_eq!(parse_tool_reply(bad, &tools, &auto).unwrap_err(), issue, "{bad}");
         }
-        assert!(parse_tool_reply("no call", &tools, &json!({"type":"any"})).is_err());
-        assert!(parse_tool_reply("<client_tool_call>{\"name\":\"ls\",\"input\":{}}</client_tool_call>", &tools, &json!({"type":"none"})).is_err());
+        // Common model slips still yield the intended call: a fence, literal
+        // newlines in strings, a quoted closing tag, a final call without its tag.
+        let edit = |text: &str| parse_tool_reply(text, &tools, &auto).map(|(clean, calls)| (clean, calls[0]["function"]["arguments"].clone()));
+        assert_eq!(edit("<client_tool_call>\n```json\n{\"name\":\"ls\",\"input\":{\"p\":1}}\n```\n</client_tool_call>").unwrap(), ("".into(), json!("{\"p\":1}")));
+        let (_, args) = edit("<client_tool_call>{\"name\":\"ls\",\"input\":{\"patch\":\"line 1\n\tline \\\"2\\\"\"}}</client_tool_call> ok").unwrap();
+        assert_eq!(serde_json::from_str::<Value>(args.as_str().unwrap()).unwrap()["patch"], "line 1\n\tline \"2\"");
+        let (_, args) = edit("<client_tool_call>{\"name\":\"ls\",\"input\":{\"code\":\"x = '</client_tool_call>'\"}}</client_tool_call>").unwrap();
+        assert!(args.as_str().unwrap().contains("</client_tool_call>"));
+        assert_eq!(edit("checking <client_tool_call>{\"name\":\"ls\",\"input\":{}}").unwrap(), ("checking".into(), json!("{}")));
+        assert_eq!(parse_tool_reply("no call", &tools, &json!({"type":"any"})).unwrap_err(), "tool_call_required");
+        assert_eq!(parse_tool_reply("<client_tool_call>{\"name\":\"ls\",\"input\":{}}</client_tool_call>", &tools, &json!({"type":"none"})).unwrap_err(), "tool_call_against_policy");
     }
     #[test]
     fn tool_choice_maps_openai_and_anthropic_shapes() {
@@ -669,6 +1064,30 @@ mod tests {
         assert_eq!(tool_choice(&json!({"tool_choice":"none"})), json!({"type":"none"}));
         assert_eq!(tool_choice(&json!({"tool_choice":{"type":"function","function":{"name":"ls"}}})), json!({"type":"tool","name":"ls"}));
         assert!(valid_model_name("deepseek-v4.1-flash") && !valid_model_name("bad name") && !valid_model_name(""));
+    }
+    #[test]
+    fn turn_end_and_event_trace_follow_the_official_terminal_rules() {
+        assert_eq!(turn_end("done", &json!({"status":"completed"})), Some(TurnEnd::Done));
+        assert!(matches!(turn_end("done", &json!({"status":"failed"})), Some(TurnEnd::Failed(_))));
+        assert_eq!(turn_end("status_changed", &json!({"new_status":5})), Some(TurnEnd::SessionFinished));
+        assert!(matches!(turn_end("status_changed", &json!({"new_status":4})), Some(TurnEnd::Failed(_))));
+        for status in [1, 6, 8] {
+            assert_eq!(turn_end("status_changed", &json!({"new_status":status})), None, "{status}");
+        }
+        assert_eq!(turn_end("heartbeat", &json!({})), None);
+        assert_eq!(event_label("error", &json!({"code":4001,"message":"PRIVATE"})), "error:4001");
+        assert_eq!(event_label("text_message", &json!({"content":"PRIVATE"})), "text_message");
+        assert_eq!(event_label("done", &json!({"status":"fail ed\n"})), "done:failed");
+        let mut details = RequestDetails::default();
+        let mut trace = EventTrace::default();
+        for label in ["heartbeat", "heartbeat", "plan_item", "heartbeat"] {
+            trace.push(&mut details, label.into());
+        }
+        assert_eq!(details.upstream_summary["events"], json!(["heartbeat×2", "plan_item", "heartbeat"]));
+        for n in 0..100 {
+            trace.push(&mut details, format!("e{n}"));
+        }
+        assert_eq!(details.upstream_summary["events"].as_array().unwrap().len(), 48);
     }
     #[test]
     fn finish_announcement_and_later_parameter_updates_are_merged() {

@@ -177,7 +177,8 @@ async fn fixture() -> Fixture {
                     let tool = &body["tools"][0]["function"];
                     chunks.push(json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":tool["name"],"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}));
                 } else {
-                    chunks.push(json!({"choices":[{"index":0,"delta":{"content":format!("OK from {}", body["model"].as_str().unwrap())}}]}));
+                    let effort = body["reasoning_effort"].as_str().map(|e| format!(" effort={e}")).unwrap_or_default();
+                    chunks.push(json!({"choices":[{"index":0,"delta":{"content":format!("OK from {}{effort}", body["model"].as_str().unwrap())}}]}));
                     chunks.push(json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}));
                 }
                 chunks.push(json!({"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}));
@@ -210,6 +211,7 @@ async fn fixture() -> Fixture {
     let sessions: Arc<std::sync::Mutex<HashMap<String, (String, String)>>> = Arc::default();
     let created = sessions.clone();
     let delete_sessions = sessions.clone();
+    let message_sessions = sessions.clone();
     let trae_upstream = Router::new()
         .route(
             "/api/ide/v1/get_resource_upload_url",
@@ -302,13 +304,23 @@ async fn fixture() -> Fixture {
         )
         .route(
             "/api/remote/v1/chat_sessions/{sid}/events",
-            axum::routing::get(move |axum::extract::Path(sid): axum::extract::Path<String>| {
+            axum::routing::get(move |axum::extract::Path(sid): axum::extract::Path<String>, headers: axum::http::HeaderMap| {
                 let sessions = sessions.clone();
                 let plan_mode = plan_mode.clone();
                 let events_started = events_started.clone();
                 async move {
-                    events_started.fetch_add(1,Ordering::SeqCst);
+                    let connection = events_started.fetch_add(1,Ordering::SeqCst);
                     use axum::response::IntoResponse;
+                    // Mode 9: the stream loses every content event of a long
+                    // turn; only the message list holds the finished reply.
+                    if plan_mode.load(Ordering::SeqCst) == 9 {
+                        let wire = if connection == 0 {
+                            "event: status_changed\ndata: {\"new_status\":3}\n\nevent: metadata\ndata: {}\n\n"
+                        } else {
+                            "event: status_changed\ndata: {\"new_status\":5}\n\n"
+                        };
+                        return ([("content-type", "text/event-stream")], wire).into_response();
+                    }
                     if plan_mode.load(Ordering::SeqCst) == 405 {
                         return axum::http::StatusCode::UNAUTHORIZED.into_response();
                     }
@@ -344,13 +356,22 @@ async fn fixture() -> Fixture {
                             json!({"id":"p2","tool_call_info":{"name":"finish","params":{"summary":reply}}})
                         }));
                     }
-                    events.extend([
-                        ("token_usage", json!({"prompt_tokens":3,"completion_tokens":2})),
-                        ("done", json!({"status":"completed"})),
-                    ]);
+                    events.push(("token_usage", json!({"prompt_tokens":3,"completion_tokens":2})));
+                    // Mode 8 ends via the session status only, like the official terminal rule.
+                    events.push(if mode == 8 { ("status_changed", json!({"new_status":5})) } else { ("done", json!({"status":"completed"})) });
+                    // Mode 7 closes after two events; only a correct Last-Event-ID resumes it.
+                    let resume = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<usize>().ok());
+                    let (skip, take) = match (mode, resume) {
+                        (7, None) => (0, 2),
+                        (7, Some(n)) => (n, usize::MAX),
+                        _ => (0, usize::MAX),
+                    };
                     let wire = events
                     .iter()
-                    .map(|(e, d)| format!("event: {e}\ndata: {d}\n\n"))
+                    .enumerate()
+                    .skip(skip)
+                    .take(take)
+                    .map(|(i, (e, d))| if mode == 7 { format!("id: {}\nevent: {e}\ndata: {d}\n\n", i + 1) } else { format!("event: {e}\ndata: {d}\n\n") })
                     .collect::<String>();
                     ([("content-type", "text/event-stream")], wire).into_response()
                 }
@@ -364,6 +385,22 @@ async fn fixture() -> Fixture {
                 let code = status.load(Ordering::SeqCst) as u16;
                 if code == 204 { sessions.lock().unwrap().remove(&sid); }
                 axum::http::StatusCode::from_u16(code).unwrap()
+            }
+        }).get(|| async { Json(json!({"code":0,"data":{"status":5}})) }))
+        .route("/api/remote/v1/chat_sessions/{sid}/messages", axum::routing::get(move |axum::extract::Path(sid): axum::extract::Path<String>| {
+            let sessions = message_sessions.clone();
+            async move {
+                let (model, _) = sessions.lock().unwrap().get(&sid).cloned().unwrap();
+                let content = json!({"messages":[
+                    {"type":"plan_item","plan_item":{"id":"p1","thought":"thinking"}},
+                    {"type":"plan_item","plan_item":{"id":"p2","tool_call_info":{"name":"finish","params":{"summary":format!("recovered from {model}")}}}},
+                ]});
+                Json(json!({"code":0,"data":{"items":[
+                    {"role":"user","status":"in_progress"},
+                    {"role":"assistant","status":"completed","content":content.to_string(),
+                     "user_message_context":json!({"model_info":{"config_name":model}}).to_string(),
+                     "token_usage":json!({"prompt_tokens":7,"completion_tokens":4}).to_string()},
+                ]}}))
             }
         }))
         .route("/api/remote/v1/chat_sessions/{sid}/stop", post(move || {
@@ -389,7 +426,7 @@ async fn fixture() -> Fixture {
             disabled_accounts: vec![],
         },
         HashMap::from([
-            ("cn".into(), vec![json!({"id":"q-shared","name":"Shared"}), json!({"id":"q-only","name":"QoderOnly"}), json!({"id":"q-flaky","name":"Flaky"}), json!({"id":"q-gate","name":"Gate"}), json!({"id":"q-queue","name":"Queued"}), json!({"id":"q-auth-http","name":"AuthHttp"}), json!({"id":"q-auth-stream","name":"AuthStream"}), json!({"id":"q-auth-late","name":"AuthLate"})]),
+            ("cn".into(), vec![json!({"id":"q-shared","name":"Shared"}), json!({"id":"q-only","name":"QoderOnly"}), json!({"id":"q-flaky","name":"Flaky"}), json!({"id":"q-gate","name":"Gate"}), json!({"id":"q-queue","name":"Queued"}), json!({"id":"q-auth-http","name":"AuthHttp"}), json!({"id":"q-auth-stream","name":"AuthStream"}), json!({"id":"q-auth-late","name":"AuthLate"}), json!({"id":"q-think","name":"Think","reasoning":{"supportedEfforts":["low","medium","xhigh","none"],"defaultEffort":"medium"}})]),
             ("intl".into(), vec![json!({"id":"q-shared-i","name":"Shared"}), json!({"id":"q-gate-i","name":"Gate"})]),
         ]),
     );
@@ -520,6 +557,82 @@ async fn aliases_apply_to_requests_lists_logs_and_all_protocols() {
 }
 
 #[tokio::test]
+async fn each_api_key_uses_its_own_scope_and_strategy_and_is_recorded() {
+    use crate::api_key::KeyFields;
+    use crate::settings::Strategy;
+    let f = fixture().await;
+    let scope = std::collections::BTreeMap::from([(agentdock_core::provider::ProviderKind::Trae, vec!["cn".to_owned()])]);
+    let ci = f.hub.keys.create(None, KeyFields { alias: "ci".into(), enabled: true, strategy: Some(Strategy::Ordered), scope: Some(scope) }).unwrap();
+    let send = |key: String, model: &'static str| {
+        let url = format!("{}/v1/chat/completions", f.url);
+        async move { client().post(url).bearer_auth(key).json(&chat(model)).send().await.unwrap() }
+    };
+    for _ in 0..3 {
+        let r = send(ci.key.clone(), "Shared").await;
+        assert_eq!(r.status(), 200);
+    }
+    // Models outside the key's scope are neither listed nor served.
+    let models: Value = client().get(format!("{}/v1/models", f.url)).header("x-api-key", &ci.key).send().await.unwrap().json().await.unwrap();
+    let listed: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(listed.contains(&"Shared") && !listed.contains(&"QoderOnly"), "{listed:?}");
+    assert_eq!(send(ci.key.clone(), "QoderOnly").await.status(), 400);
+    // The default key keeps the global scope.
+    assert_eq!(send(KEY.into(), "QoderOnly").await.status(), 200);
+    let logs = wait_logs(&f, 5).await;
+    let by_ci: Vec<_> = logs.iter().filter(|l| l.key_id == ci.id).collect();
+    assert_eq!(by_ci.len(), 4);
+    for l in by_ci.iter().filter(|l| l.status == 200) {
+        assert_eq!((l.provider.as_str(), l.region.as_str(), l.strategy.as_str()), ("trae", "cn", "Ordered"));
+        assert_eq!((l.key_alias.as_str(), l.key_hint.as_str()), ("ci", crate::api_key::abbreviate(&ci.key).as_str()));
+    }
+    let default = logs.iter().find(|l| l.key_id == "default").unwrap();
+    assert_eq!((default.key_alias.as_str(), default.strategy.as_str()), ("", "RoundRobin"));
+    assert!(!serde_json::to_string(&logs).unwrap().contains(&ci.key), "records never hold the key itself");
+    let stats = crate::logs::statistics(&f.hub.logs.usage_rows(), &json!({"keyId": ci.id}), 0);
+    assert_eq!(stats["summary"]["records"], 4);
+    assert_eq!(stats["apiKeys"][0]["label"], "ci");
+    // A global pin outside the key's scope does not lock the key out.
+    let qoder = f.hub.pool_accounts().into_iter().find(|a| a.provider == agentdock_core::provider::ProviderKind::Qoder).unwrap().key();
+    f.hub.update_settings(|s| {
+        s.pinned.insert("all".into(), qoder.clone());
+        Ok(())
+    }).unwrap();
+    assert_eq!(send(ci.key.clone(), "Shared").await.status(), 200);
+    assert_eq!(send(KEY.into(), "QoderOnly").await.status(), 200);
+    let logs = wait_logs(&f, 7).await;
+    assert_eq!((logs[0].provider.as_str(), logs[1].provider.as_str()), ("qoder", "trae"), "{logs:?}");
+    // A disabled key is refused before anything else.
+    f.hub.keys.update(&ci.id, KeyFields { alias: "ci".into(), enabled: false, ..KeyFields::default() }).unwrap();
+    let r = send(ci.key.clone(), "Shared").await;
+    assert_eq!(r.status(), 401);
+    assert_eq!(r.json::<Value>().await.unwrap()["error"]["code"], "api_key_disabled");
+}
+
+#[tokio::test]
+async fn merged_model_shares_the_destination_pool_and_keeps_its_name() {
+    let f = fixture().await;
+    let routes = f.hub.routes(&f.hub.settings());
+    let id = |name: &str| crate::catalog::resolve(&routes, name).unwrap().route_id.clone();
+    let (only, shared) = (id("QoderOnly"), id("Shared"));
+    f.hub.link_route(&only, Some(shared.clone())).unwrap();
+    let models: Value = client().get(format!("{}/v1/models", f.url)).bearer_auth(KEY).send().await.unwrap().json().await.unwrap();
+    let listed: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(listed.contains(&"Shared") && !listed.contains(&"QoderOnly"), "{listed:?}");
+    let r = post_json(&f, "/v1/chat/completions", chat("QoderOnly")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(wait_logs(&f, 1).await[0].model, "Shared");
+    // An account offering both targets falls back to the merged one.
+    f.hub.runtime.lock().unwrap().model_cooldown.insert(("qoder/cn:u1".into(), "q-shared".into()), i64::MAX);
+    let r = post_json(&f, "/qoder/cn/v1/chat/completions", chat("Shared")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(wait_logs(&f, 2).await[0].real_model, "q-only");
+    // Undoing the merge removes the override entirely.
+    f.hub.link_route(&only, None).unwrap();
+    assert!(!f.hub.settings().routes.contains_key(&only));
+    assert_eq!(crate::catalog::resolve(&f.hub.routes(&f.hub.settings()), "QoderOnly").unwrap().route_id, only);
+}
+
+#[tokio::test]
 async fn tools_roundtrip_on_every_provider_including_the_trae_text_bridge() {
     let f = fixture().await;
     let body = json!({"model":"Shared","max_tokens":64,"tools":[{"name":"read","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"use a tool"}]});
@@ -552,6 +665,74 @@ async fn tools_roundtrip_on_every_provider_including_the_trae_text_bridge() {
 }
 
 const IMAGE_DATA: &str = "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAF0lEQVR4nGP4z8BAEiJN9aiGUQ1DSgMAkPn/Afnh+ngAAAAASUVORK5CYII=";
+
+#[tokio::test]
+async fn trae_events_stream_closed_early_resumes_from_last_event_id() {
+    let f = fixture().await;
+    f.trae_plan_mode.store(7, Ordering::SeqCst);
+    let r = post_json(&f, "/trae/cn/v1/chat/completions", chat("Shared")).await;
+    assert_eq!(r.status(), 200);
+    let value: Value = r.json().await.unwrap();
+    assert!(value["choices"][0]["message"]["content"].as_str().unwrap().contains("你好 from"), "{value}");
+    assert_eq!(f.trae_events.load(Ordering::SeqCst), 2, "one resumed connection");
+    let log = &wait_logs(&f, 1).await[0];
+    let summary = &log.details["upstreamSummary"];
+    assert_eq!(summary["eventReconnects"], 1);
+    assert_eq!(summary["events"], json!(["model_config", "plan_item", "reconnect:eof", "plan_item", "token_usage", "done:completed"]));
+    assert_eq!(log.usage["total_tokens"], 5);
+
+    // The session reaching Finished ends the turn even without `done`.
+    let f = fixture().await;
+    f.trae_plan_mode.store(8, Ordering::SeqCst);
+    let r = post_json(&f, "/trae/cn/v1/chat/completions", chat("Shared")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(f.trae_events.load(Ordering::SeqCst), 1);
+    let log = &wait_logs(&f, 1).await[0];
+    assert!(log.details["upstreamSummary"].get("eventReconnects").is_none());
+}
+
+#[tokio::test]
+async fn trae_turn_whose_events_were_lost_is_read_back_from_the_message_list() {
+    let f = fixture().await;
+    f.trae_plan_mode.store(9, Ordering::SeqCst);
+    let r = post_json(&f, "/trae/cn/v1/chat/completions", chat("Shared")).await;
+    assert_eq!(r.status(), 200);
+    let value: Value = r.json().await.unwrap();
+    assert_eq!(value["choices"][0]["message"]["content"], "recovered from shared-real", "{value}");
+    let log = &wait_logs(&f, 1).await[0];
+    let summary = &log.details["upstreamSummary"];
+    assert_eq!(summary["events"], json!(["status_changed:3", "metadata", "reconnect:eof", "status_changed:5", "recovered:messages"]));
+    assert_eq!(summary["finalMessage"], json!({"status":"completed"}));
+    assert_eq!(log.usage["total_tokens"], 11);
+    assert_eq!(summary["cloudSessionCleanup"], "deleted");
+}
+
+#[tokio::test]
+async fn conversation_over_the_trae_message_cap_moves_to_other_providers_without_a_session() {
+    let f = fixture().await;
+    let body = json!({"model":"Shared","messages":[{"role":"user","content":"x".repeat(1_100_000)}]});
+    for _ in 0..3 {
+        let r = post_json(&f, "/v1/chat/completions", body.clone()).await;
+        assert_eq!(r.status(), 200);
+    }
+    assert_eq!(f.trae_calls.load(Ordering::SeqCst), 0, "no Trae session is created");
+    let logs = wait_logs(&f, 4).await;
+    let refused: Vec<_> = logs.iter().filter(|l| l.provider == "trae").collect();
+    assert!(!refused.is_empty(), "rotation reached Trae at least once");
+    for log in &refused {
+        assert_eq!(log.outcome, "retried");
+        assert_eq!(log.upstream_code.as_deref(), Some("context_length_exceeded"));
+        // One refusal excludes every Trae account for that request.
+        assert_eq!(refused.iter().filter(|l| l.request_group == log.request_group).count(), 1);
+        assert!(logs.iter().any(|l| l.request_group == log.request_group && l.provider == "qoder" && l.outcome == "completed"));
+    }
+
+    // Trae alone has no alternative: the client sees the context error.
+    let r = post_json(&f, "/trae/cn/v1/chat/completions", body).await;
+    assert_eq!(r.status(), 400);
+    let error: Value = r.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "context_length_exceeded", "{error}");
+}
 
 #[tokio::test]
 async fn delayed_trae_finish_parameters_work_with_large_namespaced_tool_requests() {
@@ -777,6 +958,42 @@ async fn trae_images_cross_all_protocols_and_upload_failures_never_drop_images()
 }
 
 #[tokio::test]
+async fn only_the_newest_images_go_upstream_when_limited() {
+    let f = fixture().await;
+    let image = |_: &str| json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{IMAGE_DATA}")}});
+    let body = json!({"model":"Shared","messages":[
+        {"role":"user","content":[{"type":"text","text":"first"},image("a")]},
+        {"role":"assistant","content":"seen a"},
+        {"role":"user","content":[{"type":"text","text":"second"},image("b")]},
+        {"role":"assistant","content":"seen b"},
+        {"role":"user","content":[{"type":"text","text":"now"},image("c"),image("d")]},
+    ]});
+    f.hub.update_settings(|s| {
+        s.recent_images = Some(1);
+        Ok(())
+    }).unwrap();
+    assert_eq!(post_json(&f, "/trae/v1/chat/completions", body.clone()).await.status(), 200);
+    // This turn's two images stay even above the limit; both older ones go.
+    assert_eq!(f.trae_uploads.load(Ordering::SeqCst), 2);
+    let query = f.trae_queries.lock().unwrap().last().unwrap().to_string();
+    assert_eq!(query.matches("An earlier image was omitted").count(), 2, "{query}");
+    let log = &wait_logs(&f, 1).await[0];
+    assert_eq!(log.details["requestSummary"]["omittedImages"], 2);
+    assert!(log.details["requestSummary"]["omittedImageBytes"].as_u64().unwrap() > 0);
+    // Unlimited (the default) sends every image.
+    f.hub.update_settings(|s| {
+        s.recent_images = None;
+        Ok(())
+    }).unwrap();
+    assert_eq!(post_json(&f, "/trae/v1/chat/completions", body).await.status(), 200);
+    assert_eq!(f.trae_uploads.load(Ordering::SeqCst), 6);
+    assert!(f.hub.update_settings(|s| {
+        s.recent_images = Some(0);
+        Ok(())
+    }).is_err());
+}
+
+#[tokio::test]
 async fn rate_limited_accounts_cool_down_and_traffic_moves_to_other_providers() {
     let f = fixture().await;
     // The Qoder 429 happens before any output, so the request fails over to Trae.
@@ -833,6 +1050,53 @@ async fn in_stream_qoder_rejections_fail_over_before_output_and_cool_down_only_t
     let r = post_json(&f, "/qoder/cn/v1/messages", json!({"model":"Gate","max_tokens":8,"messages":[{"role":"user","content":"hi"}]})).await;
     assert_eq!(r.status(), 403);
     assert_eq!(r.json::<Value>().await.unwrap()["error"]["type"], "permission_error");
+}
+
+#[tokio::test]
+async fn claude_code_and_codex_effort_sliders_map_to_levels_the_model_offers() {
+    let f = fixture().await;
+    let messages = |effort: &str, thinking: &str| json!({"model":"Think","max_tokens":16,"output_config":{"effort":effort},"thinking":{"type":thinking},"messages":[{"role":"user","content":"hi"}]});
+    let cases = [
+        ("/v1/messages", messages("low", "enabled"), "low"),
+        ("/v1/messages", messages("high", "enabled"), "xhigh"),
+        ("/v1/messages", messages("max", "enabled"), "xhigh"),
+        ("/v1/messages", messages("high", "disabled"), "none"),
+        ("/v1/responses", json!({"model":"Think","input":"hi","reasoning":{"effort":"minimal"}}), "low"),
+        ("/v1/responses", json!({"model":"Think","input":"hi","reasoning":{"effort":"high"}}), "xhigh"),
+        ("/v1/chat/completions", json!({"model":"Think","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}), "xhigh"),
+    ];
+    for (path, body, used) in &cases {
+        let r = post_json(&f, path, body.clone()).await;
+        assert_eq!(r.status(), 200, "{path} {body}");
+        let text = r.text().await.unwrap();
+        assert!(text.contains(&format!("OK from q-think effort={used}")), "{path} {body}: {text}");
+    }
+    let logs = wait_logs(&f, cases.len()).await;
+    assert!(logs.iter().all(|l| l.outcome == "completed"));
+    assert!(logs.iter().any(|l| l.details["requestSummary"]["appliedEffort"] == "xhigh"));
+    // The model list carries Codex catalog levels so the client shows a slider.
+    let list: Value = client().get(format!("{}/v1/models", f.url)).bearer_auth(KEY).send().await.unwrap().json().await.unwrap();
+    let think = list["data"].as_array().unwrap().iter().find(|m| m["id"] == "Think").unwrap();
+    let levels: Vec<&Value> = think["supported_reasoning_levels"].as_array().unwrap().iter().map(|l| &l["effort"]).collect();
+    assert_eq!(levels, [&json!("none"), &json!("low"), &json!("medium"), &json!("xhigh")]);
+    assert_eq!(think["default_reasoning_level"], "medium");
+}
+
+#[tokio::test]
+async fn codex_default_hosted_web_search_does_not_block_the_turn() {
+    let f = fixture().await;
+    let body = json!({"model":"Think","stream":true,"input":"hi","reasoning":{"effort":"high","summary":"auto"},
+        "include":["reasoning.encrypted_content"],"store":false,"parallel_tool_calls":true,"tool_choice":"auto",
+        "tools":[{"type":"function","name":"exec_command","parameters":{"type":"object"}},
+            {"type":"namespace","name":"mcp__node_repl","tools":[{"type":"function","name":"js","parameters":{"type":"object"}}]},
+            {"type":"web_search","external_web_access":true}]});
+    let r = post_json(&f, "/v1/responses", body).await;
+    assert_eq!(r.status(), 200);
+    let text = r.text().await.unwrap();
+    assert!(text.contains("response.completed"), "{text}");
+    let log = &wait_logs(&f, 1).await[0];
+    assert_eq!(log.outcome, "completed");
+    assert_eq!(log.details["requestSummary"]["skippedHostedTools"], json!(["web_search"]));
 }
 
 #[tokio::test]

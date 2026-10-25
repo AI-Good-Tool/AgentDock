@@ -1,13 +1,8 @@
 import { t } from '../i18n'
-import type { TokenStatsGroup, TokenStatsTotals, CreditStatsDailyPoint } from '../statistics-types'
-export type StatsRange = 'today' | '7d' | '30d' | 'month' | 'total'
-export const ranges = () => [
-  { label: t('今天', 'Today'), value: 'today' },
-  { label: t('近 7 天', 'Last 7 days'), value: '7d' },
-  { label: t('近 30 天', 'Last 30 days'), value: '30d' },
-  { label: t('本月', 'This month'), value: 'month' },
-  { label: t('全部', 'All'), value: 'total' },
-]
+import { inRange as inDayRange, type RangeKey } from './range'
+import type { TokenStatsGroup, TokenStatsTotals } from '../statistics-types'
+export type StatsRange = RangeKey
+export type CustomRange = [string, string] | null
 export const sourceNames = (): Record<string, string> => ({
   workbuddy: t('WorkBuddy 国内版', 'WorkBuddy China'),
   'workbuddy-ai': t('WorkBuddy 国际版', 'WorkBuddy International'),
@@ -46,19 +41,9 @@ export function dateKey(at: number = Date.now()) {
 export function shiftDay(day: string, offset: number) {
   return new Date(Date.parse(`${day}T12:00:00Z`) + offset * 86400000).toISOString().slice(0, 10)
 }
-export function inRange(day: string, range: StatsRange, at = Date.now()) {
-  const today = dateKey(at)
-  const start =
-    range === 'today'
-      ? today
-      : range === '7d'
-        ? shiftDay(today, -6)
-        : range === '30d'
-          ? shiftDay(today, -29)
-          : range === 'month'
-            ? `${today.slice(0, 7)}-01`
-            : '0000'
-  return day >= start && day <= today
+/** Official WorkBuddy days are Shanghai dates. */
+export function inRange(day: string, range: StatsRange, custom?: CustomRange) {
+  return inDayRange(day, range, custom, dateKey())
 }
 export function sumTokens(rows: Partial<TokenStatsTotals>[]): TokenStatsTotals {
   const out = emptyTotals()
@@ -70,11 +55,8 @@ export function sumTokens(rows: Partial<TokenStatsTotals>[]): TokenStatsTotals {
   out.cacheHitRate = out.input > 0 ? out.cacheRead / out.input : null
   return out
 }
-export function periodTokens(daily: TokenStatsGroup[], range: StatsRange) {
-  return sumTokens(daily.filter((p) => inRange(p.key, range)))
-}
-export function creditFor(daily: CreditStatsDailyPoint[] | undefined, range: StatsRange): number {
-  return (daily ?? []).filter((p) => inRange(p.date, range)).reduce((s, p) => s + p.usage, 0)
+export function periodTokens(daily: TokenStatsGroup[], range: StatsRange, custom?: CustomRange) {
+  return sumTokens(daily.filter((p) => inRange(p.key, range, custom)))
 }
 export function requestDate(value: string | number) {
   if (

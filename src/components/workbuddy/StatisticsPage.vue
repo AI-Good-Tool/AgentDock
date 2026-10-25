@@ -11,7 +11,6 @@ import type {
   TokenStatsSource,
 } from '../../statistics-types'
 import {
-  ranges,
   exact,
   sourceNames,
   emptyTotals,
@@ -24,13 +23,15 @@ import {
 } from '../../lib/statistics'
 import { logTime } from '../../lib/request-log'
 import StatsTrend from './StatsTrend.vue'
+import RangePicker from '../RangePicker.vue'
 const props = defineProps<{ kind: 'credits' | 'tokens' }>()
 const busy = ref(false),
   remoteBusy = ref(false),
   error = ref('')
 const credit = ref<CreditStatistics | null>(null),
   token = ref<TokenStatistics | null>(null)
-const range = ref<StatsRange>('30d'),
+const range = ref<StatsRange>('today'),
+  rangeCustom = ref<[string, string] | null>(null),
   variant = ref('all'),
   account = ref('all'),
   creditMode = ref('official')
@@ -104,7 +105,7 @@ watch(
   },
   { immediate: true }
 )
-watch([range, variant, account, source, trendModel, creditMode], () => (day.value = ''))
+watch([range, rangeCustom, variant, account, source, trendModel, creditMode], () => (day.value = ''))
 watch(variant, () => (account.value = 'all'))
 watch(source, () => {
   trendModel.value = 'all'
@@ -156,7 +157,7 @@ const creditDaily = computed(() => {
   const rows = usingOfficial.value ? officialRows.value.filter((a) => a.ok) : visibleAccounts.value
   for (const a of rows)
     for (const p of a.daily ?? [])
-      if (inRange(p.date, range.value)) result.set(p.date, (result.get(p.date) ?? 0) + p.usage)
+      if (inRange(p.date, range.value, rangeCustom.value)) result.set(p.date, (result.get(p.date) ?? 0) + p.usage)
   return [...result]
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([date, value]) => ({ date, value }))
@@ -182,7 +183,7 @@ const creditModels = computed(() => {
   const result = new Map<string, { model: string; credit: number; requestCount: number }>()
   for (const a of officialRows.value.filter((a) => a.ok))
     for (const p of a.daily ?? []) {
-      if (!inRange(p.date, range.value) || (day.value && p.date !== day.value)) continue
+      if (!inRange(p.date, range.value, rangeCustom.value) || (day.value && p.date !== day.value)) continue
       for (const m of p.models ?? []) {
         const old = result.get(m.model) ?? { model: m.model, credit: 0, requestCount: 0 }
         old.credit += m.credit
@@ -205,7 +206,7 @@ const accountRows = computed(() =>
         usage:
           usingOfficial.value && !o?.ok
             ? null
-            : daily.filter((d) => inRange(d.date, range.value)).reduce((s, d) => s + d.usage, 0),
+            : daily.filter((d) => inRange(d.date, range.value, rangeCustom.value)).reduce((s, d) => s + d.usage, 0),
       }
     })
     .sort((a, b) => (b.usage ?? -1) - (a.usage ?? -1))
@@ -214,7 +215,7 @@ const creditRequests = computed(() =>
   (official.value?.requests ?? []).filter(
     (r) =>
       visibleIds.value.has(r.accountId) &&
-      inRange(requestDate(r.requestTime), range.value) &&
+      inRange(requestDate(r.requestTime), range.value, rangeCustom.value) &&
       (!day.value || requestDate(r.requestTime) === day.value)
   )
 )
@@ -222,15 +223,15 @@ const localEvents = computed(() =>
   (credit.value?.events ?? []).filter(
     (e) =>
       (e.accountId ? visibleIds.value.has(e.accountId) : variant.value === 'all') &&
-      inRange(e.date, range.value) &&
+      inRange(e.date, range.value, rangeCustom.value) &&
       (!day.value || e.date === day.value)
   )
 )
 const currentSource = computed(() => token.value?.sources.find((s) => s.source === source.value))
 const tokenSummary = computed(() =>
-  range.value === 'total'
+  range.value === 'all'
     ? (currentSource.value?.summary ?? emptyTotals())
-    : periodTokens(currentSource.value?.daily ?? [], range.value)
+    : periodTokens(currentSource.value?.daily ?? [], range.value, rangeCustom.value)
 )
 const trendPoints = computed(() => {
   const rows =
@@ -238,7 +239,7 @@ const trendPoints = computed(() => {
       ? currentSource.value?.daily
       : currentSource.value?.dailyByModel?.[trendModel.value]
   return (rows ?? [])
-    .filter((r) => inRange(r.key, range.value))
+    .filter((r) => inRange(r.key, range.value, rangeCustom.value))
     .sort((a, b) => a.key.localeCompare(b.key))
     .map((r) => ({
       date: r.key,
@@ -248,9 +249,9 @@ const trendPoints = computed(() => {
     }))
 })
 const tokenModels = computed(() => {
-  if (range.value === 'total') return currentSource.value?.models ?? []
+  if (range.value === 'all') return currentSource.value?.models ?? []
   return Object.entries(currentSource.value?.dailyByModel ?? {})
-    .map(([key, daily]) => ({ key, ...periodTokens(daily, range.value) }))
+    .map(([key, daily]) => ({ key, ...periodTokens(daily, range.value, rangeCustom.value) }))
     .filter((r) => r.records > 0)
     .sort((a, b) => b.total - a.total)
 })
@@ -260,7 +261,7 @@ const ranking = computed(() =>
 const tokenRequests = computed(() =>
   (currentSource.value?.requests ?? []).filter(
     (r) =>
-      inRange(dateKey(r.timestamp), range.value) &&
+      inRange(dateKey(r.timestamp), range.value, rangeCustom.value) &&
       (!day.value || dateKey(r.timestamp) === day.value) &&
       (trendModel.value === 'all' || r.model === trendModel.value)
   )
@@ -368,12 +369,7 @@ const labels = computed<Record<string, string>>(() => ({
           style="width: 200px"
           :aria-label="t('Token 数据来源', 'Token source')"
         />
-        <a-select
-          v-model="range"
-          :options="ranges()"
-          style="width: 130px"
-          :aria-label="t('统计时间范围', 'Range')"
-        />
+        <RangePicker v-model="range" v-model:custom="rangeCustom" :today="dateKey()" />
       </div>
       <div class="statistics-filters">
         <a-button :loading="busy" @click="load"><IconRefresh /> {{ t('刷新本地统计', 'Refresh local stats') }}</a-button>
