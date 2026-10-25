@@ -97,7 +97,11 @@ pub fn to_chat(input: &Value) -> Result<Value, String> {
         .as_array()
         .filter(|a| !a.is_empty())
         .ok_or("messages 必须是非空数组")?;
-    for row in rows {
+    // Histories written by older gateway builds can hold a tool_use with an
+    // empty id, answered by a tool_result with an empty tool_use_id. Pair them
+    // in order under a position-derived id so the conversation stays usable.
+    let mut unnamed = std::collections::VecDeque::<String>::new();
+    for (row_index, row) in rows.iter().enumerate() {
         let role = row["role"].as_str().ok_or("消息缺少 role")?;
         // Claude Code sends mid-conversation system updates. Collect these
         // below into the leading system message required by chat providers.
@@ -118,13 +122,18 @@ pub fn to_chat(input: &Value) -> Result<Value, String> {
         let mut parts = vec![];
         let mut calls = vec![];
         let mut thinking = String::new();
-        for block in blocks {
+        for (block_index, block) in blocks.iter().enumerate() {
             match block["type"].as_str() {
                 Some("tool_use") if role == "assistant" => {
-                    let id = block["id"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .ok_or("tool_use 缺少 id")?;
+                    let id = match block["id"].as_str() {
+                        Some(s) if !s.is_empty() => s.to_owned(),
+                        Some(_) => {
+                            let id = format!("toolu_agentdock_{row_index}_{block_index}");
+                            unnamed.push_back(id.clone());
+                            id
+                        }
+                        None => return Err("tool_use 缺少 id".into()),
+                    };
                     let name = block["name"]
                         .as_str()
                         .filter(|s| !s.is_empty())
@@ -137,10 +146,11 @@ pub fn to_chat(input: &Value) -> Result<Value, String> {
                 Some("tool_result") if role == "user" => {
                     // Every result precedes user text from the same turn, so parallel
                     // tool calls stay contiguous and matched to their tool_calls.
-                    let id = block["tool_use_id"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .ok_or("tool_result 缺少 tool_use_id")?;
+                    let id = match block["tool_use_id"].as_str() {
+                        Some(s) if !s.is_empty() => s.to_owned(),
+                        Some(_) => unnamed.pop_front().ok_or("tool_result 缺少 tool_use_id")?,
+                        None => return Err("tool_result 缺少 tool_use_id".into()),
+                    };
                     let content = match block.get("content") {
                         None => json!(""),
                         Some(v) if v.is_string() => v.clone(),
@@ -317,7 +327,8 @@ pub fn from_completion(value: &Value, model: &str) -> Result<Value, String> {
         if !args.is_object() {
             return Err("上游工具参数必须是 JSON 对象".into());
         }
-        content.push(json!({"type":"tool_use","id":tool["id"].as_str().ok_or("上游工具缺少 id")?,"name":tool["function"]["name"].as_str().ok_or("上游工具缺少 name")?,"input":args}));
+        let id = tool["id"].as_str().filter(|s| !s.is_empty()).map(str::to_owned).unwrap_or_else(crate::stream::tool_call_id);
+        content.push(json!({"type":"tool_use","id":id,"name":tool["function"]["name"].as_str().ok_or("上游工具缺少 name")?,"input":args}));
     }
     Ok(
         json!({"id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"type":"message","role":"assistant","model":model,"content":content,"stop_reason":stop_reason(choice["finish_reason"].as_str().unwrap_or(""))?,"stop_sequence":null,"usage":usage(&value["usage"])}),
@@ -438,8 +449,10 @@ impl Stream {
     }
     fn tool(&mut self, index: u64, fragment: &Value, out: &mut Vec<u8>) -> Result<(), String> {
         let mut tool = self.tools.remove(&index).unwrap_or_default();
-        if let Some(id) = fragment["id"].as_str() {
-            tool.id.push_str(id);
+        if let Some(id) = fragment["id"].as_str().filter(|s| !s.is_empty()) {
+            if tool.id.is_empty() {
+                tool.id = id.into();
+            }
         }
         if let Some(name) = fragment["function"]["name"]
             .as_str()
@@ -455,8 +468,11 @@ impl Stream {
         if tool.args.len() > 1024 * 1024 {
             return Err("上游工具参数过大".into());
         }
-        if !args.is_empty() && tool.block.is_none() && !tool.id.is_empty() && !tool.name.is_empty()
-        {
+        if !args.is_empty() && tool.block.is_none() && !tool.name.is_empty() {
+            // The id comes with the first fragment or not at all.
+            if tool.id.is_empty() {
+                tool.id = crate::stream::tool_call_id();
+            }
             tool.block = Some(self.block(
                 "tool_use",
                 json!({"type":"tool_use","id":tool.id,"name":tool.name,"input":{}}),
@@ -478,8 +494,11 @@ impl Stream {
         let reason = stop_reason(self.finish.as_deref().unwrap_or(""))?;
         let mut tools = std::mem::take(&mut self.tools);
         for tool in tools.values_mut() {
-            if tool.id.is_empty() || tool.name.is_empty() {
-                return Err("上游工具缺少名称或 id".into());
+            if tool.name.is_empty() {
+                return Err("上游工具缺少名称".into());
+            }
+            if tool.id.is_empty() {
+                tool.id = crate::stream::tool_call_id();
             }
             let args = if tool.args.is_empty() {
                 "{}"
@@ -825,5 +844,48 @@ mod tests {
             events(&adapter.feed(&vec![b'x'; 1024 * 1024 + 1]))[0]["type"],
             "error"
         );
+    }
+    #[test]
+    fn empty_tool_ids_from_old_histories_are_paired_stably() {
+        let input = json!({"model":"m","max_tokens":8,"messages":[
+            {"role":"user","content":"ask"},
+            {"role":"assistant","content":[{"type":"text","text":"q"},{"type":"tool_use","id":"","name":"AskUserQuestion","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"","content":"rejected","is_error":true}]},
+            {"role":"assistant","content":[{"type":"tool_use","id":"real","name":"Read","input":{}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"real","content":"ok"},{"type":"text","text":"next"}]}
+        ]});
+        let chat = to_chat(&input).unwrap();
+        let m = chat["messages"].as_array().unwrap();
+        let id = m[1]["tool_calls"][0]["id"].as_str().unwrap();
+        assert!(!id.is_empty());
+        assert_eq!(m[2]["tool_call_id"], id);
+        assert_eq!(m[4]["tool_call_id"], "real");
+        assert_eq!(to_chat(&input).unwrap(), chat, "ids are stable for prompt caching");
+        let mut orphan = input.clone();
+        orphan["messages"][1]["content"][1]["id"] = json!("x");
+        assert!(to_chat(&orphan).is_err(), "an empty result still needs an empty-id call");
+    }
+    #[test]
+    fn upstream_tool_ids_survive_empty_repeats_and_are_never_empty() {
+        let repeat = [
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_q","function":{"name":"Ask","arguments":""}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"","function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}),
+        ];
+        let missing = [json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"Ask","arguments":"{}"}}]},"finish_reason":"tool_calls"}]})];
+        for (chunks, expected) in [(&repeat[..], Some("call_q")), (&missing[..], None)] {
+            let source = chunks.iter().map(|c| format!("data: {c}\n\n")).collect::<String>() + "data: [DONE]\n\n";
+            let e = events(&Stream::new("m").feed(source.as_bytes()));
+            let block = e.iter().find(|e| e["content_block"]["type"] == "tool_use").unwrap();
+            let id = block["content_block"]["id"].as_str().unwrap();
+            assert!(expected.map_or(!id.is_empty(), |x| x == id), "{id}");
+            assert_eq!(e.last().unwrap()["type"], "message_stop");
+            let mut aggregate = crate::stream::Aggregate::new("m");
+            for c in chunks {
+                aggregate.push(c).unwrap();
+            }
+            let message = from_completion(&aggregate.finish(), "m").unwrap();
+            let id = message["content"][0]["id"].as_str().unwrap();
+            assert!(expected.map_or(!id.is_empty(), |x| x == id), "{id}");
+        }
     }
 }

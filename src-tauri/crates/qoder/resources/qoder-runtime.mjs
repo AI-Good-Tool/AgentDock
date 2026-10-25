@@ -14,16 +14,15 @@ async function load(edition) {
     process.env.AGENTDOCK_QODER_SOURCE ||
     `/Applications/${app}.app/Contents/Resources/app.asar.unpacked/node_modules/@qoder-ai/${sdk}/dist/_worker/qoder-worker-runtime.obf.mjs`;
   let code = await readFile(source, 'utf8');
-  // Supported formats:
-  // 1) legacy (SDK 1.0.50/1.0.51, app <=0.4.4): ok(),Zir(async()=> ... function pO() / function Gm()
-  // 2) current (app 0.4.8+, obfuscated chunks renamed): fx(),vsr(async()=> ... dynamically detected
-  const entries = ['ok(),Zir(async()=>', 'fx(),vsr(async()=>'];
-  let at = -1;
-  for (const entry of entries) {
-    const i = code.lastIndexOf(entry);
-    if (i >= 0 && i > code.length - 2000) { at = i; break; }
-  }
-  if (at < 0) throw new Error('当前 Qoder 运行时版本不受支持，请更新适配器');
+  // The bundle ends by starting the CLI; cut it off there. Obfuscated names
+  // change per release, so match the shape rather than the names:
+  //   app <=0.4.4  ok(),Zir(async()=>...
+  //   app 0.4.8    fx(),vsr(async()=>...
+  //   app 0.4.11   Hm(),"sites"===process.argv[2]?...:(LvA(async A=>...
+  const tail = code.length - 2000;
+  const entry = [...code.slice(tail).matchAll(/\w+\(\),(?:"sites"===process\.argv\[2\]\?|\w+\(async\b)/g)].pop();
+  if (!entry) throw new Error('当前 Qoder 运行时版本不受支持，请更新适配器');
+  const at = tail + entry.index;
   const loaderMatch = [...code.matchAll(/async function (\w+)\(\)\{return (\w+)\|\|(\w+)\|\|/g)]
     .find((m) => code.slice(m.index, m.index + 2400).includes('qoder_auth_wasm'));
   const initMatch = code.match(
@@ -32,6 +31,8 @@ async function load(edition) {
   if (!loaderMatch || !initMatch) throw new Error('当前 Qoder 运行时版本不受支持，请更新适配器');
   const wasmLoader = loaderMatch[1];
   const wasmInit = initMatch[1];
+  // Report the CLI version the installed runtime itself reports (getVersion fallback).
+  const version = code.match(/function \w+\(\)\{return (\w+)&&"UNKNOWN"!==\1\?\1:"([^"]+)"\}/)?.[2] || '1.1.66';
   const hash = createHash('sha256').update(code).digest('hex').slice(0, 20);
   const dir = process.env.AGENTDOCK_QODER_CACHE || join(homedir(), '.agentdock', 'qoder', 'runtime-cache');
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -44,12 +45,12 @@ async function load(edition) {
     await rename(temp, file);
   }
   const module = await import(pathToFileURL(file).href);
-  return await module.wasmOnly();
+  return { wasm: await module.wasmOnly(), version };
 }
 
 async function main(input) {
-  const wasm = await load(input.edition ?? 'intl');
-  if (input.op === 'check') return { ok: true, capabilities: ['prepare_models', 'decrypt', 'runtime_auth'] };
+  const { wasm, version } = await load(input.edition ?? 'intl');
+  if (input.op === 'check') return { ok: true, version, capabilities: ['prepare_models', 'decrypt', 'runtime_auth'] };
   if (input.op === 'decrypt') {
     let text = input.text;
     try { text = wasm.decrypt_server_response(text); } catch { /* Plain JSON is also valid. */ }
@@ -58,7 +59,7 @@ async function main(input) {
   const fields = JSON.parse(wasm.generate_runtime_auth_fields(JSON.stringify({
     uid: input.uid, security_oauth_token: input.token, ...(typeof input.dataPolicyAgreed === 'boolean' ? {data_policy_agreed:input.dataPolicyAgreed} : {}),
   })));
-  const ctx = new wasm.QoderContext(input.machineId, '1.1.66', JSON.stringify({
+  const ctx = new wasm.QoderContext(input.machineId, version, JSON.stringify({
     uid: input.uid, encrypt_user_info: fields.encrypt_user_info, key: fields.key, ...(typeof input.dataPolicyAgreed === 'boolean' ? {data_policy_agreed:input.dataPolicyAgreed} : {}),
   }), JSON.stringify({client_type:'5',business_product:'cli',business_type:'agent',scene:'assistant'}));
   try {

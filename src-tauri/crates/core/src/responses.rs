@@ -523,7 +523,7 @@ impl Stream {
                 if t.get("type").is_some_and(|v| v != "function") {
                     return Err("上游返回不支持的工具类型".into());
                 }
-                if let Some(id) = t["id"].as_str() {
+                if let Some(id) = t["id"].as_str().filter(|s| !s.is_empty()) {
                     if tool.item.is_some() && tool.call != id {
                         return Err("流中工具调用 ID 改变".into());
                     }
@@ -538,8 +538,11 @@ impl Stream {
                 let delta = t["function"]["arguments"].as_str().unwrap_or("");
                 tool.args.push_str(delta);
                 if !delta.is_empty() && tool.item.is_none() {
-                    if tool.call.is_empty() || tool.name.is_empty() {
-                        return Err("上游工具调用缺少 ID 或名称".into());
+                    if tool.name.is_empty() {
+                        return Err("上游工具调用缺少名称".into());
+                    }
+                    if tool.call.is_empty() {
+                        tool.call = crate::stream::tool_call_id();
                     }
                     tool.item=Some(self.add(json!({"type":"function_call","id":format!("fc_{}",uuid::Uuid::new_v4().simple()),"call_id":tool.call,"name":tool.name,"arguments":"","status":"in_progress"}),out));
                 }

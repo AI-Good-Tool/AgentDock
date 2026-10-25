@@ -41,6 +41,11 @@ impl StreamFailure {
 pub type EventStream =
     Pin<Box<dyn Stream<Item = Result<UpstreamEvent, StreamFailure>> + Send + 'static>>;
 
+/// Id for an upstream tool call that arrived without one.
+pub fn tool_call_id() -> String {
+    format!("call_{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Incremental SSE frame splitter with hard size limits. Yields the joined
 /// `data:` payload of each complete frame and its optional `event:` name.
 #[derive(Default)]
@@ -184,7 +189,8 @@ impl Aggregate {
                         json!({"type":"function","id":"","function":{"name":"","arguments":""}}),
                     );
                 }
-                if tool["id"].is_string() {
+                // Some upstreams repeat `"id":""` on later fragments; keep the first real id.
+                if tool["id"].as_str().is_some_and(|s| !s.is_empty()) && calls[i]["id"] == "" {
                     calls[i]["id"] = tool["id"].clone();
                 }
                 for field in ["name", "arguments"] {
@@ -200,6 +206,12 @@ impl Aggregate {
     /// Final value: tool-call-only replies carry null content, as upstream SDKs expect.
     pub fn finish(mut self) -> Value {
         let m = &mut self.value["choices"][0]["message"];
+        // Clients echo tool ids back with the results; never hand out an empty one.
+        for call in m["tool_calls"].as_array_mut().into_iter().flatten() {
+            if call["id"].as_str().is_none_or(str::is_empty) {
+                call["id"] = json!(tool_call_id());
+            }
+        }
         if m["tool_calls"].as_array().is_some_and(|a| !a.is_empty()) && m["content"] == "" {
             m["content"] = Value::Null;
         }
