@@ -1,7 +1,7 @@
 //! Thin adapter around the MIT Switch core; credentials never leave Rust.
 use crate::pool::{self, Account, ModelLimit, Shared};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wb_switch_core::modules as switch;
 
 fn source_account(a: &Account) -> Result<Value, String> {
@@ -15,7 +15,9 @@ fn source_account(a: &Account) -> Result<Value, String> {
         .ok_or("Switch 来源中找不到此账号".into())
 }
 
-pub fn refresh_local(state: &Shared) -> Result<(), String> {
+/// Scan local clients and rate limits. Accounts in `frozen` (disabled by the
+/// user) keep their previous limits; their display details still refresh.
+pub fn refresh_local(state: &Shared, frozen: &HashSet<String>) -> Result<(), String> {
     let accounts = state.store.lock().unwrap().accounts.clone();
     let source = switch::limits::get_rate_limits_read_only();
     let cli = switch::codebuddy_cli::status();
@@ -59,7 +61,9 @@ pub fn refresh_local(state: &Shared) -> Result<(), String> {
                 })
             })
             .collect::<Vec<_>>();
-        external.insert(a.id.clone(), limits);
+        if !frozen.contains(&a.id) {
+            external.insert(a.id.clone(), limits);
+        }
         let name = if meta["displayField"] == "note" {
             meta["note"].as_str()
         } else if meta["displayField"] == "phone" {
@@ -75,6 +79,11 @@ pub fn refresh_local(state: &Shared) -> Result<(), String> {
                 "cli":cli["activeAccountId"]==source_id,"ide":ide["activeAccountId"]==source_id,"vscode":vscode["activeAccountId"]==source_id}}));
     }
     let mut rt = state.runtime.lock().unwrap();
+    for id in frozen {
+        if let Some(previous) = rt.external_limits.remove(id) {
+            external.insert(id.clone(), previous);
+        }
+    }
     rt.external_limits = external;
     rt.presentations = presentations;
     rt.clients = json!({"cli":{"available":cli["configured"]==true,"migrationRequired":cli["migrationRequired"]},
@@ -120,6 +129,7 @@ pub fn switch_client(
     id: &str,
     target: &str,
     confirmed: bool,
+    frozen: &HashSet<String>,
 ) -> Result<Value, String> {
     if !confirmed {
         return Err("请先确认客户端重启和登录态改写".into());
@@ -143,7 +153,7 @@ pub fn switch_client(
         "vscode" => switch::vscode_ext::switch_account(source_id, true),
         _ => Err("不支持的客户端".into()),
     }?;
-    refresh_local(state)?;
+    refresh_local(state, frozen)?;
     // Core switch reports may include profile metadata: keep the frontend result minimal.
     Ok(json!({"ok":true,"target":target,"status":result["status"]}))
 }
@@ -171,11 +181,12 @@ pub fn observe_limit(state: &Shared, id: &str, model: &str, data: &Value) -> boo
     state.record_model_limit(id, model, reset).is_ok()
 }
 
-pub async fn run_local_monitor(state: Shared) {
+/// `frozen` is read before every scan, so enabling an account applies on the next tick.
+pub async fn run_local_monitor(state: Shared, frozen: impl Fn() -> HashSet<String>) {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tick.tick().await;
-        let state = state.clone();
-        let _ = tokio::task::spawn_blocking(move || refresh_local(&state)).await;
+        let (state, frozen) = (state.clone(), frozen());
+        let _ = tokio::task::spawn_blocking(move || refresh_local(&state, &frozen)).await;
     }
 }

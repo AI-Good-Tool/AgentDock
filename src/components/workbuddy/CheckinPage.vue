@@ -29,8 +29,7 @@ const emit = defineEmits<{
 }>()
 const search = ref(''),
   filter = ref('all'),
-  settingsOpen = ref(false),
-  historyOpen = ref(false)
+  settingsOpen = ref(false)
 const start = ref('09:00'),
   end = ref('24:00'),
   dirty = ref(false)
@@ -59,7 +58,7 @@ const labels = computed(() => ({
   unknown: t('今日未查询', 'Not queried'),
 }))
 const done = computed(() => accounts.value.filter((a) => status(a) === 'done').length)
-const enabled = computed(() => accounts.value.filter((a) => a.checkinEnabled).length)
+const enabled = computed(() => accounts.value.filter((a) => a.checkinEnabled && !a.disabled).length)
 const failed = computed(() => accounts.value.filter((a) => status(a) === 'error').length)
 const reward = computed(() =>
   accounts.value
@@ -93,15 +92,6 @@ const shown = computed(() =>
         (filter.value === 'enabled' && a.checkinEnabled))
   )
 )
-const records = computed(() =>
-  [...(props.snapshot.checkinRecords || [])]
-    .filter((r) => r.at >= props.now - 30 * 86400000)
-    .reverse()
-)
-const name = (id: string) => {
-  const a = props.snapshot.accounts.find((a) => a.id === id)
-  return a ? accountName(a) : t('已移除账号', 'Removed account')
-}
 const time = (v?: number) => (v ? fmtShort(v) : '—')
 function clearWindow() {
   start.value = ''
@@ -171,7 +161,6 @@ const configuredWindow = computed(() => {
         <a-button v-if="!autoHint" size="small" @click="settingsOpen = !settingsOpen"
           ><template #icon><IconSettings /></template>{{ t('签到设置', 'Settings') }}</a-button
         >
-        <a-button size="small" @click="historyOpen = !historyOpen">{{ t('操作记录', 'History') }}</a-button>
       </div>
     </div>
   </section>
@@ -258,18 +247,26 @@ const configuredWindow = computed(() => {
       v-for="a in shown"
       :key="a.id"
       class="checkin-account"
-      :class="{ 'card-done': status(a) === 'done' }"
+      :class="{ 'card-done': status(a) === 'done', 'card-disabled': a.disabled }"
     >
       <header class="ca-heading">
         <div class="ca-avatar">{{ accountName(a).slice(0, 1) }}</div>
         <div class="ca-identity">
           <h3 :title="accountName(a)">{{ accountName(a) }}</h3>
           <span
-            >{{ a.checkinEnabled ? t('参与签到', 'Check-in on') : t('自动 / 批量签到已关闭', 'Auto / batch off') }} ·
-            {{ a.enabled ? t('反代开启', 'Proxy on') : t('反代关闭', 'Proxy off') }}</span
+            >{{
+              a.disabled
+                ? t('账号已禁用 · 不参与自动 / 批量签到', 'Disabled · left out of auto / batch')
+                : a.checkinEnabled
+                  ? t('参与签到', 'Check-in on')
+                  : t('自动 / 批量签到已关闭', 'Auto / batch off')
+            }}
+            · {{ a.enabled ? t('反代开启', 'Proxy on') : t('反代关闭', 'Proxy off') }}</span
           >
         </div>
+        <a-tag v-if="a.disabled">{{ t('已禁用', 'Disabled') }}</a-tag>
         <a-tag
+          v-else
           :color="
             status(a) === 'done'
               ? 'green'
@@ -323,6 +320,7 @@ const configuredWindow = computed(() => {
           <a-switch
             size="small"
             :model-value="a.checkinEnabled"
+            :disabled="a.disabled"
             :loading="busy(a.id)"
             :aria-label="accountName(a) + t('参与签到', ' check-in')"
             @change="(v) => emit('toggleAccount', a, !!v)"
@@ -355,39 +353,6 @@ const configuredWindow = computed(() => {
     </article>
   </div>
   <a-empty v-if="!shown.length" class="empty-panel" :description="t('没有符合条件的国内版账号', 'No matching China accounts')" />
-  <section v-if="historyOpen" class="checkin-history">
-    <h3>{{ t('签到操作记录', 'Check-in history') }} <small>{{ t('最近 30 天，最多 1,000 条 · 仅本机保存', 'Last 30 days, up to 1,000 · stored locally') }}</small></h3>
-    <a-empty v-if="!records.length" :description="t('暂无操作记录', 'No records')" />
-    <div v-else class="history-scroll">
-      <table>
-        <thead>
-          <tr>
-            <th>{{ t('时间', 'Time') }}</th>
-            <th>{{ t('账号', 'Account') }}</th>
-            <th>{{ t('操作', 'Action') }}</th>
-            <th>{{ t('结果', 'Result') }}</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(r, i) in records" :key="r.at + ':' + i">
-            <td>{{ time(r.at) }}</td>
-            <td>{{ name(r.accountId) }}</td>
-            <td>{{ r.submit ? t('核验并签到', 'Check in') : t('查询状态', 'Query') }}</td>
-            <td :class="{ 'error-text': r.error }">
-              {{
-                r.error ||
-                (r.status?.today_checked_in
-                  ? t('今日已签到', 'Checked in')
-                  : r.status?.active === false
-                    ? t('活动未开放', 'Not open')
-                    : t('待签到', 'Pending'))
-              }}
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
   <p class="checkin-footnote">
     {{ t('关闭页面不停止自动任务，退出应用后停止。手动批量立即执行，不受自动签到时间段限制。', 'Leaving the page keeps auto tasks running until the app quits. Manual batches run immediately, outside the window.') }}
     {{ t(`国际版 ${snapshot.accounts.filter((a) => a.variant === 'ai').length} 个账号不参与此接口。`, `${snapshot.accounts.filter((a) => a.variant === 'ai').length} international accounts are excluded.`) }}
@@ -491,8 +456,7 @@ h3 {
   align-items: center;
   gap: 7px;
 }
-.checkin-settings,
-.checkin-history {
+.checkin-settings {
   background: var(--surface);
   border: 1px solid var(--c-dfe8e2);
   border-radius: 14px;
@@ -566,6 +530,16 @@ h3 {
 }
 .card-done {
   border-color: var(--c-c9e7d8);
+}
+.checkin-account.card-disabled {
+  border-style: dashed;
+  border-color: var(--c-c4ccd0);
+  box-shadow: none;
+}
+.card-disabled .ca-avatar,
+.card-disabled .ca-metrics {
+  filter: grayscale(1);
+  opacity: 0.55;
 }
 .ca-heading {
   display: flex;
@@ -668,37 +642,6 @@ h3 {
 .error-text,
 .summary-metrics .error-text {
   color: var(--c-b24e42);
-}
-.checkin-history h3 small {
-  font-size: 11px;
-  font-weight: 400;
-  color: var(--c-82958a);
-  margin-left: 10px;
-}
-.history-scroll {
-  max-height: 340px;
-  overflow: auto;
-  margin-top: 15px;
-}
-table {
-  width: 100%;
-  border-collapse: collapse;
-  text-align: left;
-  font-size: 12px;
-}
-th,
-td {
-  padding: 10px;
-  border-bottom: 1px solid var(--c-edf1ee);
-}
-th {
-  color: var(--c-82958a);
-  position: sticky;
-  top: 0;
-  background: var(--surface);
-}
-td:last-child {
-  overflow-wrap: anywhere;
 }
 .checkin-footnote {
   font-size: 11px;

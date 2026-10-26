@@ -8,7 +8,7 @@ import RangePicker from '../components/RangePicker.vue'
 import BarChart from '../components/BarChart.vue'
 import { call } from '../api'
 import { t, fmtNumber, fmtDateTime, fmtDate, zoneOffset } from '../i18n'
-import { state, act, busy, refreshPool } from '../store'
+import { state, act, busy, refreshPool, isDisabled } from '../store'
 import { inRange, daysOf, type RangeKey } from '../lib/range'
 
 const tab = ref<'workbuddy' | 'qoder' | 'trae'>('workbuddy')
@@ -122,7 +122,8 @@ async function traeRefreshAll() {
   await act(
     'trae-refresh-all',
     async () => {
-      for (const a of traeAccounts.value) await call('trae_refresh', { id: a.id }).catch(() => {})
+      for (const a of traeAccounts.value.filter((a: any) => !isDisabled('trae', a.id)))
+        await call('trae_refresh', { id: a.id }).catch(() => {})
     },
     t('用量已刷新', 'Usage refreshed')
   )

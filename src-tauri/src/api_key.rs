@@ -25,6 +25,10 @@ pub fn validate(value: &str) -> Result<(), String> {
     }
     Ok(())
 }
+/// Timing depends only on the lengths, never on where the bytes differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 /// Short, non-reversible form shown in records ("ad-1…9f0e").
 pub fn abbreviate(value: &str) -> String {
     let chars: Vec<char> = value.chars().collect();
@@ -200,8 +204,9 @@ impl KeyStore {
     pub fn primary(&self) -> String {
         self.keys.lock().unwrap()[0].key.clone()
     }
+    /// Compared in constant time, since LAN access exposes the gateway to other devices.
     pub fn find(&self, value: &str) -> Option<ApiKey> {
-        self.keys.lock().unwrap().iter().find(|k| k.key == value).cloned()
+        self.keys.lock().unwrap().iter().find(|k| constant_time_eq(k.key.as_bytes(), value.as_bytes())).cloned()
     }
     pub fn create(&self, value: Option<String>, fields: KeyFields) -> Result<ApiKey, String> {
         fields.validate()?;
@@ -280,6 +285,9 @@ mod tests {
         assert!(validate(&"x".repeat(257)).is_err());
         assert_eq!(abbreviate("ad-0123456789abcdef0123456789"), "ad-0…6789");
         assert_eq!(abbreviate("0123456789abcdef"), "01…ef");
+        assert!(constant_time_eq(a.as_bytes(), a.clone().as_bytes()));
+        assert!(!constant_time_eq(a.as_bytes(), b.as_bytes()));
+        assert!(!constant_time_eq(a.as_bytes(), &a.as_bytes()[..66]));
     }
     #[test]
     fn legacy_key_migrates_and_the_first_key_stays_mirrored_privately() {

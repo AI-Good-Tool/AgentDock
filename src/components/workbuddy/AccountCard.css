@@ -106,6 +106,56 @@
 .auth-invalid-card .switch-credit-line > strong {
   color: var(--muted);
 }
+/* Disabled by the user: dashed, desaturated card; the bar and actions stay crisp. */
+.switch-card.account-disabled-card {
+  border: 1px dashed var(--c-c4ccd0);
+  background: var(--c-f9fafb);
+  box-shadow: none;
+}
+.account-disabled-card .switch-card-header {
+  background: var(--c-f3f5f6);
+}
+.account-disabled-card .switch-avatar,
+.account-disabled-card .switch-identity h3,
+.account-disabled-card .switch-credit-section {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+.account-disabled-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px 10px 16px;
+  border-bottom: 1px dashed var(--c-c4ccd0);
+  background: var(--c-eef0f3);
+  color: var(--c-6d777e);
+}
+.account-disabled-bar > svg {
+  flex: none;
+  font-size: 17px;
+}
+.account-disabled-bar > div {
+  flex: 1;
+  min-width: 0;
+}
+.account-disabled-bar strong {
+  font-size: 13px;
+  line-height: 1.5;
+}
+.account-disabled-bar p {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--c-82958a);
+}
+.account-disabled-bar .arco-btn {
+  flex: none;
+}
+.card-chip.off {
+  background: var(--c-6d777e);
+  color: var(--surface);
+  font-weight: 700;
+}
 .auth-invalid-card .switch-credit-line {
   flex-wrap: wrap;
 }

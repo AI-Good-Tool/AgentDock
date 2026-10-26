@@ -10,6 +10,8 @@ export interface CheckinRecord {
   submit: boolean
   status: Account['checkin'] | null
   error: string | null
+  /** manual / startup / scheduled / launchd; absent in older records. */
+  trigger?: string
 }
 export interface Account {
   id: string
@@ -17,6 +19,8 @@ export interface Account {
   source: string
   variant: string
   enabled: boolean
+  /** Disabled by the user (from the AgentDock runtime; not stored by WorkBuddy). */
+  disabled?: boolean
   checkinEnabled: boolean
   checkinUpdatedAt?: number
   checkinError?: string

@@ -913,6 +913,10 @@ body[arco-theme='dark'] {
   font-family: 'SF Mono', ui-monospace, Menlo, monospace;
   letter-spacing: 0.01em;
 }
+.gateway-chip .chip-sep {
+  margin: 0 -2px;
+  color: var(--muted);
+}
 .topbar .gateway-btn.arco-btn {
   height: 30px;
   padding: 0 14px;

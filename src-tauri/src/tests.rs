@@ -557,6 +557,47 @@ async fn aliases_apply_to_requests_lists_logs_and_all_protocols() {
 }
 
 #[tokio::test]
+async fn clearing_checkin_history_keeps_account_status_and_other_platforms() {
+    let f = fixture().await;
+    let record = workbuddy::checkin::Record { at: 1, account_id: "a".into(), submit: true, status: Some(json!({"today_checked_in":true})), error: None, trigger: Some("manual".into()) };
+    // "legacy" predates per-account state: its status exists only in the history.
+    let legacy = [
+        workbuddy::checkin::Record { at: 2, account_id: "legacy".into(), status: Some(json!({"today_checked_in":true})), ..record.clone() },
+        workbuddy::checkin::Record { at: 3, account_id: "legacy".into(), status: None, error: Some("offline".into()), ..record.clone() },
+    ];
+    f.hub.wb.update_store(|s| {
+        s.checkin_states.entry("a".into()).or_default().observe(&record);
+        s.checkin_records.push(record.clone());
+        s.checkin_records.extend(legacy.iter().cloned());
+        Ok(())
+    }).unwrap();
+    f.hub.trae.store.update(|d| { d["checkinHistory"] = json!([{"accountId":"t","status":"success"}]); Ok(()) }).unwrap();
+    assert!(f.hub.clear_checkin_history(Some("unknown")).is_err());
+    // Qoder's claim log lives in the user's Qoder data directory, so tests clear only the others.
+    f.hub.clear_checkin_history(Some("workbuddy")).unwrap();
+    assert!(f.hub.wb.store.lock().unwrap().checkin_records.is_empty());
+    assert!(f.hub.wb.store.lock().unwrap().checkin_states["a"].status.is_some());
+    let kept = f.hub.wb.store.lock().unwrap().checkin_states["legacy"].clone();
+    assert_eq!((kept.updated_at, kept.error_at, kept.status.unwrap()["today_checked_in"].clone()), (Some(2), Some(3), json!(true)));
+    assert_eq!(f.hub.trae.store.snapshot()["checkinHistory"].as_array().unwrap().len(), 1);
+    f.hub.clear_checkin_history(Some("trae")).unwrap();
+    assert!(f.hub.trae.store.snapshot()["checkinHistory"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn lan_access_is_off_by_default_and_changes_only_while_stopped() {
+    let f = fixture().await;
+    assert!(!f.hub.settings().allow_lan);
+    let (stop, _rx) = tokio::sync::oneshot::channel();
+    *f.hub.server.lock().unwrap() = Some(crate::app::ServerHandle { port: 1, lan: false, stop });
+    let err = f.hub.update_settings(|s| { s.allow_lan = true; Ok(()) }).unwrap_err();
+    assert!(err.contains("局域网"), "{err}");
+    assert!(!f.hub.settings().allow_lan);
+    f.hub.server.lock().unwrap().take();
+    assert!(f.hub.update_settings(|s| { s.allow_lan = true; Ok(()) }).unwrap().allow_lan);
+}
+
+#[tokio::test]
 async fn each_api_key_uses_its_own_scope_and_strategy_and_is_recorded() {
     use crate::api_key::KeyFields;
     use crate::settings::Strategy;
@@ -1132,6 +1173,36 @@ async fn workbuddy_expired_or_relogin_required_is_disabled_only_when_its_route_i
         let saved = workbuddy::pool::AppState::new(f.hub.dir.join("workbuddy/store.json")).unwrap();
         assert!(!saved.pool_accounts()[0].enabled);
     }
+}
+
+#[tokio::test]
+async fn disabled_account_turns_proxy_off_and_stays_out_until_enabled() {
+    use agentdock_core::provider::ProviderKind;
+    let f = fixture().await;
+    f.hub.wb.update_store(|store| {
+        store.accounts.push(workbuddy::pool::Account { id:"off-wb".into(),name:"Off".into(),source:"test".into(),source_id:"off".into(),variant:"cn".into(),enabled:true,checkin_enabled:true,note:String::new(),display_field:String::new(),expires_at:None });
+        Ok(())
+    }).unwrap();
+    assert!(f.hub.set_account_disabled(ProviderKind::Workbuddy, "missing", true).is_err());
+    f.hub.set_account_disabled(ProviderKind::Workbuddy, "off-wb", true).unwrap();
+    let rt = &f.hub.account_runtime()["workbuddy/off-wb"];
+    assert_eq!((rt["disabled"].clone(), rt["enabled"].clone()), (json!(true), json!(false)));
+    assert!(!f.hub.wb.store.lock().unwrap().accounts.iter().find(|a| a.id == "off-wb").unwrap().enabled);
+    assert!(f.hub.disabled_ids(ProviderKind::Workbuddy).contains("off-wb"));
+    assert!(f.hub.disabled_ids(ProviderKind::Qoder).is_empty());
+    let err = f.hub.set_account_enabled(ProviderKind::Workbuddy, "off-wb", true).unwrap_err();
+    assert!(err.contains("已禁用"), "{err}");
+    // Even a native switch turned back on elsewhere is not scheduled.
+    f.hub.wb.set_enabled("off-wb", true).unwrap();
+    assert!(!f.hub.pool_accounts().iter().find(|a| a.id == "off-wb").unwrap().enabled);
+    f.hub.enforce_disabled_accounts();
+    assert!(!f.hub.wb.store.lock().unwrap().accounts.iter().find(|a| a.id == "off-wb").unwrap().enabled);
+    assert!(crate::app::read_settings(&f.hub.dir.join("settings.json")).disabled_accounts.contains("workbuddy/off-wb"));
+    f.hub.set_account_disabled(ProviderKind::Workbuddy, "off-wb", false).unwrap();
+    assert_eq!(f.hub.account_runtime()["workbuddy/off-wb"]["disabled"], false);
+    assert_eq!(f.hub.account_runtime()["workbuddy/off-wb"]["enabled"], false, "enabling leaves the proxy off");
+    f.hub.set_account_enabled(ProviderKind::Workbuddy, "off-wb", true).unwrap();
+    assert_eq!(f.hub.account_runtime()["workbuddy/off-wb"]["enabled"], true);
 }
 
 #[tokio::test]

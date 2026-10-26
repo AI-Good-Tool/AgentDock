@@ -30,6 +30,8 @@ export interface RouteOverride {
 }
 export interface Settings {
   port: number
+  /** Listen on every interface so LAN devices can connect (with an API key). */
+  allowLan: boolean
   strategy: Strategy
   providers: Record<ProviderKey, ProviderScope>
   routes: Record<string, RouteOverride>
@@ -126,6 +128,10 @@ export interface AppSnapshot {
   dataDir: string
   running: boolean
   port: number
+  /** The running gateway accepts LAN connections (as bound). */
+  lan?: boolean
+  /** This computer's private IPv4 addresses, preferred first. */
+  lanAddresses?: string[]
   apiKey: string
   apiKeys?: ApiKeyInfo[]
   error: string
@@ -171,6 +177,8 @@ export interface AccountRuntime {
   cooldownUntil?: number | null
   authFailed: boolean
   enabled: boolean
+  /** Disabled by the user: proxy off, left out of batch and scheduled actions. */
+  disabled?: boolean
   credit: { remaining?: number | null; earliestExpiry?: number | null; unit: string; updatedAt?: number | null }
   expiresAt?: number | null
   blocked?: string | null

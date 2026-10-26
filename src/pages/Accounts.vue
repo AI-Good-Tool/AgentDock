@@ -17,7 +17,7 @@ import AccountJsonDialog from '../components/AccountJsonDialog.vue'
 import AccountBatchExportDialog from '../components/AccountBatchExportDialog.vue'
 import { call } from '../api'
 import { t } from '../i18n'
-import { state, act, busy, refreshPool, runtimeOf, revealPhones } from '../store'
+import { state, act, busy, refreshPool, runtimeOf, revealPhones, isDisabled } from '../store'
 import { accountName } from '../lib/account-display'
 
 const provider = ref<'all' | 'workbuddy' | 'qoder' | 'trae'>('all')
@@ -57,6 +57,7 @@ const wbAccounts = computed(() =>
         concurrency: rt?.concurrency ?? 4,
         authFailed: !!(rt?.authFailed || a.authFailed),
         enabled: rt?.enabled ?? a.enabled,
+        disabled: !!rt?.disabled,
         cooldownUntil: rt?.cooldownUntil,
       }
     })
@@ -252,21 +253,25 @@ function traeRemove(a: any) {
     onOk: () => act('tdelete', () => call('trae_delete', { id: a.id })),
   })
 }
-async function traeRefreshAll() {
+async function traeRefreshAll(ids: string[]) {
   await act(
     'trae-all',
     async () => {
-      for (const a of traeAccounts.value) await call('trae_refresh', { id: a.id }).catch(() => {})
+      for (const id of ids) await call('trae_refresh', { id }).catch(() => {})
     },
     t('Trae 用量已刷新', 'Trae usage refreshed')
   )
 }
+/** Disabled accounts are left out of this batch; their cards can still refresh one by one. */
 async function refreshAllCredits() {
-  if (show('workbuddy') && wbAccounts.value.length)
-    await wbCredits(wbAccounts.value.map((a: any) => a.id))
-  if (show('qoder') && qoderAccounts.value.length)
-    await qoderCredits(qoderAccounts.value.map((a: any) => a.id))
-  if (show('trae') && traeAccounts.value.length) await traeRefreshAll()
+  const active = (provider: string, list: any[]) => list.filter((a) => !isDisabled(provider, a.id)).map((a) => a.id as string)
+  const wb = show('workbuddy') ? active('workbuddy', wbAccounts.value) : []
+  const qoder = show('qoder') ? active('qoder', qoderAccounts.value) : []
+  const trae = show('trae') ? active('trae', traeAccounts.value) : []
+  if (!wb.length && !qoder.length && !trae.length) return Message.info(t('没有可刷新的账号（已禁用的账号不参与）', 'Nothing to refresh (disabled accounts are skipped)'))
+  if (wb.length) await wbCredits(wb)
+  if (qoder.length) await qoderCredits(qoder)
+  if (trae.length) await traeRefreshAll(trae)
 }
 const clients = computed(() => state.pool?.workbuddy?.clients)
 const qEditions = computed(() => state.pool?.qoder?.editions ?? {})

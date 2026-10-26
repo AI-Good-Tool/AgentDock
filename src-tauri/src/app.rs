@@ -18,6 +18,8 @@ pub type Shared = Arc<Hub>;
 
 pub struct ServerHandle {
     pub port: u16,
+    /// Bound to every interface (settings.allow_lan at start).
+    pub lan: bool,
     pub stop: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -184,7 +186,24 @@ impl Hub {
                 hub.disable_account_auth(ProviderKind::Workbuddy, &id);
             }
         }
+        hub.enforce_disabled_accounts();
         hub
+    }
+    /// Turn native proxy switches back off for disabled accounts, e.g. after a
+    /// restore brought back the list or a provider store with switches on.
+    /// WorkBuddy's scheduled credit refresh selects accounts by that switch.
+    pub fn enforce_disabled_accounts(&self) {
+        let disabled = self.settings().disabled_accounts;
+        if disabled.is_empty() {
+            return;
+        }
+        let _writer = self.account_writer.lock().unwrap();
+        let native = self.wb.pool_accounts().into_iter().chain(self.qoder.pool_accounts()).chain(self.trae.pool_accounts());
+        for a in native.filter(|a| a.enabled && disabled.contains(&a.key())) {
+            if self.set_provider_enabled(a.provider, &a.id, false).is_err() {
+                agentdock_core::applog::warn("accounts", || ("关闭已禁用账号的反代失败".into(), json!({"provider": a.provider.key(), "accountId": a.id})));
+            }
+        }
     }
     pub fn settings(&self) -> Settings {
         self.settings.lock().unwrap().clone()
@@ -195,7 +214,7 @@ impl Hub {
     pub fn api_key(&self) -> String {
         self.keys.primary()
     }
-    /// Validate, persist, then publish. Port changes require a stopped gateway.
+    /// Validate, persist, then publish. Port and LAN access changes require a stopped gateway.
     pub fn update_settings(&self, change: impl FnOnce(&mut Settings) -> Result<(), String>) -> Result<Settings, String> {
         let _w = self.settings_writer.lock().unwrap();
         let mut next = self.settings();
@@ -204,6 +223,9 @@ impl Hub {
         next.validate()?;
         if next.port != previous.port && self.running() {
             return Err("请先停止服务再修改端口".into());
+        }
+        if next.allow_lan != previous.allow_lan && self.running() {
+            return Err("请先停止服务再修改局域网访问".into());
         }
         write_private(
             &self.dir.join("settings.json"),
@@ -264,6 +286,41 @@ impl Hub {
         })
         .map(|_| ())
     }
+    /// Clear the check-in history of one platform, or of all three when `None`.
+    /// Each account's current check-in status is stored apart and stays.
+    pub fn clear_checkin_history(&self, provider: Option<&str>) -> Result<(), String> {
+        let only = |p: &str| provider.is_none_or(|x| x == p);
+        if provider.is_some_and(|p| !["workbuddy", "qoder", "trae"].contains(&p)) {
+            return Err("未知的平台".into());
+        }
+        if only("workbuddy") {
+            self.wb.update_store(|s| {
+                // Older data may hold an account's status only in the history.
+                let legacy: std::collections::HashSet<String> = s
+                    .checkin_records
+                    .iter()
+                    .filter(|r| !s.checkin_states.contains_key(&r.account_id))
+                    .map(|r| r.account_id.clone())
+                    .collect();
+                for r in std::mem::take(&mut s.checkin_records) {
+                    if legacy.contains(&r.account_id) {
+                        s.checkin_states.entry(r.account_id.clone()).or_default().observe(&r);
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        if only("qoder") {
+            qoder::qcore::write_claim_log(&json!([]));
+        }
+        if only("trae") {
+            self.trae.store.update(|d| {
+                d["checkinHistory"] = json!([]);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
     pub fn reset_route(&self, route_id: &str) -> Result<(), String> {
         self.update_settings(|s| {
             s.routes.remove(route_id);
@@ -277,13 +334,43 @@ impl Hub {
         let mut out = self.wb.pool_accounts();
         out.extend(self.qoder.pool_accounts());
         out.extend(self.trae.pool_accounts());
-        let disabled = self.settings().auth_disabled_accounts;
+        let settings = self.settings();
         for account in &mut out {
-            if disabled.contains(&account.key()) {
+            let key = account.key();
+            if settings.auth_disabled_accounts.contains(&key) || settings.disabled_accounts.contains(&key) {
                 account.enabled = false;
             }
         }
         out
+    }
+    /// Provider-local ids of the accounts the user disabled.
+    pub fn disabled_ids(&self, provider: ProviderKind) -> std::collections::HashSet<String> {
+        let prefix = format!("{}/", provider.key());
+        self.settings()
+            .disabled_accounts
+            .iter()
+            .filter_map(|key| key.strip_prefix(&prefix).map(str::to_owned))
+            .collect()
+    }
+    /// Disabling also turns the proxy off; enabling leaves it off until switched on.
+    pub fn set_account_disabled(&self, provider: ProviderKind, id: &str, disabled: bool) -> Result<(), String> {
+        let _writer = self.account_writer.lock().unwrap();
+        let key = agentdock_core::provider::account_key(provider, id);
+        if disabled {
+            if !self.pool_accounts().iter().any(|a| a.key() == key) {
+                return Err("账号不存在".into());
+            }
+            self.set_provider_enabled(provider, id, false)?;
+        }
+        self.update_settings(|s| {
+            if disabled {
+                s.disabled_accounts.insert(key.clone());
+            } else {
+                s.disabled_accounts.remove(&key);
+            }
+            Ok(())
+        })?;
+        Ok(())
     }
     pub fn eligibility(
         &self,
@@ -327,10 +414,13 @@ impl Hub {
     }
     pub fn set_account_enabled(&self, provider: ProviderKind, id: &str, enabled: bool) -> Result<(), String> {
         let _writer = self.account_writer.lock().unwrap();
+        let key = agentdock_core::provider::account_key(provider, id);
+        if enabled && self.settings().disabled_accounts.contains(&key) {
+            return Err("账号已禁用，请先启用账号再开启反代".into());
+        }
         self.set_provider_enabled(provider, id, enabled)?;
         if enabled {
             // Re-enabling acknowledges a repaired login.
-            let key = agentdock_core::provider::account_key(provider, id);
             if self.settings().auth_disabled_accounts.contains(&key) {
                 self.update_settings(|s| {
                     s.auth_disabled_accounts.remove(&key);
@@ -478,6 +568,7 @@ impl Hub {
                 "cooldownUntil": rt.cooldown.get(&key).filter(|t| **t > now),
                 "authFailed": rt.auth_failed.contains(&key) || settings.auth_disabled_accounts.contains(&key),
                 "enabled": a.enabled && !rt.auth_failed.contains(&key),
+                "disabled": settings.disabled_accounts.contains(&key),
                 "credit": a.credit,
                 "expiresAt": a.expires_at,
                 "blocked": a.blocked,

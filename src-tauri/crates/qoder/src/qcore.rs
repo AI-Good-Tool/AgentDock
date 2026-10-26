@@ -879,15 +879,20 @@ pub fn claim_account(acc: &mut Account, dry_run: bool) -> Value {
     r
 }
 
-pub fn claim_all(edition_filter: Option<&str>, dry_run: bool) -> Vec<Value> {
+/// `trigger` (manual / startup / scheduled / launchd) is kept with the claim log
+/// entry. Accounts whose id is in `skip` (disabled by the user) are left out.
+pub fn claim_all(
+    edition_filter: Option<&str>,
+    dry_run: bool,
+    trigger: &str,
+    skip: &std::collections::HashSet<String>,
+) -> Vec<Value> {
     let mut accounts = load_accounts();
     let mut results = vec![];
     let mut changed = false;
     for acc in accounts.iter_mut() {
-        if let Some(f) = edition_filter {
-            if acc.edition != f {
-                continue;
-            }
+        if edition_filter.is_some_and(|f| acc.edition != f) || skip.contains(&acc.id()) {
+            continue;
         }
         let before = (acc.token.clone(), acc.refreshToken.clone());
         let res = claim_account(acc, dry_run);
@@ -900,12 +905,12 @@ pub fn claim_all(edition_filter: Option<&str>, dry_run: bool) -> Vec<Value> {
         let _ = save_accounts(&accounts);
     }
     if !dry_run {
-        append_claim_log(&results);
+        append_claim_log(&results, trigger);
     }
     results
 }
 
-pub fn append_claim_log(results: &[Value]) {
+pub fn append_claim_log(results: &[Value], trigger: &str) {
     let _ = fs::create_dir_all(switch_dir());
     let mut log: Vec<Value> = fs::read_to_string(claim_log_file())
         .ok()
@@ -922,7 +927,7 @@ pub fn append_claim_log(results: &[Value]) {
             })
         })
         .collect();
-    log.push(json!({ "time": now, "results": slim }));
+    log.push(json!({ "time": now, "trigger": trigger, "results": slim }));
     if log.len() > 500 {
         log = log.split_off(log.len() - 500);
     }

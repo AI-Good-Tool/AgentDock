@@ -17,10 +17,13 @@ import {
   IconDelete,
   IconMobile,
   IconEmail,
+  IconPlayCircle,
+  IconStop,
 } from '@arco-design/web-vue/es/icon'
 import { t, fmtDate } from '../i18n'
-import { state, revealPhones, runtimeOf } from '../store'
+import { state, revealPhones, runtimeOf, setAccountDisabled } from '../store'
 import AccountAuthAlert from './AccountAuthAlert.vue'
+import AccountDisabledBar from './AccountDisabledBar.vue'
 import { credits, updated, phoneText } from '../lib/account-display'
 import CardProxyRow from './CardProxyRow.vue'
 const props = defineProps<{ account: any; compact?: boolean }>()
@@ -36,6 +39,7 @@ const emit = defineEmits<{
 }>()
 const a = computed(() => props.account)
 const rt = computed(() => runtimeOf('qoder', a.value.id))
+const disabled = computed(() => !!rt.value?.disabled)
 const expired = computed(() => Date.parse(a.value.expiresAt) <= state.now)
 const loginInvalid = computed(() => expired.value || a.value.hasToken === false || rt.value?.authFailed)
 const name = computed(() => a.value.note || a.value.name || a.value.email || a.value.phone || t('未命名', 'Unnamed'))
@@ -65,7 +69,10 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
 const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
 </script>
 <template>
-  <article class="switch-card" :class="[{ 'current-card': a.isCurrent, 'compact-card': compact, 'auth-invalid-card': loginInvalid }, `tone-${color}`]">
+  <article
+    class="switch-card"
+    :class="[{ 'current-card': a.isCurrent, 'compact-card': compact, 'auth-invalid-card': loginInvalid && !disabled, 'account-disabled-card': disabled }, `tone-${color}`]"
+  >
     <header class="switch-card-header">
       <div class="switch-avatar">{{ Array.from(String(name))[0] }}</div>
       <div class="switch-identity">
@@ -74,6 +81,7 @@ const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
         <p v-if="phone" class="switch-contact mono"><IconMobile /> {{ phone }}</p>
         <p v-if="a.email" class="switch-contact" :title="a.email"><IconEmail /> {{ a.email }}</p>
         <div class="switch-badges">
+          <span v-if="disabled" class="card-chip off">{{ t('已禁用', 'Disabled') }}</span>
           <span class="card-chip">{{ a.edition === 'cn' ? t('国内版', 'China') : t('国际版', 'Intl') }}</span>
           <span v-if="a.isCurrent" class="card-chip" :class="{ ok: !loginInvalid }">{{ loginInvalid ? t('客户端当前账号', 'Current in client') : t('当前登录', 'Signed in') }}</span>
           <span v-if="loginInvalid" class="auth-invalid-chip">{{ expired ? t('登录已过期', 'Login expired') : t('需重新登录', 'Sign-in required') }}</span>
@@ -87,6 +95,9 @@ const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
           ><a-doption @click="emit('note')"><IconEdit /> {{ t('修改备注', 'Edit note') }}</a-doption
           ><a-doption @click="emit('refreshToken')"><IconLock /> {{ t('刷新登录凭证', 'Refresh login') }}</a-doption
           ><a-doption @click="emit('json')"><IconCode /> {{ t('查看 JSON', 'View JSON') }}</a-doption
+          ><a-doption @click="setAccountDisabled('qoder', a.id, !disabled)"
+            ><template v-if="disabled"><IconPlayCircle /> {{ t('启用账号', 'Enable account') }}</template
+            ><span v-else class="danger-option"><IconStop /> {{ t('禁用账号', 'Disable account') }}</span></a-doption
           ><a-doption @click="emit('remove')"
             ><span class="danger-option"><IconDelete /> {{ t('删除账号', 'Delete account') }}</span></a-doption
           ></template
@@ -94,7 +105,8 @@ const pending = (k: string) => state.pending.has(`${k}:${a.value.id}`)
       >
       <span v-if="a.isCurrent" class="client-watermark">Q</span>
     </header>
-    <AccountAuthAlert v-if="loginInvalid" :expired="expired" :disabled="!(rt?.enabled ?? a.enabled)" />
+    <AccountDisabledBar v-if="disabled" provider="qoder" :id="a.id" />
+    <AccountAuthAlert v-else-if="loginInvalid" :expired="expired" :disabled="!(rt?.enabled ?? a.enabled)" />
     <section class="switch-credit-section">
       <div class="switch-credit-line">
         <IconStar /><strong>{{ known ? credits(total) : pending('qcredit') ? t('查询中', 'Loading') : '—' }}</strong

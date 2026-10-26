@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { revealPhones } from '../../store'
+import { revealPhones, setAccountDisabled } from '../../store'
 import { computed } from 'vue'
 import { IconMobile,
+  IconPlayCircle,
+  IconStop,
   IconCalendar,
   IconClockCircle,
   IconThunderbolt,
@@ -26,6 +28,7 @@ import { hasFullPhone, phoneText,
 } from '../../lib/account-display'
 import { t } from '../../i18n'
 import AccountAuthAlert from '../AccountAuthAlert.vue'
+import AccountDisabledBar from '../AccountDisabledBar.vue'
 const props = defineProps<{
   account: Account
   clients: Snapshot['clients']
@@ -86,7 +89,10 @@ const targets = computed(() => [
 <template>
   <article
     class="switch-card"
-    :class="[{ 'current-card': active.workbuddy, 'compact-card': compact, 'auth-invalid-card': loginInvalid }, `tone-${color}`]"
+    :class="[
+      { 'current-card': active.workbuddy, 'compact-card': compact, 'auth-invalid-card': loginInvalid && !account.disabled, 'account-disabled-card': account.disabled },
+      `tone-${color}`,
+    ]"
   >
     <header class="switch-card-header">
       <div class="switch-avatar">{{ name.slice(0, 1) }}</div>
@@ -95,6 +101,7 @@ const targets = computed(() => [
         <p :title="uid">UID · {{ uid }}</p>
         <p v-if="account.presentation?.phoneNumber" class="switch-contact mono"><IconMobile /> {{ phoneText(account.presentation.phoneNumber, revealPhones) }} <span v-if="revealPhones && !hasFullPhone(account.presentation.phoneNumber)" :title="t('可重新授权或导入当前登录账号以更新手机号', 'Sign in again or import the current login to update the phone')">{{ t('（官方已脱敏）', '(masked by source)') }}</span></p>
         <div class="switch-badges">
+          <span v-if="account.disabled" class="card-chip off">{{ t('已禁用', 'Disabled') }}</span>
           <a-tooltip
             :content="
               account.checkinEnabled
@@ -147,6 +154,9 @@ const targets = computed(() => [
           ><a-doption @click="emit('checkin')" :disabled="account.variant !== 'cn'"
             ><IconCalendar /> {{ t('查询签到状态', 'Check-in status') }}</a-doption
           ><a-doption @click="emit('json')"><IconCode /> {{ t('查看 JSON', 'View JSON') }}</a-doption
+          ><a-doption @click="setAccountDisabled('workbuddy', account.id, !account.disabled)"
+            ><template v-if="account.disabled"><IconPlayCircle /> {{ t('启用账号', 'Enable account') }}</template
+            ><span v-else class="danger-option"><IconStop /> {{ t('禁用账号', 'Disable account') }}</span></a-doption
           ></template
         ></a-dropdown
       >
@@ -154,7 +164,8 @@ const targets = computed(() => [
         active.cli ? '>_' : 'W'
       }}</span>
     </header>
-    <AccountAuthAlert v-if="loginInvalid" :expired="expired" :disabled="!account.enabled" />
+    <AccountDisabledBar v-if="account.disabled" provider="workbuddy" :id="account.id" />
+    <AccountAuthAlert v-else-if="loginInvalid" :expired="expired" :disabled="!account.enabled" />
     <section class="switch-credit-section">
       <div class="switch-credit-line">
         <IconStar /><strong>{{
@@ -239,20 +250,32 @@ const targets = computed(() => [
         </button>
       </div>
       <div class="account-toggle-row">
-        <label :title="t('停用后不再接收新请求，正在进行的请求会继续完成', 'Disabled accounts take no new requests; in-flight requests finish')"
+        <label
+          :title="
+            account.disabled
+              ? t('账号已禁用，启用后才能开启反代', 'Enable the account to turn the proxy on')
+              : t('停用后不再接收新请求，正在进行的请求会继续完成', 'Disabled accounts take no new requests; in-flight requests finish')
+          "
           >{{ t('反代', 'Proxy') }}
           <a-switch
             size="small"
             :model-value="account.enabled"
+            :disabled="account.disabled"
             :loading="busy"
             @change="(v) => emit('enable', !!v)" /></label
         ><label
-          :title="account.variant === 'cn' ? t('自动签到需要全局开关也开启', 'Auto check-in also needs the global switch') : t('国际版不支持签到', 'Not available for international')"
+          :title="
+            account.disabled
+              ? t('账号已禁用，不参与签到', 'Disabled accounts are not checked in')
+              : account.variant === 'cn'
+                ? t('自动签到需要全局开关也开启', 'Auto check-in also needs the global switch')
+                : t('国际版不支持签到', 'Not available for international')
+          "
           >{{ t('签到', 'Check-in') }}
           <a-switch
             size="small"
             :model-value="account.checkinEnabled"
-            :disabled="account.variant !== 'cn'"
+            :disabled="account.variant !== 'cn' || account.disabled"
             :loading="busy"
             @change="(v) => emit('checkinEnable', !!v)" /></label
         ><span :title="t(`后台管理查询 ${account.managementInFlight ?? 0} 个，不占用聊天并发`, `${account.managementInFlight ?? 0} management queries (separate from chat)`)"

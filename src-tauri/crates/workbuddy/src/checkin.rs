@@ -62,6 +62,9 @@ pub struct Record {
     pub submit: bool,
     pub status: Option<Value>,
     pub error: Option<String>,
+    /// manual / startup / scheduled / launchd; absent in older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -196,6 +199,7 @@ mod tests {
             submit: true,
             status: Some(json!({"today_checked_in":true})),
             error: None,
+            trigger: None,
         }];
         state.observe(&log[0]);
         log.clear();
@@ -208,6 +212,7 @@ mod tests {
             submit: false,
             status: None,
             error: Some("offline".into()),
+            trigger: None,
         });
         assert_eq!(state.updated_at, Some(1));
         assert_eq!(state.error_at, Some(2));

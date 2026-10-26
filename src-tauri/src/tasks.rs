@@ -16,7 +16,10 @@ pub async fn spawn_all(hub: Shared) {
     // WorkBuddy: scheduled credit refresh and local client monitor.
     tokio::spawn(workbuddy::settings::run_scheduler(hub.wb.clone()));
     tokio::spawn(workbuddy::auth::run_scheduler(hub.wb.clone()));
-    tokio::spawn(workbuddy::switch_bridge::run_local_monitor(hub.wb.clone()));
+    let monitor = hub.clone();
+    tokio::spawn(workbuddy::switch_bridge::run_local_monitor(hub.wb.clone(), move || {
+        monitor.disabled_ids(agentdock_core::provider::ProviderKind::Workbuddy)
+    }));
     // Unified daily check-in / credit claim for all three platforms.
     tokio::spawn(checkin_loop(hub.clone()));
     let trae = hub.trae.clone();
@@ -96,9 +99,13 @@ async fn run_locked(hub: &Shared, trigger: &str, _lock: RunLock) -> Value {
             json!({"workbuddy": c.workbuddy, "qoder": c.qoder, "trae": c.trae}),
         )
     });
-    let workbuddy = if c.workbuddy { json!(workbuddy_pass(hub).await) } else { json!("disabled") };
-    let qoder = if c.qoder { qoder_pass(hub).await } else { json!("disabled") };
-    let trae = if c.trae { json!(hub.trae.auto_checkin_tick().await) } else { json!("disabled") };
+    let workbuddy = if c.workbuddy { json!(workbuddy_pass(hub, trigger).await) } else { json!("disabled") };
+    let qoder = if c.qoder { qoder_pass(hub, trigger).await } else { json!("disabled") };
+    let trae = if c.trae {
+        json!(hub.trae.checkin_pass(trigger, &hub.disabled_ids(agentdock_core::provider::ProviderKind::Trae)).await)
+    } else {
+        json!("disabled")
+    };
     for (source, rows) in [("checkin.workbuddy", &workbuddy), ("checkin.qoder", &qoder), ("checkin.trae", &trae)] {
         for row in rows.as_array().into_iter().flatten() {
             let ok = row["ok"] != false && row["phase"] != "error" && row["phase"] != "login_required";
@@ -150,15 +157,16 @@ fn trigger_label(trigger: &str) -> &'static str {
 
 /// Opted-in WorkBuddy CN accounts whose official status is not yet "checked
 /// in today" (Shanghai day); each check queries status before submitting.
-async fn workbuddy_pass(hub: &Shared) -> Vec<Value> {
+async fn workbuddy_pass(hub: &Shared, trigger: &str) -> Vec<Value> {
     let shanghai = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     let today = chrono::Utc::now().with_timezone(&shanghai).date_naive();
+    let disabled = hub.disabled_ids(agentdock_core::provider::ProviderKind::Workbuddy);
     let due: Vec<(String, String)> = {
         let store = hub.wb.store.lock().unwrap();
         store
             .accounts
             .iter()
-            .filter(|a| a.checkin_enabled && a.variant == "cn")
+            .filter(|a| a.checkin_enabled && a.variant == "cn" && !disabled.contains(&a.id))
             .filter(|a| {
                 let state = store.checkin_states.get(&a.id);
                 let done = state.is_some_and(|s| {
@@ -175,7 +183,7 @@ async fn workbuddy_pass(hub: &Shared) -> Vec<Value> {
     let mut out = vec![];
     let mut done = vec![];
     for (id, name) in due {
-        let r = workbuddy::proxy::checkin(hub.wb.clone(), id.clone(), true).await;
+        let r = workbuddy::proxy::checkin_by(hub.wb.clone(), id.clone(), true, trigger).await;
         if r.is_ok() {
             done.push(id.clone());
         }
@@ -191,26 +199,34 @@ async fn workbuddy_pass(hub: &Shared) -> Vec<Value> {
     out
 }
 
-async fn qoder_pass(hub: &Shared) -> Value {
-    match qoder_auto_claim(hub).await {
+async fn qoder_pass(hub: &Shared, trigger: &str) -> Value {
+    match qoder_auto_claim(hub, trigger).await {
         Some(results) => json!(results),
         None => json!([]),
     }
 }
 
-/// Claim only when a campaign is claimable (or a token needs refreshing).
-pub async fn qoder_auto_claim(hub: &Shared) -> Option<Vec<Value>> {
+/// Run by hand, every account is claimed and recorded. Otherwise claim only
+/// when a campaign is claimable (or a token needs refreshing).
+pub async fn qoder_auto_claim(hub: &Shared, trigger: &str) -> Option<Vec<Value>> {
     let recovery = hub.clone();
+    let trigger = trigger.to_owned();
     let results = tokio::task::spawn_blocking(move || {
         use qoder::qcore as qc;
         let before = recovery.credential_revisions(agentdock_core::provider::ProviderKind::Qoder);
+        let disabled = recovery.disabled_ids(agentdock_core::provider::ProviderKind::Qoder);
         let accounts = qc::load_accounts();
-        let need = accounts.iter().filter(|a| !a.token.is_empty()).any(|acc| {
-            let (status, data) = qc::get_campaigns(acc);
-            (status == 200 && !qc::claimable_campaigns(&data).is_empty())
-                || (status == 401 && !acc.refreshToken.is_empty())
-        });
-        let results = need.then(|| qc::claim_all(None, false));
+        let mut active = accounts.iter().filter(|a| !disabled.contains(&a.id()));
+        let need = if trigger == "manual" {
+            active.next().is_some()
+        } else {
+            active.filter(|a| !a.token.is_empty()).any(|acc| {
+                let (status, data) = qc::get_campaigns(acc);
+                (status == 200 && !qc::claimable_campaigns(&data).is_empty())
+                    || (status == 401 && !acc.refreshToken.is_empty())
+            })
+        };
+        let results = need.then(|| qc::claim_all(None, false, &trigger, &disabled));
         if recovery.restore_changed_logins(agentdock_core::provider::ProviderKind::Qoder, &before).is_err() {
             agentdock_core::applog::warn("accounts", || ("签到续期后保存登录恢复状态失败".into(), json!({"provider":"qoder"})));
         }

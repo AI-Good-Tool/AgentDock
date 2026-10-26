@@ -2,14 +2,15 @@
 import ProviderMark from '../components/ProviderMark.vue'
 import { computed, ref, onMounted } from 'vue'
 import { Message, Modal } from '@arco-design/web-vue'
-import { IconCalendar, IconGift, IconDelete, IconPlayArrow, IconClockCircle } from '@arco-design/web-vue/es/icon'
+import { IconCalendar, IconGift, IconPlayArrow, IconClockCircle } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
 import CheckinPage from '../components/workbuddy/CheckinPage.vue'
+import CheckinHistory from '../components/CheckinHistory.vue'
 import CheckinScheduleEditor from '../components/CheckinScheduleEditor.vue'
 import { defaultCheckinSchedule, describeCheckinSchedule } from '../checkin-schedule'
 import { call, isWindows, type CheckinSettings, type ProviderKey } from '../api'
-import { t, fmtDateTime, fmtNumber } from '../i18n'
-import { state, act, busy, refreshPool, refreshApp } from '../store'
+import { t, fmtDateTime } from '../i18n'
+import { state, act, busy, refreshPool, refreshApp, isDisabled } from '../store'
 
 const tab = ref<'workbuddy' | 'qoder' | 'trae'>('workbuddy')
 const progress = ref({ completed: 0, total: 0, failed: 0 })
@@ -39,8 +40,8 @@ const scheduleHint = computed(() => {
 })
 const platformTiles = computed(() => [
   { key: 'workbuddy' as ProviderKey, name: 'WorkBuddy', desc: t('国内版中已开启签到的账号', 'China accounts with check-in on') },
-  { key: 'qoder' as ProviderKey, name: 'Qoder', desc: t('每日积分活动（有可领时才领取）', 'Daily credit campaigns, only when claimable') },
-  { key: 'trae' as ProviderKey, name: 'Trae', desc: t('国内版中已开启自动签到的账号', 'China accounts with auto check-in on') },
+  { key: 'qoder' as ProviderKey, name: 'Qoder', desc: t('全部账号的每日积分活动', 'Daily credit campaigns of all accounts') },
+  { key: 'trae' as ProviderKey, name: 'Trae', desc: t('国内版账号（定时只签开启「自动」的）', 'China accounts (schedule: only those with Auto on)') },
 ])
 const triggerName: Record<string, [string, string]> = {
   startup: ['启动后自动', 'At launch'],
@@ -75,6 +76,11 @@ function toggleLaunchd(forceInstall = false) {
   )
 }
 const wb = computed(() => state.pool?.workbuddy ?? { accounts: [] })
+const wbView = computed(() => ({
+  ...(wb.value as any),
+  autoCheckin: plan.value.workbuddy,
+  accounts: wb.value.accounts.map((a: any) => ({ ...a, disabled: isDisabled('workbuddy', a.id) })),
+}))
 const pendingIds = computed(() => [...state.pending].map((k) => k.replace(/^wb:/, '')))
 
 // WorkBuddy
@@ -93,7 +99,7 @@ function wbToggleAuto(enabled: boolean) {
 async function wbBatch(submit = true) {
   await act('checkin-all', async () => {
     const accounts = wb.value.accounts.filter(
-      (a: any) => a.variant === 'cn' && (!submit || a.checkinEnabled)
+      (a: any) => a.variant === 'cn' && (!submit || a.checkinEnabled) && !isDisabled('workbuddy', a.id)
     )
     progress.value = { completed: 0, total: accounts.length, failed: 0 }
     for (const a of accounts) {
@@ -117,21 +123,6 @@ async function wbBatch(submit = true) {
 
 // Qoder
 const q = computed(() => state.pool?.qoder ?? {})
-const claimLog = computed(() => [...(q.value.claimLog ?? [])].reverse())
-const phase: Record<string, [string, string]> = {
-  claimed: ['领取成功', 'Claimed'],
-  nothing: ['无可领', 'Nothing to claim'],
-  dry_run: ['干跑', 'Dry run'],
-  login_required: ['需重新登录', 'Login required'],
-  error: ['失败', 'Failed'],
-}
-function clearQoderLog() {
-  Modal.confirm({
-    title: t('清除领取记录', 'Clear claim log'),
-    content: t('清除后不可恢复。', 'This cannot be undone.'),
-    onOk: () => act('qclear', () => call('qoder_clear_claim_log')),
-  })
-}
 
 // Trae
 const traeCn = computed(() =>
@@ -140,7 +131,8 @@ const traeCn = computed(() =>
 async function traeAll() {
   await act('trae-checkin-all', async () => {
     let failed = 0
-    for (const a of traeCn.value) await call('trae_checkin', { id: a.id }).catch(() => failed++)
+    for (const a of traeCn.value.filter((a: any) => !isDisabled('trae', a.id)))
+      await call('trae_checkin', { id: a.id }).catch(() => failed++)
     failed
       ? Message.warning(t(`${failed} 个账号签到未完成`, `${failed} accounts failed`))
       : Message.success(t('签到状态已确认', 'Check-ins confirmed'))
@@ -163,7 +155,7 @@ async function traeAll() {
     <div class="box-head">
       <div>
         <h2>{{ t('自动签到计划', 'Auto check-in schedule') }}</h2>
-        <p>{{ t('三个平台共用一个计划，分别开关。应用运行期间执行；已签到 / 已领取的账号不会重复提交。', 'One schedule for all three platforms, each with its own switch. Runs while the app is open; accounts already done are skipped.') }}</p>
+        <p>{{ t('三个平台共用一个计划，分别开关。「立即执行一次」处理已开启平台的全部账号（WorkBuddy 为参与批量签到的账号）；启动后与定时执行时，Trae 只签开启「自动」的账号，Qoder 只在有可领积分时领取。已签到 / 已领取的不会重复提交；号池中已禁用的账号始终不参与。', 'One schedule for all three platforms, each with its own switch. “Run now” covers every account of the enabled platforms (WorkBuddy: accounts in batch check-in); at launch and on schedule, Trae checks in only accounts with Auto on and Qoder claims only when credits are available. Accounts already done are skipped; accounts disabled in the pool never take part.') }}</p>
       </div>
       <a-button type="primary" :loading="busy('checkin-run') || !!status.running" @click="runNow"><template #icon><IconPlayArrow /></template>{{ t('立即执行一次', 'Run now') }}</a-button>
     </div>
@@ -218,7 +210,7 @@ async function traeAll() {
 
   <CheckinPage
     v-if="tab === 'workbuddy'"
-    :snapshot="{ ...(wb as any), autoCheckin: plan.workbuddy }"
+    :snapshot="wbView"
     :auto-hint="scheduleHint"
     :pending-ids="pendingIds"
     :progress="progress"
@@ -293,36 +285,6 @@ async function traeAll() {
         }}
       </p>
     </section>
-    <section class="box">
-      <div class="box-head">
-        <h2>{{ t('领取记录', 'Claim log') }}</h2>
-        <a-button size="small" @click="clearQoderLog"
-          ><template #icon><IconDelete /></template>{{ t('清除记录', 'Clear') }}</a-button
-        >
-      </div>
-      <div v-for="(entry, i) in claimLog" :key="i" style="margin-bottom: 10px">
-        <b style="font-size: 13px">{{ entry.time }}</b>
-        <div v-for="(r, j) in entry.results" :key="j" class="kv">
-          <span
-            >{{ r.name }} ·
-            {{ r.edition === 'cn' ? t('国内版', 'China') : t('国际版', 'International') }}</span
-          >
-          <b
-            ><span
-              class="state-pill"
-              :class="{
-                bad: r.phase === 'error' || r.phase === 'login_required',
-                off: r.phase === 'nothing',
-              }"
-              >{{ phase[r.phase] ? t(...phase[r.phase]) : r.phase }}</span
-            >
-            {{ r.credits ? '+' + fmtNumber(r.credits) : '' }}
-            <small class="muted">{{ r.msg }}</small></b
-          >
-        </div>
-      </div>
-      <a-empty v-if="!claimLog.length" :description="t('暂无记录', 'No records yet')" />
-    </section>
   </template>
 
   <template v-if="tab === 'trae'">
@@ -333,8 +295,8 @@ async function traeAll() {
           <p>
             {{
               t(
-                '先查询服务端状态，已领取时不会重复请求；按北京时间判断签到日。开启「自动」的账号按上方签到计划执行，需要保持应用运行。国际版没有相同签到入口。',
-                'Status is queried first, so claimed days are never re-submitted; days follow Beijing time. Accounts with “Auto” on follow the schedule above while the app runs. International has no check-in.'
+                '先查询服务端状态，已领取时不会重复请求；按北京时间判断签到日。开启「自动」的账号按上方签到计划执行，需要保持应用运行；「立即执行一次」会签到全部国内账号（已禁用的除外）。国际版没有相同签到入口。',
+                'Status is queried first, so claimed days are never re-submitted; days follow Beijing time. Accounts with “Auto” on follow the schedule above while the app runs; “Run now” checks in every CN account except disabled ones. International has no check-in.'
               )
             }}
           </p>
@@ -354,6 +316,7 @@ async function traeAll() {
           }}</small>
         </div>
         <div class="control">
+          <span v-if="isDisabled('trae', a.id)" class="state-pill off">{{ t('已禁用', 'Disabled') }}</span>
           <span class="state-pill" :class="{ warn: !a.checkedToday }">{{
             a.checkedToday
               ? t('今日已签到', 'Checked in today')
@@ -378,6 +341,7 @@ async function traeAll() {
           <a-switch
             size="small"
             :model-value="a.autoCheckin"
+            :disabled="isDisabled('trae', a.id)"
             @change="
               (v) =>
                 act(`trae:${a.id}:auto`, () =>
@@ -392,38 +356,7 @@ async function traeAll() {
         :description="t('添加一个 Trae CN 账号后可签到', 'Add a Trae CN account to check in')"
       />
     </section>
-    <section class="box">
-      <div class="box-head">
-        <h2>{{ t('签到记录', 'Check-in history') }}</h2>
-        <span class="muted">{{ t('最近 300 条', 'Latest 300') }}</span>
-      </div>
-      <a-table
-        :data="(state.pool?.trae?.checkinHistory ?? []).slice(0, 100)"
-        :pagination="{ pageSize: 10 }"
-        :bordered="false"
-        class="table-tight"
-      >
-        <template #columns>
-          <a-table-column :title="t('时间', 'Time')"
-            ><template #cell="{ record }">{{ fmtDateTime(record.time) }}</template></a-table-column
-          >
-          <a-table-column :title="t('账号', 'Account')" data-index="accountName" />
-          <a-table-column :title="t('触发方式', 'Trigger')"
-            ><template #cell="{ record }">{{
-              record.source === 'auto' ? t('自动', 'Auto') : t('手动', 'Manual')
-            }}</template></a-table-column
-          >
-          <a-table-column :title="t('结果', 'Result')"
-            ><template #cell="{ record }">{{
-              record.status === 'already'
-                ? t('已领取', 'Already claimed')
-                : record.status === 'success'
-                  ? t('签到成功', 'Checked in')
-                  : record.error
-            }}</template></a-table-column
-          >
-        </template>
-      </a-table>
-    </section>
   </template>
+
+  <CheckinHistory />
 </template>

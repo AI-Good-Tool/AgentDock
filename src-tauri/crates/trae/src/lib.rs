@@ -289,15 +289,18 @@ impl Provider {
         }
         outcome
     }
-    /// Startup catch-up and periodic automatic check-in for opted-in CN accounts.
-    /// Check in every opted-in CN account not yet checked today.
-    pub async fn auto_checkin_tick(self: &Arc<Self>) -> Vec<Value> {
+    /// One pass of the unified check-in plan over CN accounts not yet checked
+    /// today: every one when run by hand, otherwise those with auto check-in on.
+    /// Accounts in `skip` (disabled by the user) are left out.
+    pub async fn checkin_pass(self: &Arc<Self>, trigger: &str, skip: &std::collections::HashSet<String>) -> Vec<Value> {
+        let manual = trigger == "manual";
         let due: Vec<(String, String)> = self
             .store
             .accounts()
             .iter()
-            .filter(|a| a["autoCheckin"] == true && a["variant"] == "cn" && !checked_today(a))
+            .filter(|a| (manual || a["autoCheckin"] == true) && a["variant"] == "cn" && !checked_today(a))
             .filter_map(|a| a["id"].as_str().map(|id| (id.to_owned(), display_name(a))))
+            .filter(|(id, _)| !skip.contains(id))
             .collect();
         let mut results = vec![];
         for (id, name) in due {
@@ -305,18 +308,18 @@ impl Provider {
                 results.push(json!({"id": id, "name": name, "ok": false, "message": "账号正忙，稍后重试"}));
                 continue;
             };
-            match self.checkin(&id, "auto").await {
+            match self.checkin(&id, trigger).await {
                 Ok(result) => {
                     let already = result["already"] == true;
                     if !already {
                         let _ = self.refresh_unlocked(&id).await;
-                        self.store.event("checkin", "自动签到成功");
+                        self.store.event("checkin", if manual { "签到成功" } else { "自动签到成功" });
                     }
                     results.push(json!({"id": id, "name": name, "ok": true,
                         "message": if already { "今日已签到" } else { "签到成功" }}));
                 }
                 Err(e) => {
-                    self.store.event("error", &format!("自动签到：{e}"));
+                    self.store.event("error", &format!("{}：{e}", if manual { "签到" } else { "自动签到" }));
                     results.push(json!({"id": id, "name": name, "ok": false, "message": e.to_string()}));
                 }
             }

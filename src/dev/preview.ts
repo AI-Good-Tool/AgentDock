@@ -11,6 +11,7 @@ const iso = (t: number) => new Date(t).toISOString()
 let updateCancelled = false
 const settings = {
   port: 24800,
+  allowLan: true,
   strategy: 'roundRobin',
   providers: {
     workbuddy: { enabled: true, regions: ['cn', 'intl'], concurrency: 4 },
@@ -175,7 +176,7 @@ const pool = {
     accountRefresh: { running: false, success: 0, failed: 0 },
     autoCheckin: true,
     checkinConfig: { start: '09:00', end: '24:00' },
-    checkinRecords: [{ at: now - 3600e3, accountId: 'cn:a1', submit: true, status: { today_checked_in: true }, error: null }],
+    checkinRecords: [{ at: now - 3600e3, accountId: 'cn:a1', submit: true, status: { today_checked_in: true, today_credit: 20 }, error: null, trigger: 'scheduled' }],
     version: '5.8.3',
   },
   qoder: {
@@ -186,7 +187,7 @@ const pool = {
     ],
     settings: { autoClaim: true },
     scheduler: { lastRun: '2026-10-21 10:05:12', lastResults: [] },
-    claimLog: [{ time: '2026-10-21 10:05:12', results: [{ name: 'Qoder 演示 01', edition: 'cn', phase: 'claimed', msg: '领取成功 +100 Credits', credits: 100 }, { name: 'Qoder 演示 02', edition: 'intl', phase: 'nothing', msg: '今日无可领积分', credits: 0 }] }],
+    claimLog: [{ time: '2026-10-21 10:05:12', trigger: 'manual', results: [{ name: 'Qoder 演示 01', edition: 'cn', phase: 'claimed', msg: '领取成功 +100 Credits', credits: 100 }, { name: 'Qoder 演示 02', edition: 'intl', phase: 'nothing', msg: '今日无可领积分', credits: 0 }] }],
     gateway: { transport: 'legacy', cnEndpoint: 'https://gateway.qoder.com.cn', intlEndpoint: 'https://api2.qoder.sh', disabledAccounts: [] },
   },
   trae: {
@@ -217,6 +218,11 @@ if (new URLSearchParams(location.search).has('expired')) {
   trae.enabled = false
   Object.assign(runtime['trae/t1'], { enabled: false, authFailed: true })
 }
+if (new URLSearchParams(location.search).has('disabled')) {
+  pool.workbuddy.accounts[1].enabled = false
+  Object.assign(runtime['workbuddy/cn:a2'], { enabled: false, disabled: true })
+  Object.assign(runtime['qoder/cn:q1'], { enabled: false, disabled: true })
+}
 if (new URLSearchParams(location.search).has('stale-auth')) {
   const wb = pool.workbuddy.accounts[0]
   wb.enabled = false
@@ -241,7 +247,7 @@ function stats() {
 export function preview(command: string, args?: Record<string, any>): unknown {
   switch (command) {
     case 'app_snapshot':
-      return { version: appVersion, dataDir: '/Users/****/.agentdock', running: true, port: 24800, apiKey: 'ad-preview0000000000000000000000000000', apiKeys: [{ id: 'default', key: 'ad-preview0000000000000000000000000000', alias: '', enabled: true, strategy: null, scope: null, createdAt: 0 }], error: '', settings: structuredClone(settings), active: [], checkin: checkinStatus, migration: { workbuddy: { files: 1, usageRows: 3262 }, qoder: { files: 31, usageRows: 0 }, trae: { files: 4, requests: 0 } } }
+      return { version: appVersion, dataDir: '/Users/****/.agentdock', running: true, port: 24800, lan: true, lanAddresses: ['192.168.1.23'], apiKey: 'ad-preview0000000000000000000000000000', apiKeys: [{ id: 'default', key: 'ad-preview0000000000000000000000000000', alias: '', enabled: true, strategy: null, scope: null, createdAt: 0 }], error: '', settings: structuredClone(settings), active: [], checkin: checkinStatus, migration: { workbuddy: { files: 1, usageRows: 3262 }, qoder: { files: 31, usageRows: 0 }, trae: { files: 4, requests: 0 } } }
     case 'save_settings':
       for (const [k, v] of Object.entries(args?.patch ?? {})) settings[k] = k === 'checkin' ? { ...settings.checkin, ...(v as object) } : v
       return settings
@@ -262,6 +268,14 @@ export function preview(command: string, args?: Record<string, any>): unknown {
     case 'wb_set_runtime_settings':
       Object.assign(pool.workbuddy.settings, args?.settings)
       return { ok: true }
+    case 'set_account_disabled': {
+      const rt = runtime[`${args?.providerKey}/${args?.id}`]
+      rt.disabled = !!args?.disabled
+      if (rt.disabled) rt.enabled = false
+      const wb = pool.workbuddy.accounts.find((a: any) => a.id === args?.id)
+      if (wb && rt.disabled) wb.enabled = false
+      return { ok: true }
+    }
     case 'wb_oauth_start':
       return { loginId: args?.variant === 'ai' ? 'preview:ai:a3' : 'preview:cn:a1', verificationUri: 'https://example.com/preview-oauth' }
     case 'wb_open_oauth_link':

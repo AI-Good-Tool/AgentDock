@@ -1683,6 +1683,7 @@ mod tests {
                 submit: true,
                 status: Some(json!({"today_checked_in":true,"today_credit":10})),
                 error: None,
+                trigger: None,
             });
         let snap = s.snapshot();
         assert_eq!(snap["accounts"][0]["checkin"]["today_checked_in"], true);

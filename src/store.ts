@@ -1,7 +1,7 @@
 // Shared reactive state and actions for every page.
 
 import { reactive, ref, watch } from 'vue'
-import { Message } from '@arco-design/web-vue'
+import { Message, Modal } from '@arco-design/web-vue'
 import { call, desktop as isDesktop, previewMode, type AppSnapshot, type RequestLog, type RouteView, type Target, type AccountRuntime, type ProviderKey } from './api'
 import { langSetting, tzSetting, t } from './i18n'
 
@@ -40,6 +40,29 @@ export const revealPhones = ref(false)
 
 export function runtimeOf(provider: string, id: string): AccountRuntime | undefined {
   return state.pool?.runtime?.[`${provider}/${id}`]
+}
+export const isDisabled = (provider: string, id: string) => !!runtimeOf(provider, id)?.disabled
+/** Disabling asks first; enabling leaves the proxy off until switched on. */
+export function setAccountDisabled(provider: ProviderKey, id: string, disabled: boolean) {
+  const run = () =>
+    act(
+      `disable:${provider}/${id}`,
+      () => call('set_account_disabled', { providerKey: provider, id, disabled }),
+      disabled
+        ? t('账号已禁用，反代已关闭', 'Account disabled; proxy is off')
+        : t('账号已启用；需要时请手动开启反代', 'Account enabled; turn the proxy on when needed')
+    )
+  if (!disabled) return run()
+  Modal.confirm({
+    title: t('禁用账号', 'Disable account'),
+    content: t(
+      '禁用后自动关闭反代，且不参与一键刷新积分、刷新限额、全部签到和定时签到。账号数据保留，可随时启用。',
+      'The proxy is turned off and the account is left out of batch credit and limit refreshes, check-in for all and scheduled check-ins. Its data is kept; enable it any time.'
+    ),
+    okText: t('禁用', 'Disable'),
+    okButtonProps: { status: 'danger' },
+    onOk: run,
+  })
 }
 
 async function guard<T>(work: () => Promise<T>): Promise<T | undefined> {

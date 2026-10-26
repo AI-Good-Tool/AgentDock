@@ -16,10 +16,13 @@ import {
   IconStorage,
   IconGift,
   IconMobile,
+  IconPlayCircle,
+  IconStop,
 } from '@arco-design/web-vue/es/icon'
 import { t, fmtDate, fmtShort } from '../i18n'
-import { state, runtimeOf } from '../store'
+import { state, runtimeOf, setAccountDisabled } from '../store'
 import AccountAuthAlert from './AccountAuthAlert.vue'
+import AccountDisabledBar from './AccountDisabledBar.vue'
 import { credits, updated } from '../lib/account-display'
 import CardProxyRow from './CardProxyRow.vue'
 const props = defineProps<{ account: any; compact?: boolean }>()
@@ -37,6 +40,7 @@ const emit = defineEmits<{
 }>()
 const a = computed(() => props.account)
 const rt = computed(() => runtimeOf('trae', a.value.id))
+const disabled = computed(() => !!rt.value?.disabled)
 const expired = computed(() => a.value.tokenExpired || Date.parse(a.value.expiredAt) <= state.now)
 const loginInvalid = computed(() => expired.value || a.value.tokenPresent === false || rt.value?.authFailed)
 const name = computed(() => a.value.note || a.value.username || 'Trae')
@@ -53,7 +57,10 @@ const plan = computed(() => a.value.snapshot?.pay?.user_pay_identity_str || a.va
 const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n + c.charCodeAt(0), 0) % 3)
 </script>
 <template>
-  <article class="switch-card" :class="[{ 'compact-card': compact, 'auth-invalid-card': loginInvalid }, `tone-${color}`]">
+  <article
+    class="switch-card"
+    :class="[{ 'compact-card': compact, 'auth-invalid-card': loginInvalid && !disabled, 'account-disabled-card': disabled }, `tone-${color}`]"
+  >
     <header class="switch-card-header">
       <div class="switch-avatar">{{ Array.from(String(name))[0]?.toUpperCase() }}</div>
       <div class="switch-identity">
@@ -61,6 +68,7 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
         <p :title="a.email || a.userId">{{ a.email || t('本地采集账号', 'Locally captured') }}{{ plan ? ' · ' + plan : '' }}</p>
         <p v-if="a.mobile" class="switch-contact mono" :title="t('Trae 官方只提供脱敏手机号', 'Trae only provides a masked number')"><IconMobile /> {{ a.mobile }}</p>
         <div class="switch-badges">
+          <span v-if="disabled" class="card-chip off">{{ t('已禁用', 'Disabled') }}</span>
           <span class="card-chip">{{ a.variant === 'cn' ? t('国内版', 'China') : t('国际版', 'Intl') }}</span>
           <span :class="loginInvalid ? 'auth-invalid-chip' : 'card-chip ok'">{{ loginInvalid ? expired ? t('登录已过期', 'Login expired') : t('需重新登录', 'Sign-in required') : t('凭证有效', 'Login valid') }}</span>
           <span v-if="a.models?.length" class="card-chip">{{ a.models.length }} {{ t('个模型', 'models') }}</span>
@@ -77,13 +85,17 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
           ><a-doption @click="emit('models')"><IconStorage /> {{ t('同步模型目录', 'Sync models') }}</a-doption
           ><a-doption v-if="a.variant === 'cn'" @click="emit('packs')"><IconGift /> {{ t('全部积分包', 'All credit packs') }}</a-doption
           ><a-doption @click="emit('json')"><IconCode /> {{ t('查看 JSON', 'View JSON') }}</a-doption
+          ><a-doption @click="setAccountDisabled('trae', a.id, !disabled)"
+            ><template v-if="disabled"><IconPlayCircle /> {{ t('启用账号', 'Enable account') }}</template
+            ><span v-else class="danger-option"><IconStop /> {{ t('禁用账号', 'Disable account') }}</span></a-doption
           ><a-doption @click="emit('remove')"
             ><span class="danger-option"><IconDelete /> {{ t('删除账号', 'Delete account') }}</span></a-doption
           ></template
         ></a-dropdown
       >
     </header>
-    <AccountAuthAlert v-if="loginInvalid" :expired="!!expired" :disabled="!(rt?.enabled ?? a.enabled)" />
+    <AccountDisabledBar v-if="disabled" provider="trae" :id="a.id" />
+    <AccountAuthAlert v-else-if="loginInvalid" :expired="!!expired" :disabled="!(rt?.enabled ?? a.enabled)" />
     <section class="switch-credit-section">
       <div class="switch-credit-line">
         <IconStar /><strong>{{ amount(b.remaining) }}</strong
@@ -129,9 +141,11 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
         </button>
       </div>
       <CardProxyRow provider="trae" :id="a.id">
-        <label v-if="a.variant === 'cn'" :title="t('自动签到按「签到与领取」的计划执行', 'Auto check-in follows the Daily Rewards schedule')"
+        <label
+          v-if="a.variant === 'cn'"
+          :title="disabled ? t('账号已禁用，不参与签到', 'Disabled accounts are not checked in') : t('自动签到按「签到与领取」的计划执行', 'Auto check-in follows the Daily Rewards schedule')"
           >{{ t('签到', 'Check-in') }}
-          <a-switch size="small" :model-value="a.autoCheckin" @change="(v) => emit('autoCheckin', !!v)"
+          <a-switch size="small" :model-value="a.autoCheckin" :disabled="disabled" @change="(v) => emit('autoCheckin', !!v)"
         /></label>
       </CardProxyRow>
     </footer>

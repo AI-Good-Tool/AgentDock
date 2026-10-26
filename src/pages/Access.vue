@@ -20,6 +20,8 @@ watch(
 )
 const port = computed(() => state.app?.port ?? draft.value?.port ?? 24800)
 const base = computed(() => `http://127.0.0.1:${port.value}`)
+const lanIps = computed(() => state.app?.lanAddresses ?? [])
+const lanBase = computed(() => (state.app?.running && state.app.lan && lanIps.value[0] ? `http://${lanIps.value[0]}:${port.value}` : ''))
 const strategies = computed(() => [
   { value: 'roundRobin', label: t('轮询', 'Round robin'), desc: t('同一模型按账号顺序逐个使用，每个模型独立推进', 'Rotate accounts per model') },
   { value: 'creditFirst', label: t('积分优先', 'Credits first'), desc: t('剩余积分最多的账号优先；未查询或美元额度排在后面', 'Most remaining credits first; unknown/USD balances last') },
@@ -30,7 +32,7 @@ const strategies = computed(() => [
 function save() {
   const d = draft.value!
   return saveSettings(
-    { port: d.port, strategy: d.strategy, providers: d.providers, pinned: d.pinned, rejectBrowserOrigin: d.rejectBrowserOrigin, autoStart: d.autoStart, recentImages: d.recentImages ?? null },
+    { port: d.port, allowLan: !!d.allowLan, strategy: d.strategy, providers: d.providers, pinned: d.pinned, rejectBrowserOrigin: d.rejectBrowserOrigin, autoStart: d.autoStart, recentImages: d.recentImages ?? null },
     t('接入设置已保存，对新请求立即生效', 'Saved; applies to new requests')
   ).then(() => (dirty.value = false))
 }
@@ -72,6 +74,7 @@ const configCode = computed(() => {
 })
 const endpoints = computed(() => [
   [t('统一入口（全部端、全部地区）', 'Unified (all providers and regions)'), `${base.value}/v1`],
+  ...(lanBase.value ? [[t('局域网设备（统一入口）', 'LAN devices (unified)'), `${lanBase.value}/v1`]] : []),
   [t('Claude Code / Anthropic', 'Claude Code / Anthropic'), base.value],
   [t('仅国内账号', 'China accounts only'), `${base.value}/cn/v1`],
   [t('仅国际账号', 'International accounts only'), `${base.value}/intl/v1`],
@@ -102,10 +105,18 @@ function saveQoder() {
   <div v-if="draft" class="split-2">
     <div>
       <section class="box">
-        <div class="box-head"><div><h2>{{ t('网关与调度', 'Gateway and scheduling') }}</h2><p>{{ t('仅监听 127.0.0.1；每个请求调用一个账号。仅当 Qoder 在输出前明确拒绝（401/403/429）或排队时，才换下一个可用账号重试，最多 3 个；已开始输出的请求不会重放。', 'Loopback only; one account per request. Only an explicit Qoder rejection (401/403/429) or queue notice before any output moves the request to the next eligible account, at most 3; started output is never replayed.') }}</p></div></div>
+        <div class="box-head"><div><h2>{{ t('网关与调度', 'Gateway and scheduling') }}</h2><p>{{ t('默认仅监听 127.0.0.1，可开启局域网访问；每个请求调用一个账号。仅当 Qoder 在输出前明确拒绝（401/403/429）或排队时，才换下一个可用账号重试，最多 3 个；已开始输出的请求不会重放。', 'Loopback by default, LAN access optional; one account per request. Only an explicit Qoder rejection (401/403/429) or queue notice before any output moves the request to the next eligible account, at most 3; started output is never replayed.') }}</p></div></div>
         <div class="field-row">
           <div><b>{{ t('监听端口', 'Port') }}</b><small>{{ t('修改端口需先停止服务', 'Stop the gateway to change it') }}</small></div>
           <div class="control"><a-input-number v-model="draft.port" :min="1024" :max="65535" :disabled="state.app?.running" style="width: 140px" @change="touch" /></div>
+        </div>
+        <div class="field-row">
+          <div>
+            <b>{{ t('允许局域网访问', 'Allow LAN access') }}</b>
+            <small>{{ t('开启后监听所有网卡，同一局域网的其他设备可凭本地 API Key 访问；只在可信网络开启。修改需先停止服务', 'Listens on every interface so other devices on your network can connect with a local API key; enable only on trusted networks. Stop the gateway to change it') }}</small>
+            <small class="mono">{{ t('本机局域网 IP：', 'LAN IP: ') }}{{ lanIps.length ? lanIps.join(t('、', ', ')) : t('未检测到', 'none found') }}</small>
+          </div>
+          <div class="control"><a-switch v-model="draft.allowLan" :disabled="state.app?.running" @change="touch" /></div>
         </div>
         <div class="field-row">
           <div><b>{{ t('默认调度策略', 'Default scheduling') }}</b><small>{{ t('同一模型在所有提供它的端、地区和账号之间统一调度；API Key 可单独设置', 'One pool per model across every provider, region and account that offers it; each API key may override it') }}</small></div>

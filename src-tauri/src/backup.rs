@@ -230,6 +230,7 @@ pub fn import(hub: &Shared, bundle: &Value, parts: &Parts) -> Result<Value, Stri
         report["trae"] = r;
     }
     for (provider, revisions) in before { hub.restore_changed_logins(provider, &revisions)?; }
+    hub.enforce_disabled_accounts();
     agentdock_core::applog::info("backup", || ("已导入备份".into(), report.clone()));
     Ok(report)
 }

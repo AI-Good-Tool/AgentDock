@@ -195,7 +195,10 @@ const strategyName = computed(() => {
           <span>{{ t('服务状态', 'Service') }}</span
           ><b>{{
             running
-              ? t('正在监听', 'Listening') + ' 127.0.0.1:' + state.app?.port
+              ? t('正在监听', 'Listening') +
+                ' 127.0.0.1:' +
+                state.app?.port +
+                (state.app?.lan && state.app.lanAddresses?.[0] ? ` · ${state.app.lanAddresses[0]}:${state.app.port}` : '')
               : t('未启动', 'Stopped')
           }}</b>
         </div>

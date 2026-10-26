@@ -1,4 +1,4 @@
-//! Loopback HTTP gateway: Chat Completions, Anthropic Messages (+count_tokens)
+//! HTTP gateway (loopback, or every interface with LAN access): Chat Completions, Anthropic Messages (+count_tokens)
 //! and stateless Responses over every provider. Paths may be scoped to a
 //! provider and/or region, e.g. `/v1`, `/cn/v1`, `/qoder/v1`, `/trae/intl/v1`,
 //! and the ZCode compatibility profile `/zcode/...`.
@@ -1025,7 +1025,25 @@ fn record_stream_failure(lease: &mut Lease, f: &agentdock_core::stream::StreamFa
     }
 }
 
-/// Bind the loopback listener and serve until stopped.
+/// This computer's private IPv4 addresses (192.168.x first, then 10.x and
+/// 172.16–31.x), for showing where LAN clients connect. Tunnel and link-local
+/// addresses are skipped.
+pub fn lan_addresses() -> Vec<std::net::Ipv4Addr> {
+    let mut out: Vec<std::net::Ipv4Addr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !i.is_loopback() && i.is_oper_up())
+        .filter_map(|i| match i.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_private() => Some(ip),
+            _ => None,
+        })
+        .collect();
+    out.sort_by_key(|ip| (ip.octets()[0] != 192, ip.octets()[0] != 10, *ip));
+    out.dedup();
+    out
+}
+
+/// Bind the listener (loopback, or every interface with LAN access) and serve until stopped.
 pub async fn start(hub: Shared) -> Result<u16, String> {
     if hub.running() {
         return Ok(hub.server.lock().unwrap().as_ref().unwrap().port);
@@ -1039,7 +1057,9 @@ pub async fn start(hub: Shared) -> Result<u16, String> {
             *hub.error.lock().unwrap() = format!("WorkBuddy 设备 SDK：{e}");
         }
     }
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, settings.port))
+    let lan = settings.allow_lan;
+    let host = if lan { std::net::Ipv4Addr::UNSPECIFIED } else { std::net::Ipv4Addr::LOCALHOST };
+    let listener = tokio::net::TcpListener::bind((host, settings.port))
         .await
         .map_err(|_| {
             let e = format!("端口 {} 已占用或无法监听", settings.port);
@@ -1054,11 +1074,17 @@ pub async fn start(hub: Shared) -> Result<u16, String> {
         if server.is_some() {
             return Ok(port);
         }
-        *server = Some(crate::app::ServerHandle { port, stop: tx });
+        *server = Some(crate::app::ServerHandle { port, lan, stop: tx });
     }
     hub.error.lock().unwrap().clear();
     agentdock_core::applog::info("gateway", || {
-        (format!("网关已启动：127.0.0.1:{port}"), json!({"strategy": settings.strategy}))
+        let message = if lan {
+            let lan_urls: Vec<String> = lan_addresses().iter().map(|ip| format!("{ip}:{port}")).collect();
+            format!("网关已启动：127.0.0.1:{port}，允许局域网访问（{}）", if lan_urls.is_empty() { "未检测到局域网地址".into() } else { lan_urls.join("、") })
+        } else {
+            format!("网关已启动：127.0.0.1:{port}")
+        };
+        (message, json!({"strategy": settings.strategy, "lan": lan}))
     });
     let app = router(hub.clone());
     let state = hub.clone();
@@ -1086,6 +1112,13 @@ pub fn stop(hub: &Shared) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lan_addresses_are_private_ipv4_with_192_168_first() {
+        let ips = lan_addresses();
+        assert!(ips.iter().all(|ip| ip.is_private()));
+        let rank: Vec<_> = ips.iter().map(|ip| (ip.octets()[0] != 192, ip.octets()[0] != 10)).collect();
+        assert!(rank.windows(2).all(|w| w[0] <= w[1]));
+    }
     #[test]
     fn paths_cover_scopes_profiles_and_aliases() {
         let ep = parse("/v1/chat/completions").unwrap();

@@ -100,13 +100,18 @@ pub async fn sync_models(state: Shared, id: Option<String>) -> Result<usize, Str
 }
 
 pub async fn checkin(state: Shared, id: String, submit: bool) -> Result<Value, String> {
-    checkin_run(state, id, submit, false).await
+    checkin_run(state, id, submit, false, "manual").await
+}
+/// A pass of the unified check-in plan; `trigger` is kept in the record.
+pub async fn checkin_by(state: Shared, id: String, submit: bool, trigger: &str) -> Result<Value, String> {
+    checkin_run(state, id, submit, false, trigger).await
 }
 async fn checkin_run(
     state: Shared,
     id: String,
     submit: bool,
     automatic: bool,
+    trigger: &str,
 ) -> Result<Value, String> {
     let _guard = crate::checkin::RunGuard::acquire(state.clone(), &id)?;
     let result = checkin_inner(state.clone(), id.clone(), submit, automatic).await;
@@ -117,6 +122,7 @@ async fn checkin_run(
         submit,
         status: result.as_ref().ok().cloned(),
         error: result.as_ref().err().cloned(),
+        trigger: Some(trigger.to_owned()),
     };
     let saved = state.clone();
     let record_id = id.clone();
@@ -333,7 +339,7 @@ pub async fn run_checkin_scheduler(state: Shared) {
             ) {
                 continue;
             }
-            let result = checkin_run(state.clone(), id.clone(), true, true).await;
+            let result = checkin_run(state.clone(), id.clone(), true, true, "scheduled").await;
             {
                 let mut rt = state.runtime.lock().unwrap();
                 let attempt = rt.auto_checkin_attempts.entry(id).or_default();

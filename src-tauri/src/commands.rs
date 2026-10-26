@@ -22,13 +22,17 @@ fn provider(p: &str) -> Result<ProviderKind, String> {
 #[tauri::command]
 pub fn app_snapshot(hub: State<'_, Shared>) -> Value {
     let settings = hub.settings();
-    let running = hub.server.lock().unwrap().as_ref().map(|s| s.port);
+    let server = hub.server.lock().unwrap().as_ref().map(|s| (s.port, s.lan));
     let active: Vec<_> = hub.active.lock().unwrap().values().cloned().collect();
+    let lan_addresses: Vec<String> = crate::server::lan_addresses().iter().map(|ip| ip.to_string()).collect();
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "dataDir": hub.dir,
-        "running": running.is_some(),
-        "port": running.unwrap_or(settings.port),
+        "running": server.is_some(),
+        "port": server.map_or(settings.port, |s| s.0),
+        // Whether the running gateway accepts LAN connections (as bound, not as saved).
+        "lan": server.is_some_and(|s| s.1),
+        "lanAddresses": lan_addresses,
         "apiKey": hub.api_key(),
         "apiKeys": hub.keys.list(),
         "error": *hub.error.lock().unwrap(),
@@ -125,7 +129,8 @@ pub async fn save_settings(hub: State<'_, Shared>, patch: Value) -> Res {
         hub.update_settings(|s| {
             let mut value = serde_json::to_value(&*s).unwrap();
             for (k, v) in patch.as_object().ok_or("设置格式无效")? {
-                if k == "routes" {
+                // Account states change only through their own commands, which also switch the proxy.
+                if matches!(k.as_str(), "routes" | "disabledAccounts" | "authDisabledAccounts") {
                     continue;
                 }
                 // `checkin` accepts partial patches so concurrent switches never clobber each other.
@@ -196,6 +201,13 @@ pub async fn set_account_enabled(hub: State<'_, Shared>, provider_key: String, i
     let p = provider(&provider_key)?;
     let hub = hub.inner().clone();
     blocking(move || hub.set_account_enabled(p, &id, enabled).map(|_| json!({"ok":true}))).await?
+}
+
+#[tauri::command]
+pub async fn set_account_disabled(hub: State<'_, Shared>, provider_key: String, id: String, disabled: bool) -> Res {
+    let p = provider(&provider_key)?;
+    let hub = hub.inner().clone();
+    blocking(move || hub.set_account_disabled(p, &id, disabled).map(|_| json!({"ok":true}))).await?
 }
 
 #[tauri::command]
@@ -530,14 +542,18 @@ pub async fn wb_import_accounts(hub: State<'_, Shared>, source: String) -> Res {
         let result_id = id.clone();
         blocking(move || {
             hub.restore_workbuddy_login(&id)?;
-            workbuddy::switch_bridge::refresh_local(&hub.wb)?;
+            workbuddy::switch_bridge::refresh_local(&hub.wb, &hub.disabled_ids(ProviderKind::Workbuddy))?;
             let wb = hub.wb.clone();
             tauri::async_runtime::spawn(async move { let _ = workbuddy::settings::refresh_accounts(wb, vec![id]).await; });
             Ok(json!({"count":1,"accountId":result_id,"updated":true}))
         }).await?
     } else {
-        let wb = hub.wb.clone();
-        blocking(move || { let n = wb.import_accounts(&source)?; workbuddy::switch_bridge::refresh_local(&wb)?; Ok(json!({"count":n})) }).await?
+        let hub = hub.inner().clone();
+        blocking(move || {
+            let n = hub.wb.import_accounts(&source)?;
+            workbuddy::switch_bridge::refresh_local(&hub.wb, &hub.disabled_ids(ProviderKind::Workbuddy))?;
+            Ok(json!({"count":n}))
+        }).await?
     }
 }
 #[tauri::command]
@@ -645,10 +661,10 @@ pub async fn wb_set_runtime_settings(hub: State<'_, Shared>, settings: workbuddy
 }
 #[tauri::command]
 pub async fn wb_refresh_statuses(hub: State<'_, Shared>) -> Res {
-    let wb = hub.wb.clone();
+    let hub = hub.inner().clone();
     blocking(move || {
         wb_switch_core::modules::limits::invalidate_scan_cache();
-        workbuddy::switch_bridge::refresh_local(&wb).map(|_| json!({"ok":true}))
+        workbuddy::switch_bridge::refresh_local(&hub.wb, &hub.disabled_ids(ProviderKind::Workbuddy)).map(|_| json!({"ok":true}))
     })
     .await?
 }
@@ -662,8 +678,11 @@ pub async fn wb_refresh_credits(hub: State<'_, Shared>, ids: Vec<String>) -> Res
 }
 #[tauri::command]
 pub async fn wb_switch_client(hub: State<'_, Shared>, id: String, target: String, confirmed: bool) -> Res {
-    let wb = hub.wb.clone();
-    blocking(move || workbuddy::switch_bridge::switch_client(&wb, &id, &target, confirmed)).await?
+    let hub = hub.inner().clone();
+    blocking(move || {
+        workbuddy::switch_bridge::switch_client(&hub.wb, &id, &target, confirmed, &hub.disabled_ids(ProviderKind::Workbuddy))
+    })
+    .await?
 }
 #[tauri::command]
 pub async fn wb_checkin(hub: State<'_, Shared>, id: String, submit: bool) -> Res {
@@ -791,7 +810,8 @@ pub async fn qoder_switch_account(id: String) -> Res {
     })
     .await
 }
-pub fn qoder_claim_blocking(id: Option<String>) -> Value {
+/// Without an id, claims every account except the disabled ones in `skip`.
+pub fn qoder_claim_blocking(id: Option<String>, skip: &std::collections::HashSet<String>) -> Value {
     use qoder::qcore as qc;
     if let Some(aid) = id {
         let mut accounts = qc::load_accounts();
@@ -799,14 +819,14 @@ pub fn qoder_claim_blocking(id: Option<String>) -> Value {
             Some(i) => {
                 let r = qc::claim_account(&mut accounts[i], false);
                 let _ = qc::save_accounts(&accounts);
-                qc::append_claim_log(&[r.clone()]);
+                qc::append_claim_log(&[r.clone()], "manual");
                 let ok = matches!(r["phase"].as_str(), Some("claimed" | "nothing" | "dry_run"));
                 json!({"ok":ok,"message":format!("{}：{}", r["name"].as_str().unwrap_or(""), r["msg"].as_str().unwrap_or(""))})
             }
             None => json!({"ok":false,"message":"账号不存在"}),
         }
     } else {
-        let results = qc::claim_all(None, false);
+        let results = qc::claim_all(None, false, "manual", skip);
         let total: f64 = results.iter().filter_map(|r| r["credits"].as_f64()).sum();
         let lines: Vec<String> = results.iter().map(|r| format!("{} {}", r["name"].as_str().unwrap_or(""), r["msg"].as_str().unwrap_or(""))).collect();
         json!({"ok":true,"message":format!("共领取 {} Credits。{}", total, lines.join("；")),"results":results})
@@ -817,7 +837,7 @@ pub async fn qoder_claim(hub: State<'_, Shared>, id: Option<String>) -> Res {
     let hub = hub.inner().clone();
     blocking(move || {
         let before = hub.credential_revisions(ProviderKind::Qoder);
-        let result = qoder_claim_blocking(id);
+        let result = qoder_claim_blocking(id, &hub.disabled_ids(ProviderKind::Qoder));
         hub.restore_changed_logins(ProviderKind::Qoder, &before)?;
         Ok(result)
     }).await?
@@ -879,6 +899,7 @@ pub async fn qoder_delete_account(hub: State<'_, Shared>, id: String) -> Res {
         let accounts: Vec<_> = qoder::qcore::load_accounts().into_iter().filter(|a| a.id() != id).collect();
         let _ = qoder::qcore::save_accounts(&accounts);
         hub.qoder.forget_account(&id);
+        let _ = hub.set_account_disabled(ProviderKind::Qoder, &id, false);
         json!({"ok":true,"message":"已删除"})
     })
     .await
@@ -1023,13 +1044,12 @@ pub async fn qoder_refresh_account(hub: State<'_, Shared>, id: String) -> Res {
     })
     .await
 }
+/// Clear check-in history of one platform, or of all three. Each account's
+/// current check-in status is kept apart from the history and stays.
 #[tauri::command]
-pub async fn qoder_clear_claim_log() -> Res {
-    blocking(|| {
-        qoder::qcore::write_claim_log(&json!([]));
-        json!({"ok":true,"message":"领取记录已清除"})
-    })
-    .await
+pub async fn checkin_clear_history(hub: State<'_, Shared>, provider: Option<String>) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || hub.clear_checkin_history(provider.as_deref()).map(|_| json!({"ok":true}))).await?
 }
 #[tauri::command]
 pub async fn qoder_save_gateway(hub: State<'_, Shared>, config: qoder::gateway::Config) -> Res {
@@ -1108,8 +1128,13 @@ pub async fn trae_import(hub: State<'_, Shared>, variant: String, account: Value
 }
 #[tauri::command]
 pub async fn trae_delete(hub: State<'_, Shared>, id: String) -> Res {
-    let t = hub.trae.clone();
-    blocking(move || t.delete(&id).map(|_| json!({"ok":true}))).await?
+    let hub = hub.inner().clone();
+    blocking(move || {
+        hub.trae.delete(&id)?;
+        let _ = hub.set_account_disabled(ProviderKind::Trae, &id, false);
+        Ok(json!({"ok":true}))
+    })
+    .await?
 }
 
 // ── WorkBuddy sessions (WorkBuddy Switch session core) ──

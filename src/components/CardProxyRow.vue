@@ -20,9 +20,19 @@ async function clear() {
 </script>
 <template>
   <div class="account-toggle-row">
-    <label :title="t('停用后不再接收新请求，正在进行的请求会继续完成', 'Disabled accounts take no new requests; in-flight requests finish')"
+    <label
+      :title="
+        rt?.disabled
+          ? t('账号已禁用，启用后才能开启反代', 'Enable the account to turn the proxy on')
+          : t('停用后不再接收新请求，正在进行的请求会继续完成', 'Disabled accounts take no new requests; in-flight requests finish')
+      "
       >{{ t('反代', 'Proxy') }}
-      <a-switch size="small" :model-value="rt?.enabled ?? true" :loading="state.pending.has(`enable:${key}`)" @change="(v) => toggle(!!v)"
+      <a-switch
+        size="small"
+        :model-value="rt?.enabled ?? true"
+        :disabled="rt?.disabled"
+        :loading="state.pending.has(`enable:${key}`)"
+        @change="(v) => toggle(!!v)"
     /></label>
     <slot />
     <span v-if="rt?.authFailed" class="auth-invalid-chip" :title="t('重新登录后请手动开启反代', 'Sign in again, then enable proxy manually')">{{ t('登录失效', 'Login invalid') }}</span>

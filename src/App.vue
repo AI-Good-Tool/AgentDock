@@ -88,6 +88,15 @@ const pages: Record<string, any> = {
   about: About,
 }
 const running = computed(() => !!state.app?.running)
+const lanHost = computed(() => (running.value && state.app?.lan ? state.app.lanAddresses?.[0] : undefined))
+const lanTitle = computed(() => {
+  if (!running.value) return ''
+  if (!state.app?.lan) return t('仅本机可访问', 'This computer only')
+  const all = (state.app.lanAddresses ?? []).map((ip) => `${ip}:${state.app?.port}`)
+  return all.length
+    ? t('局域网设备可通过 ', 'LAN devices can use ') + all.join(t('、', ', ')) + t(' 访问（需 API Key）', ' (API key required)')
+    : t('已允许局域网访问，但未检测到局域网地址', 'LAN access is on, but no LAN address was found')
+})
 function toggle() {
   return act(
     'gateway',
@@ -150,9 +159,13 @@ onMounted(async () => {
       <header class="topbar">
         <div>AgentDock <span>/</span> {{ nav.find((n) => n.id === page)?.label }}</div>
         <div class="topbar-right">
-          <span class="gateway-chip" :class="{ online: running }">
+          <span class="gateway-chip" :class="{ online: running }" :title="lanTitle">
             <i class="dot" :class="{ online: running }"></i>
             <span class="mono">{{ running ? `127.0.0.1:${state.app?.port}` : t('未启动', 'Stopped') }}</span>
+            <template v-if="lanHost">
+              <span class="chip-sep">·</span>
+              <span class="mono">{{ lanHost }}:{{ state.app?.port }}</span>
+            </template>
           </span>
           <a-button
             class="gateway-btn"

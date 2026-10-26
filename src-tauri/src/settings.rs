@@ -120,6 +120,9 @@ pub struct RouteOverride {
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub port: u16,
+    /// Listen on every network interface instead of loopback only, so other
+    /// devices on the LAN can connect (still with a local API key).
+    pub allow_lan: bool,
     pub strategy: Strategy,
     pub providers: BTreeMap<ProviderKind, ProviderScope>,
     pub routes: BTreeMap<String, RouteOverride>,
@@ -129,6 +132,9 @@ pub struct Settings {
     /// Kept until verified login recovery or manual acknowledgement. Recovery
     /// clears this evidence while leaving the native proxy switch disabled.
     pub auth_disabled_accounts: BTreeSet<String>,
+    /// Accounts (account keys) disabled by the user: proxy stays off and they
+    /// are left out of batch and scheduled actions until enabled again.
+    pub disabled_accounts: BTreeSet<String>,
     /// Reject browser (http/https Origin) requests; native and file:// clients pass.
     pub reject_browser_origin: bool,
     /// Start the gateway automatically when AgentDock opens.
@@ -152,6 +158,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
+            allow_lan: false,
             strategy: Strategy::RoundRobin,
             providers: ProviderKind::ALL
                 .into_iter()
@@ -160,6 +167,7 @@ impl Default for Settings {
             routes: BTreeMap::new(),
             pinned: BTreeMap::new(),
             auth_disabled_accounts: BTreeSet::new(),
+            disabled_accounts: BTreeSet::new(),
             reject_browser_origin: true,
             auto_start: false,
             recent_images: None,
