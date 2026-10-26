@@ -177,7 +177,7 @@ const pool = {
     autoCheckin: true,
     checkinConfig: { start: '09:00', end: '24:00' },
     checkinRecords: [{ at: now - 3600e3, accountId: 'cn:a1', submit: true, status: { today_checked_in: true, today_credit: 20 }, error: null, trigger: 'scheduled' }],
-    version: '5.8.3',
+    version: '5.9.2',
   },
   qoder: {
     editions: { cn: { label: 'Qoder CN 国内版', installed: true, running: false, currentUid: 'u1', currentName: 'Qoder 演示 01' }, intl: { label: 'Qoder 国际版', installed: true, running: true, currentUid: '', currentName: '' } },

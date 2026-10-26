@@ -138,19 +138,19 @@ function save() {
       <div>
         <h2>{{ t('官方请求配置', 'Official request profile') }}</h2>
         <p>
-          {{ t('通过后台 helper 使用本机 WorkBuddy 5.8.3 的 Node；设备 SDK 按运行设置选用，不启动官方应用窗口。', 'A background helper uses the installed WorkBuddy 5.8.3 Node runtime; the device SDK follows the runtime setting; no official window is opened.') }}
+          {{ t('通过后台 helper 使用本机 WorkBuddy 5.9.2 的 Node；设备 SDK 按运行设置选用，不启动官方应用窗口。', 'A background helper uses the installed WorkBuddy 5.9.2 Node runtime; the device SDK follows the runtime setting; no official window is opened.') }}
         </p>
       </div>
       <a-tag color="green">gzip</a-tag>
     </div>
     <div class="profile-grid">
       <span
-        >WorkBuddy <b>{{ snapshot.officialProfile?.desktopVersion || '5.8.3' }}</b></span
+        >WorkBuddy <b>{{ snapshot.officialProfile?.desktopVersion || '5.9.2' }}</b></span
       >
       <span
-        >CLI <b>{{ snapshot.officialProfile?.cliVersion || '2.161.0' }}</b></span
+        >CLI <b>{{ snapshot.officialProfile?.cliVersion || '2.165.0' }}</b></span
       >
-      <span>IDE <b>WorkBuddy / 5.8.3</b></span>
+      <span>IDE <b>WorkBuddy / 5.9.2</b></span>
       <span>{{ t('会话追踪', 'Session tracing') }} <b>{{ t('会话与轮次关联 · W3C / B3', 'Session and turn linking · W3C / B3') }}</b></span>
       <span
         >{{ t('设备令牌', 'Device token') }}
@@ -161,7 +161,7 @@ function save() {
       <span>{{ t('压缩', 'Compression') }} <b>Node JSON / zlib gzip</b></span>
     </div>
     <code>{{
-      snapshot.officialProfile?.userAgent || 'WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0'
+      snapshot.officialProfile?.userAgent || 'WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/2.165.0'
     }}</code
     ><small>{{ t('需要安装对应版本及区域的 WorkBuddy；设备令牌获取失败时会返回明确错误。客户端的消息、工具和模型选择按请求保留，桌面端独有的 Agent 指令与行为事件随实际来源提供。', 'Requires the matching WorkBuddy version and region; a failed device token returns a clear error. Client messages, tools and model choice are kept per request.') }}</small>
   </section>

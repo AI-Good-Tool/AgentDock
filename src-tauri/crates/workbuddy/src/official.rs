@@ -1,4 +1,4 @@
-//! Desktop sidecar profile verified against the installed 5.8.3 client.
+//! Desktop sidecar profile verified against the installed 5.9.2 client.
 //! Chat SDK headers belong here, not on unrelated billing/config requests.
 use crate::pool::{Account, Credential, Shared};
 use axum::http::HeaderMap;
@@ -7,9 +7,11 @@ use serde_json::{json, Value};
 use std::io::Write;
 use uuid::Uuid;
 
-pub const USER_AGENT: &str = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0";
+pub const DESKTOP_VERSION: &str = "5.9.2";
+pub const REQUEST_PROFILE: &str = "WorkBuddy Desktop 5.9.2 / CLI 2.165.0";
+pub const USER_AGENT: &str = "WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/2.165.0";
 pub fn profile_summary(use_device_sdk: bool) -> Value {
-    json!({"desktopVersion":"5.8.3","cliVersion":"2.161.0","nodeVersion":"v22.21.1","userAgent":USER_AGENT,"ideType":"WorkBuddy","ideVersion":"5.8.3","gzip":true,"transport":"installed-electron-node","deviceToken": if use_device_sdk { "installed-native-sdk" } else { "disabled" },"evidence":"official-desktop-shadow-wire.json"})
+    json!({"desktopVersion":"5.9.2","cliVersion":"2.165.0","nodeVersion":"v22.21.1","userAgent":USER_AGENT,"ideType":"WorkBuddy","ideVersion":"5.9.2","gzip":true,"transport":"installed-electron-node","deviceToken": if use_device_sdk { "installed-native-sdk" } else { "disabled" },"evidence":"official-desktop-offline.json"})
 }
 pub fn prepare_body(body: &mut Value, config: Option<&Value>) {
     body["stream"] = json!(true);
@@ -182,11 +184,19 @@ pub fn chat_request_with_context(
         .header("X-Conversation-Request-ID", &context.root)
         .header("X-Root-Request-ID", &context.root)
         .header("X-Agent-Intent", "craft")
+        .header("X-Agent-Runtime", "other")
+        .header(
+            "baggage",
+            format!(
+                "codebuddy.session_id={},codebuddy.conversation_request_id={}",
+                context.conversation, context.root
+            ),
+        )
         .header("X-Agent-Purpose", purpose)
         .header("X-Agent-Type", agent_type(purpose))
         .header("X-IDE-Type", "WorkBuddy")
         .header("X-IDE-Name", "WorkBuddy")
-        .header("X-IDE-Version", "5.8.3")
+        .header("X-IDE-Version", "5.9.2")
         .header("X-Private-Data", "true")
         .header("X-Codebuddy-Request", "1")
         .header(
@@ -297,8 +307,9 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let input =
             json!({"model":"hy3","stream":true,"messages":[{"role":"user","content":"offline"}]});
-        let state = crate::pool::AppState::new(std::env::temp_dir().join(Uuid::new_v4().to_string()))
-        .unwrap();
+        let state =
+            crate::pool::AppState::new(std::env::temp_dir().join(Uuid::new_v4().to_string()))
+                .unwrap();
         let account = Account {
             id: "fixture".into(),
             name: "fixture".into(),
@@ -414,7 +425,7 @@ mod tests {
                 "x64"
             }
         );
-        assert_eq!(headers["x-ide-version"], "5.8.3");
+        assert_eq!(headers["x-ide-version"], "5.9.2");
         assert_eq!(headers["x-b3-traceid"], headers["x-trace-id"]);
         assert_eq!(
             headers["traceparent"].to_str().unwrap(),
@@ -425,10 +436,9 @@ mod tests {
             )
         );
         assert!(!headers.contains_key("x-model-id"));
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../evidence/official-desktop-offline.json"
-        ))
-        .unwrap();
+        let fixture: Value =
+            serde_json::from_str(include_str!("../evidence/official-desktop-offline.json"))
+                .unwrap();
         let dynamic = [
             "host",
             "x-stainless-os",
@@ -443,6 +453,8 @@ mod tests {
             "x-conversation-message-id",
             "x-conversation-request-id",
             "x-root-request-id",
+            "baggage",
+            "x-private-data",
             "traceparent",
             "b3",
             "x-b3-traceid",

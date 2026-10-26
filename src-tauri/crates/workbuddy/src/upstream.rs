@@ -3,7 +3,7 @@
 //! the official request for one chosen account and normalizes its SSE.
 use crate::{
     diagnostics::{self, RequestDetails},
-    pool::{self, Shared},
+    pool::{self, Credential, Shared},
 };
 use agentdock_core::{
     anthropic,
@@ -14,7 +14,41 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::time::Instant;
 
-pub const REQUEST_PROFILE: &str = "WorkBuddy Desktop 5.8.3 / CLI 2.161.0";
+pub use crate::official::REQUEST_PROFILE;
+
+/// Retry the same account once, only after a real upstream 401 and before any
+/// response body reaches the client. Streaming errors never enter this path.
+pub(crate) async fn send_chat<F, Fut>(
+    transport: &crate::official_transport::Transport,
+    request: reqwest::Request,
+    mut credential: Credential,
+    use_device_sdk: bool,
+    renew: F,
+) -> Result<(reqwest::Response, Credential), String>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Option<Credential>>,
+{
+    let retry = request.try_clone();
+    let mut response = transport.send(request, use_device_sdk).await?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        && !response.headers().contains_key("x-wb-local-error")
+    {
+        if let Some(mut request) = retry {
+            if let Some(fresh) = renew(credential.token.clone()).await {
+                if let Ok(value) = format!("Bearer {}", fresh.token).parse() {
+                    request
+                        .headers_mut()
+                        .insert(reqwest::header::AUTHORIZATION, value);
+                    credential = fresh;
+                    drop(response);
+                    response = transport.send(request, use_device_sdk).await?;
+                }
+            }
+        }
+    }
+    Ok((response, credential))
+}
 
 pub fn channel_denied(code: &Value) -> bool {
     code.as_i64() == Some(11128) || code.as_str() == Some("11128")
@@ -141,7 +175,11 @@ pub async fn send(
     if let Some(id) = input.session_id.as_deref().and_then(|s| s.parse().ok()) {
         headers.insert("x-conversation-id", id);
     }
-    let context = state.conversations.lock().unwrap().prepare(&headers, &mut body);
+    let context = state
+        .conversations
+        .lock()
+        .unwrap()
+        .prepare(&headers, &mut body);
     details.upstream_summary = diagnostics::summary(&body);
     details.upstream_summary["agentPurpose"] = json!(agent_purpose);
     details.upstream_summary["requestProfile"] = json!(REQUEST_PROFILE);
@@ -167,30 +205,31 @@ pub async fn send(
         }
     };
     let use_device_sdk = state.store.lock().unwrap().settings.use_device_sdk;
-    let retry = request.try_clone();
-    let mut response = state
-        .official_transport
-        .send(request, use_device_sdk)
-        .await
-        .map_err(|message| {
-            details.local_error("official_transport", &message);
-            SendFailure::local(503, "official_transport_unavailable", message)
-        })?;
-    // Only retry a rejected HTTP request, before reading or forwarding any body.
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        if let Some(mut retry) = retry {
-            if crate::auth::ensure(state, &account, Some(&cred.token)).await.unwrap_or(false) {
-                if let Ok(fresh) = pool::credentials(&account) {
-                    if let Ok(header) = format!("Bearer {}", fresh.token).parse() {
-                        retry.headers_mut().insert(reqwest::header::AUTHORIZATION, header);
-                        response = state.official_transport.send(retry, use_device_sdk).await
-                            .map_err(|m| SendFailure::local(503, "official_transport_unavailable", m))?;
-                        cred = fresh;
-                    }
+    let (response, fresh) = send_chat(
+        &state.official_transport,
+        request,
+        cred,
+        use_device_sdk,
+        |token| {
+            let (state, account) = (state.clone(), account.clone());
+            async move {
+                if crate::auth::ensure(&state, &account, Some(&token))
+                    .await
+                    .unwrap_or(false)
+                {
+                    pool::credentials(&account).ok()
+                } else {
+                    None
                 }
             }
-        }
-    }
+        },
+    )
+    .await
+    .map_err(|message| {
+        details.local_error("official_transport", &message);
+        SendFailure::local(503, "official_transport_unavailable", message)
+    })?;
+    cred = fresh;
     let status = response.status().as_u16();
     if let Some(code) = response
         .headers()
@@ -241,7 +280,11 @@ pub async fn send(
             )
         },
     );
-    details.upstream_summary["deviceTokenSource"] = json!(if use_device_sdk { "installed-native-sdk" } else { "disabled" });
+    details.upstream_summary["deviceTokenSource"] = json!(if use_device_sdk {
+        "installed-native-sdk"
+    } else {
+        "disabled"
+    });
     details.upstream_summary["gzipHeaderHex"] = json!("1f8b0800000000000013");
     details.upstream_status = Some(status);
     let safe_header = |name: &str| {
@@ -267,7 +310,8 @@ pub async fn send(
         details.upstream_error(&data, &[&cred.token]);
         let model_limited = crate::switch_bridge::observe_limit(state, &account.id, &model, &data);
         let mut failure = rejection(status, details);
-        failure.credential_revision = Some(agentdock_core::provider::credential_revision(&cred.token));
+        failure.credential_revision =
+            Some(agentdock_core::provider::credential_revision(&cred.token));
         failure.effect = if agentdock_core::provider::login_rejected(status, &data) {
             AccountEffect::AuthFailed
         } else if status == 429 && !model_limited {
@@ -282,15 +326,15 @@ pub async fn send(
         let data = diagnostic_json(response, details, started).await;
         details.upstream_error(&data, &[&cred.token]);
         crate::switch_bridge::observe_limit(state, &account.id, &model, &data);
-        let mut failure = SendFailure::local(
-            502,
-            "invalid_upstream_response",
-            "上游没有返回 SSE 流",
-        );
-        failure.credential_revision = Some(agentdock_core::provider::credential_revision(&cred.token));
+        let mut failure =
+            SendFailure::local(502, "invalid_upstream_response", "上游没有返回 SSE 流");
+        failure.credential_revision =
+            Some(agentdock_core::provider::credential_revision(&cred.token));
         return Err(if agentdock_core::provider::login_rejected(status, &data) {
             failure.with_effect(AccountEffect::AuthFailed)
-        } else { failure });
+        } else {
+            failure
+        });
     }
     let state = state.clone();
     let account_id = account.id.clone();

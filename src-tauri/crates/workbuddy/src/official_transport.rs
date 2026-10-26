@@ -156,10 +156,13 @@ impl Worker {
             Err(_) => {
                 let _ = std::fs::remove_dir_all(&directory);
                 agentdock_core::applog::error("workbuddy.sdk", || {
-                    ("无法启动官方 Node 运行时（未安装 WorkBuddy？）".into(), serde_json::Value::Null)
+                    (
+                        "无法启动官方 Node 运行时（未安装 WorkBuddy？）".into(),
+                        serde_json::Value::Null,
+                    )
                 });
                 return Err(
-                    "请安装已验证的 WorkBuddy 5.8.3，以获取官方 Node 运行时与设备 SDK".into(),
+                    "请安装已验证的 WorkBuddy 5.9.2，以获取官方 Node 运行时与设备 SDK".into(),
                 );
             }
         };
@@ -198,7 +201,10 @@ impl Worker {
                 .is_none_or(|v| v["ready"] != true)
         {
             agentdock_core::applog::error("workbuddy.sdk", || {
-                ("官方传输进程未就绪（版本/运行时/设备 SDK 不匹配）".into(), serde_json::Value::Null)
+                (
+                    "官方传输进程未就绪（版本/运行时/设备 SDK 不匹配）".into(),
+                    serde_json::Value::Null,
+                )
             });
             return Err("本机 WorkBuddy 版本、Node 运行时或设备 SDK 与已验证配置不匹配".into());
         }
@@ -216,7 +222,7 @@ impl Worker {
         })
         .await
         .map_err(|_| "查找 WorkBuddy 安装路径失败")?
-        .ok_or("请安装 WorkBuddy 5.8.3；也可在 Switch 中设置其自定义安装路径")?;
+        .ok_or("请安装 WorkBuddy 5.9.2；也可在 Switch 中设置其自定义安装路径")?;
         let key = Uuid::new_v4().simple().to_string();
         // Windows uses an ephemeral loopback listener plus a process-private random secret.
         // No unauthenticated bridge, named-pipe pathname or command-shell interpolation.
@@ -310,6 +316,83 @@ mod portable_tests {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    #[tokio::test]
+    async fn chat_retries_only_one_real_401_before_output_with_rotated_authorization() {
+        let script = r#"
+const http=require('node:http'),fs=require('node:fs');
+const hits={};
+const server=http.createServer(async(req,res)=>{
+ for await(const chunk of req){}
+ const mode=req.headers['x-test-mode'];const hit=hits[mode]=(hits[mode]||0)+1;
+ let status=mode==='forbidden'?403:mode==='stream'?200:401;
+ if(mode==='recover'&&hit===2)status=200;
+ if(mode==='local')res.setHeader('x-wb-local-error','bridge_auth_failed');
+ res.writeHead(status,{'content-type':mode==='stream'?'text/event-stream':'application/json'});
+ res.end(mode==='stream'?'data: {"error":{"code":401}}\n\n':JSON.stringify({hit,authorization:req.headers.authorization,requestId:req.headers['x-request-id']}));
+});
+server.listen(process.env.WB_OFFICIAL_SOCKET,()=>{fs.chmodSync(process.env.WB_OFFICIAL_SOCKET,0o600);console.log('{"ready":true}')});
+process.stdin.resume();process.stdin.on('end',()=>process.exit(0));
+"#;
+        let transport = Transport(Mutex::new(Some(Worker::launch(script).await.unwrap())));
+        for (mode, expected_status, expected_hits, expected_renewals) in [
+            ("recover", 200, 2, 1),
+            ("reject", 401, 2, 1),
+            ("local", 401, 1, 0),
+            ("forbidden", 403, 1, 0),
+            ("stream", 200, 1, 0),
+            ("no-refresh", 401, 1, 1),
+        ] {
+            let credential = crate::pool::Credential {
+                token: "old".into(),
+                uid: "u".into(),
+                domain: "fixture".into(),
+                enterprise: None,
+            };
+            let request = reqwest::Client::new()
+                .post("https://www.workbuddy.cn/v2/chat/completions")
+                .bearer_auth("old")
+                .header("x-test-mode", mode)
+                .header("x-request-id", "same-turn")
+                .body("fixture")
+                .build()
+                .unwrap();
+            let renewals = std::sync::atomic::AtomicUsize::new(0);
+            let (response, credential) =
+                crate::upstream::send_chat(&transport, request, credential, false, |old| {
+                    renewals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(old, "old");
+                    std::future::ready((mode != "no-refresh").then(|| crate::pool::Credential {
+                        token: "fresh".into(),
+                        uid: "u".into(),
+                        domain: "fixture".into(),
+                        enterprise: None,
+                    }))
+                })
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), expected_status, "{mode}");
+            assert_eq!(
+                renewals.load(std::sync::atomic::Ordering::SeqCst),
+                expected_renewals,
+                "{mode}"
+            );
+            if mode == "stream" {
+                assert!(response.text().await.unwrap().contains("401"));
+            } else {
+                let data: Value = response.json().await.unwrap();
+                assert_eq!(data["hit"], expected_hits, "{mode}");
+                assert_eq!(data["requestId"], "same-turn");
+                assert_eq!(
+                    data["authorization"],
+                    format!("Bearer {}", credential.token)
+                );
+                assert_eq!(
+                    credential.token,
+                    if expected_hits == 2 { "fresh" } else { "old" }
+                );
+            }
+        }
+    }
     #[tokio::test]
     async fn helper_has_separate_background_identity() {
         let module =
@@ -410,8 +493,9 @@ upstream.listen(0,'127.0.0.1',()=>{{
         );
         let worker = Worker::launch(&script).await.unwrap();
         let transport = Transport(Mutex::new(Some(worker)));
-        let state = crate::pool::AppState::new(std::env::temp_dir().join(Uuid::new_v4().to_string()))
-        .unwrap();
+        let state =
+            crate::pool::AppState::new(std::env::temp_dir().join(Uuid::new_v4().to_string()))
+                .unwrap();
         let account: crate::pool::Account = serde_json::from_value(json!({"id":"fixture","name":"fixture","source":"fixture","sourceId":"fixture","variant":"cn","enabled":true})).unwrap();
         let credential = crate::pool::Credential {
             token: "fixture-credential".into(),
@@ -471,11 +555,12 @@ upstream.listen(0,'127.0.0.1',()=>{{
         assert_eq!(headers["x-b3-parentspanid"], context.parent);
         assert_eq!(headers["acp-connection-id"], context.connection);
         assert!(headers.get("x-wb-bridge-key").is_none());
-        let official: Value = serde_json::from_str(include_str!(
-            "../evidence/official-desktop-shadow-wire.json"
-        ))
-        .unwrap();
+        let official: Value =
+            serde_json::from_str(include_str!("../evidence/official-desktop-offline.json"))
+                .unwrap();
         let dynamic = [
+            "host",
+            "connection",
             "authorization",
             "x-stainless-arch",
             "x-stainless-os",
@@ -489,6 +574,8 @@ upstream.listen(0,'127.0.0.1',()=>{{
             "x-conversation-message-id",
             "x-conversation-request-id",
             "x-root-request-id",
+            "baggage",
+            "x-private-data",
             "traceparent",
             "b3",
             "x-b3-traceid",
@@ -496,9 +583,7 @@ upstream.listen(0,'127.0.0.1',()=>{{
             "x-b3-spanid",
             "x-trace-id",
         ];
-        let observed = official["records"][0]["originalLogicalHeaders"]
-            .as_object()
-            .unwrap();
+        let observed = official["records"][0]["headers"].as_object().unwrap();
         for (name, value) in observed {
             if !dynamic.contains(&name.as_str()) {
                 assert_eq!(&headers[name], value, "header mismatch: {name}");
@@ -506,23 +591,53 @@ upstream.listen(0,'127.0.0.1',()=>{{
         }
         for name in headers.as_object().unwrap().keys() {
             assert!(
-                observed.contains_key(name) || ["host", "connection"].contains(&name.as_str()),
+                observed.contains_key(name)
+                    || ["x-device-token", "acp-connection-id", "x-b3-parentspanid"]
+                        .contains(&name.as_str()),
                 "extra header: {name}"
             );
         }
+        assert_eq!(headers["x-private-data"], "true");
+        assert_eq!(headers["x-agent-runtime"], "other");
+        assert_eq!(
+            headers["baggage"],
+            format!(
+                "codebuddy.session_id={},codebuddy.conversation_request_id={}",
+                headers["x-conversation-id"].as_str().unwrap(),
+                headers["x-root-request-id"].as_str().unwrap()
+            )
+        );
     }
 }
 impl Transport {
-    pub async fn login_device_headers(&self, variant: &str) -> std::collections::HashMap<String, String> {
+    pub async fn login_device_headers(
+        &self,
+        variant: &str,
+    ) -> std::collections::HashMap<String, String> {
         let mut slot = self.0.lock().await;
-        if slot.as_mut().is_some_and(|w| w.child.try_wait().ok().flatten().is_some()) { *slot = None; }
+        if slot
+            .as_mut()
+            .is_some_and(|w| w.child.try_wait().ok().flatten().is_some())
+        {
+            *slot = None;
+        }
         if slot.is_none() {
-            let Ok(worker) = Worker::start().await else { return Default::default(); };
+            let Ok(worker) = Worker::start().await else {
+                return Default::default();
+            };
             *slot = Some(worker);
         }
         let worker = slot.as_ref().unwrap();
-        let result = worker.client.post(format!("{}/_auth/headers", worker.local_url.as_deref().unwrap_or("http://localhost")))
-            .header("host", "localhost").header("x-wb-bridge-key", &worker.key).send().await;
+        let result = worker
+            .client
+            .post(format!(
+                "{}/_auth/headers",
+                worker.local_url.as_deref().unwrap_or("http://localhost")
+            ))
+            .header("host", "localhost")
+            .header("x-wb-bridge-key", &worker.key)
+            .send()
+            .await;
         if let Ok(response) = result {
             if let Ok(value) = response.json::<serde_json::Value>().await {
                 if value["region"] == variant {
@@ -574,7 +689,12 @@ impl Transport {
         };
         agentdock_core::applog::emit(level, "workbuddy.sdk", || {
             (
-                if status == 204 { "设备 SDK 已取得设备令牌" } else { "设备 SDK 未取得设备令牌" }.into(),
+                if status == 204 {
+                    "设备 SDK 已取得设备令牌"
+                } else {
+                    "设备 SDK 未取得设备令牌"
+                }
+                .into(),
                 serde_json::json!({"status": status, "durationMs": started.elapsed().as_millis() as u64}),
             )
         });

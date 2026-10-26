@@ -25,12 +25,24 @@ function decodeSession(root, crypto, key, userKey, resourceId) {
 
 function currentSession(root) { return { auth: root.auth, account: root.account }; }
 
+// 5.9.2 split the old app-lifetime-job crypto chunk into dist.js. Keep
+// minified exports confined to this adapter; no application bootstrap is run.
+function installedCodec(main) {
+  const runtime = require(path.join(main, 'dist.js'));
+  runtime.s(); runtime.h();
+  return {
+    R: runtime.v, K: runtime.E, I: runtime.g, G: runtime.T,
+    A: runtime.u, k: runtime.l,
+  };
+}
+
 function readInstalledSession(executable, authPath) {
   const resources = process.platform === 'darwin'
     ? path.resolve(executable, '../../Resources') : path.join(path.dirname(executable), 'resources');
   const main = path.join(resources, 'app.asar/main');
-  const crypto = require(path.join(main, 'app-lifetime-job.js'));
-  crypto.D(); crypto.W(); crypto.F();
+  const product = JSON.parse(fs.readFileSync(path.join(resources, 'app.asar.unpacked/cli/product.json'), 'utf8'));
+  if (product.genieVersion !== '5.9.2') throw new Error('unsupported_profile');
+  const crypto = installedCodec(main);
   const native = process._linkedBinding('electron_browser_workbuddy_storage');
   const capabilities = crypto.G(native.loggerGet());
   if (capabilities.symmetric.status !== 'available') throw new Error('local_key_unavailable');
@@ -38,8 +50,9 @@ function readInstalledSession(executable, authPath) {
   crypto.developerPublicKey = capabilities.developerPublicKey.value;
   let userKey;
   try {
-    const paths = require(path.join(main, 'workbuddy-paths.js'));
-    const master = crypto.A({ keyblobPath: crypto.k(paths.s()), protectorKey: key, createIfMissing: false });
+    const paths = require(path.join(main, 'workbuddy-paths2.js'));
+    paths.h();
+    const master = crypto.A({ keyblobPath: crypto.k(paths.c()), protectorKey: key, createIfMissing: false });
     if (master.status === 'available') userKey = master.value;
     if (fs.existsSync(authPath + '.logged-out')) throw new Error('logged_out');
     const root = JSON.parse(fs.readFileSync(authPath, 'utf8'));
@@ -53,4 +66,4 @@ if (require.main === module || process.env.AGENTDOCK_READ_SESSION === '1') {
   try { process.stdout.write(JSON.stringify(readInstalledSession(process.execPath, process.argv[1]))); }
   catch { process.stdout.write('{"error":"无法读取官方加密登录态，请确认本机 WorkBuddy 已登录且版本受支持"}'); process.exitCode = 1; }
 }
-module.exports = { decodeSession, readInstalledSession, currentSession };
+module.exports = { decodeSession, readInstalledSession, currentSession, installedCodec };

@@ -372,7 +372,7 @@ impl AppState {
         })?;
         let mut rt = self.runtime.lock().unwrap();
         rt.auth_failed.remove(id);
-        rt.cooldown.remove(id);
+        // Authentication recovery does not cancel an upstream Retry-After.
         if let Some(presentation) = rt.presentations.get_mut(id) { presentation["needsRelogin"] = json!(false); }
         Ok(())
     }
@@ -669,7 +669,7 @@ impl AppState {
             v["credit"]=store.resources.get(&a.id).cloned().unwrap_or(Value::Null);
             v["presentation"]=rt.presentations.get(&a.id).cloned().unwrap_or(Value::Null);
             v["modelLimits"]=json!(combined_limits(&store,&rt,&a.id,Utc::now().timestamp_millis()));v
-        }).collect::<Vec<_>>(), "version": "5.8.3", "catalogVariant": store.catalog_variant.as_deref().unwrap_or("cn"), "autoCheckin":store.auto_checkin,"checkinConfig":store.checkin_config,"checkinRecords":store.checkin_records,"clients":rt.clients,
+        }).collect::<Vec<_>>(), "version": "5.9.2", "catalogVariant": store.catalog_variant.as_deref().unwrap_or("cn"), "autoCheckin":store.auto_checkin,"checkinConfig":store.checkin_config,"checkinRecords":store.checkin_records,"clients":rt.clients,
             "settings": store.settings, "accountPriority":store.account_priority, "accountRefresh": rt.account_refresh, "officialProfile": crate::official::profile_summary(store.settings.use_device_sdk) })
     }
 
@@ -1069,9 +1069,14 @@ mod tests {
         assert!(!state.cache_credit_observed_at("cn:u",json!({"ok":true,"totalRemaining":1}),old,&path).unwrap());
         assert_eq!(state.store.lock().unwrap().resources["cn:u"]["totalRemaining"],99);
         assert!(state.runtime.lock().unwrap().auth_failed.is_empty());
+        let cooldown = Utc::now().timestamp_millis() + 60_000;
+        state.runtime.lock().unwrap().cooldown.insert("cn:u".into(), cooldown);
+        state.clear_login_failure("cn:u").unwrap();
+        assert_eq!(state.runtime.lock().unwrap().cooldown["cn:u"], cooldown);
         let fresh = agentdock_core::provider::credential_revision("fresh");
         assert!(state.cache_credit_observed_at("cn:u",json!({"ok":true,"totalRemaining":100}),fresh,&path).unwrap());
         assert_eq!(state.store.lock().unwrap().resources["cn:u"]["totalRemaining"],100);
+        assert_eq!(state.runtime.lock().unwrap().cooldown["cn:u"], cooldown);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

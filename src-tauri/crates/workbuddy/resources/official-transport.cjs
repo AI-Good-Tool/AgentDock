@@ -113,13 +113,18 @@ function listenBridge(server, { socket, tcp }, ready) {
   if (!socket) throw new Error('missing_configuration');
   return server.listen(socket, () => { fs.chmodSync(socket, 0o600); ready({}); });
 }
+function validateProfile(product, cli, nodeVersion) {
+  const cliVersion = cli.publishConfig?.customPackage?.version || cli.version;
+  if (nodeVersion !== 'v22.21.1' || product.genieVersion !== '5.9.2' || cliVersion !== '2.165.0')
+    throw new Error('unsupported_profile');
+}
 function installedProfile() {
   if (!['darwin', 'win32'].includes(process.platform) || process.version !== 'v22.21.1') throw new Error('unsupported_runtime');
   const root = installedRoot(process.platform, process.execPath);
   const product = JSON.parse(fs.readFileSync(path.join(root, 'cli/product.json'), 'utf8'));
   const cli = JSON.parse(fs.readFileSync(path.join(root, 'cli/package.json'), 'utf8'));
   const variant = product.isOversea ? 'overseas' : 'domestic';
-  if (product.genieVersion !== '5.8.3' || cli.publishConfig?.customPackage?.version !== '2.161.0') throw new Error('unsupported_profile');
+  validateProfile(product, cli, process.version);
   const channel = product.config?.turingSdk?.channelId;
   return { variant, load() {
     const sdkVariant = JSON.parse(fs.readFileSync(path.join(root, 'native/turing-sdk/build/Release/turing-sdk-variant.json'), 'utf8')).variant;
@@ -203,10 +208,10 @@ function createBridge({ key, tokens, variant, connect = https.request }) {
       // Header order follows the observed desktop SDK profile, not Rust's map ordering.
       const order = ['accept', 'content-type', 'x-requested-with', 'x-stainless-arch', 'x-stainless-lang',
         'x-stainless-os', 'x-stainless-package-version', 'x-stainless-retry-count', 'x-stainless-runtime',
-        'x-stainless-runtime-version', 'x-conversation-id', 'x-agent-intent', 'x-agent-purpose', 'x-ide-type',
+        'x-stainless-runtime-version', 'x-conversation-id', 'x-agent-intent', 'x-agent-purpose', 'x-agent-runtime', 'x-ide-type',
         'x-ide-name', 'x-ide-version', 'x-private-data', 'acp-connection-id', 'x-codebuddy-request',
         'x-device-token', 'x-request-id', 'x-conversation-message-id', 'x-conversation-request-id',
-        'x-root-request-id', 'x-agent-type', 'content-encoding', 'traceparent', 'b3', 'x-b3-traceid',
+        'x-root-request-id', 'x-agent-type', 'baggage', 'content-encoding', 'traceparent', 'b3', 'x-b3-traceid',
         'x-b3-parentspanid', 'x-b3-spanid', 'x-b3-sampled', 'x-trace-id', 'x-product', 'user-agent',
         'authorization', 'x-user-id', 'x-domain', 'x-enterprise-id', 'x-tenant-id', 'content-length', 'accept-encoding'];
       const source = { ...req.headers, ...runtimeHeaders(process.platform, process.arch), 'x-device-token': device, 'content-encoding': 'gzip', 'content-length': wire.length };
@@ -246,4 +251,4 @@ if (require.main === module || process.env.WB_OFFICIAL_BRIDGE === '1') {
     process.stdin.on('end', () => { server.closeAllConnections(); server.close(() => process.exit(0)); setTimeout(() => process.exit(0), 1000).unref(); });
   } catch { process.stdout.write('{"ready":false}\n'); process.exitCode = 1; }
 }
-module.exports = { runtimeHeaders, installedRoot, listenBridge, encode, DeviceTokens, createBridge, installedProfile, createMacRunLoop, initializeBackgroundCocoa };
+module.exports = { validateProfile, runtimeHeaders, installedRoot, listenBridge, encode, DeviceTokens, createBridge, installedProfile, createMacRunLoop, initializeBackgroundCocoa };
