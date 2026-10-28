@@ -1,4 +1,4 @@
-//! Desktop sidecar profile verified against the installed 5.9.2 client.
+//! Desktop sidecar profile verified against the installed 5.9.3 client.
 //! Chat SDK headers belong here, not on unrelated billing/config requests.
 use crate::pool::{Account, Credential, Shared};
 use axum::http::HeaderMap;
@@ -7,11 +7,11 @@ use serde_json::{json, Value};
 use std::io::Write;
 use uuid::Uuid;
 
-pub const DESKTOP_VERSION: &str = "5.9.2";
-pub const REQUEST_PROFILE: &str = "WorkBuddy Desktop 5.9.2 / CLI 2.165.0";
-pub const USER_AGENT: &str = "WorkBuddy/5.9.2 WorkBuddy/5.9.2 CLI/2.165.0";
+pub const DESKTOP_VERSION: &str = "5.9.3";
+pub const REQUEST_PROFILE: &str = "WorkBuddy Desktop 5.9.3 / CLI 2.165.0";
+pub const USER_AGENT: &str = "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0";
 pub fn profile_summary(use_device_sdk: bool) -> Value {
-    json!({"desktopVersion":"5.9.2","cliVersion":"2.165.0","nodeVersion":"v22.21.1","userAgent":USER_AGENT,"ideType":"WorkBuddy","ideVersion":"5.9.2","gzip":true,"transport":"installed-electron-node","deviceToken": if use_device_sdk { "installed-native-sdk" } else { "disabled" },"evidence":"official-desktop-offline.json"})
+    json!({"desktopVersion":DESKTOP_VERSION,"cliVersion":"2.165.0","nodeVersion":"v22.21.1","userAgent":USER_AGENT,"ideType":"WorkBuddy","ideVersion":DESKTOP_VERSION,"gzip":true,"transport":"installed-electron-node","deviceToken": if use_device_sdk { "installed-native-sdk" } else { "disabled" },"evidence":"workbuddy-5.9.3-offline.json"})
 }
 pub fn prepare_body(body: &mut Value, config: Option<&Value>) {
     body["stream"] = json!(true);
@@ -89,6 +89,7 @@ const AUXILIARY: &[&str] = &[
     "security_reviewer",
     "content_security_reviewer",
     "side_question",
+    "view_image",
     "subagent",
 ];
 pub fn purpose(headers: &HeaderMap, allow_auxiliary: bool) -> Result<String, &'static str> {
@@ -196,7 +197,7 @@ pub fn chat_request_with_context(
         .header("X-Agent-Type", agent_type(purpose))
         .header("X-IDE-Type", "WorkBuddy")
         .header("X-IDE-Name", "WorkBuddy")
-        .header("X-IDE-Version", "5.9.2")
+        .header("X-IDE-Version", DESKTOP_VERSION)
         .header("X-Private-Data", "true")
         .header("X-Codebuddy-Request", "1")
         .header(
@@ -283,6 +284,27 @@ mod tests {
         assert_eq!(purpose(&headers, false).unwrap(), "automation");
         headers.insert("x-agent-purpose", "unknown".parse().unwrap());
         assert!(purpose(&headers, true).is_err());
+    }
+    #[test]
+    fn view_image_respects_auxiliary_policy_and_sets_official_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-agent-purpose", "view_image".parse().unwrap());
+        assert_eq!(
+            purpose(&headers, false),
+            Err("客户端辅助 Agent 请求已在接入设置中禁用")
+        );
+        let purpose = purpose(&headers, true).unwrap();
+        let request = chat_request(
+            reqwest::Client::new().post("https://www.workbuddy.cn/v2/chat/completions"),
+            &headers,
+            &purpose,
+            &json!({"messages": [{"role": "user", "content": "offline"}]}),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        assert_eq!(request.headers()["x-agent-purpose"], "view_image");
+        assert_eq!(request.headers()["x-agent-type"], "auxiliary");
     }
     #[tokio::test]
     async fn wire_headers_ids_and_gzip_match_official_profile() {
@@ -425,7 +447,7 @@ mod tests {
                 "x64"
             }
         );
-        assert_eq!(headers["x-ide-version"], "5.9.2");
+        assert_eq!(headers["x-ide-version"], "5.9.3");
         assert_eq!(headers["x-b3-traceid"], headers["x-trace-id"]);
         assert_eq!(
             headers["traceparent"].to_str().unwrap(),
@@ -437,8 +459,21 @@ mod tests {
         );
         assert!(!headers.contains_key("x-model-id"));
         let fixture: Value =
-            serde_json::from_str(include_str!("../evidence/official-desktop-offline.json"))
+            serde_json::from_str(include_str!("../evidence/workbuddy-5.9.3-offline.json"))
                 .unwrap();
+        let summary = profile_summary(false);
+        assert_eq!(summary["desktopVersion"], fixture["desktopVersion"]);
+        assert_eq!(summary["ideVersion"], fixture["desktopVersion"]);
+        assert_eq!(
+            summary["userAgent"],
+            fixture["records"][0]["headers"]["user-agent"]
+        );
+        assert_eq!(summary["deviceToken"], "disabled");
+        assert_eq!(profile_summary(true)["deviceToken"], "installed-native-sdk");
+        assert_eq!(
+            REQUEST_PROFILE,
+            format!("WorkBuddy Desktop {DESKTOP_VERSION} / CLI 2.165.0")
+        );
         let dynamic = [
             "host",
             "x-stainless-os",

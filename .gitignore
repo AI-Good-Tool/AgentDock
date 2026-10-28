@@ -5,3 +5,7 @@ target/
 .env*
 /src-tauri/gen/
 *.har
+
+/.runtime/
+
+/releases/

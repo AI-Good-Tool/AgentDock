@@ -152,7 +152,7 @@ onMounted(async () => {
       <div class="sidebar-footer">
         <span class="dot" :class="{ online: running }"></span
         >{{ running ? t('网关运行中', 'Gateway running') : t('网关未启动', 'Gateway stopped') }}
-        <small>v{{ state.app?.version ?? '1.0.4' }}</small>
+        <small>v{{ state.app?.version ?? '1.0.5' }}</small>
       </div>
     </aside>
     <div class="main-shell">

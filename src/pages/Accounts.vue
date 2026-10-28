@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import ProviderMark from '../components/ProviderMark.vue'
-import { computed, ref, onMounted, h } from 'vue'
+import { computed, ref, onMounted, h, watch } from 'vue'
 import { Modal, Message } from '@arco-design/web-vue'
 import { IconPlus, IconRefresh, IconThunderbolt, IconLaunch, IconEye, IconEyeInvisible } from '@arco-design/web-vue/es/icon'
 import PageHead from '../components/PageHead.vue'
@@ -19,6 +19,7 @@ import { call } from '../api'
 import { t } from '../i18n'
 import { state, act, busy, refreshPool, runtimeOf, revealPhones, isDisabled } from '../store'
 import { accountName } from '../lib/account-display'
+import { visibleSelection, toggleSelection, accountKey } from '../lib/account-selection'
 
 const provider = ref<'all' | 'workbuddy' | 'qoder' | 'trae'>('all')
 const region = ref<'all' | 'cn' | 'intl'>('cn')
@@ -83,6 +84,34 @@ const exportAccounts = computed(() => [
   ...(show('qoder') ? qoderAccounts.value.map((a: any) => ({ provider: 'qoder', id: a.id, name: a.note || a.name || a.email || a.uid, region: a.edition })) : []),
   ...(show('trae') ? traeAccounts.value.map((a: any) => ({ provider: 'trae', id: a.id, name: a.note || a.username || a.userId, region: a.variant })) : []),
 ])
+
+const selectedAccounts = ref<string[]>([])
+const visibleKeys = computed(() => exportAccounts.value.map(a => accountKey(a.provider, a.id)))
+watch(visibleKeys, keys => { selectedAccounts.value = visibleSelection(selectedAccounts.value, keys) }, { flush: 'sync' })
+const allSelected = computed(() => visibleKeys.value.length > 0 && selectedAccounts.value.length === visibleKeys.value.length)
+function removeAccounts(accounts: { provider: string; id: string; name: string }[]) {
+  if (!accounts.length) return
+  const selection = accounts.map(a => ({ ...a }))
+  const names = selection.slice(0, 3).map(a => a.name).join('、')
+  Modal.confirm({
+    title: t(`删除 ${selection.length} 个账号`, `Delete ${selection.length} accounts`),
+    content: t(`确认删除「${names}${selection.length > 3 ? '…' : ''}」？删除后停止接收新请求和定时任务；已开始的请求会继续完成。WorkBuddy 仅从 AgentDock 账号池移除，保留原始 Switch 账号库。Qoder、Trae 会从本机账号库删除，客户端当前登录保持不变。建议先导出备份。`,
+      `Delete “${names}${selection.length > 3 ? '…' : ''}”? New requests and scheduled tasks stop; running requests may finish. WorkBuddy is removed from the AgentDock pool while its Switch library is kept. Qoder and Trae are deleted from the local account store. Clients remain signed in. Export a backup first.`),
+    okText: t('确认删除', 'Delete'), cancelText: t('取消', 'Cancel'), okButtonProps: { status: 'danger' },
+    onOk: () => act('accounts-delete', async () => {
+      const result = await call<any>('delete_accounts', { accounts: selection.map(({ provider, id }) => ({ provider, id })), confirmed: true })
+      const deleted = new Set<string>(result.results.filter((r: any) => r.ok).map((r: any) => accountKey(r.provider, r.id)))
+      selectedAccounts.value = selectedAccounts.value.filter(key => !deleted.has(key))
+      if (result.failed) Message.warning(t(`已删除 ${result.count} 个，${result.failed} 个失败；失败账号已保留，请刷新并检查存储权限后重试。`, `${result.count} deleted; ${result.failed} failed and were kept. Refresh and check storage permissions before retrying.`))
+      else Message.success(t(`已删除 ${result.count} 个账号`, `${result.count} accounts deleted`))
+      if (result.results.some((r: any) => r.warning)) Message.warning(t('账号已删除，但部分暂停标记未能清理，重新导入后请检查状态。', 'Accounts deleted; some suspension flags could not be cleared. Check their status after importing again.'))
+      return result
+    }),
+  })
+}
+function removeSelected() {
+  removeAccounts(exportAccounts.value.filter(a => selectedAccounts.value.includes(accountKey(a.provider, a.id))))
+}
 
 // ── WorkBuddy ──
 function wbEnable(a: any, enabled: boolean) {
@@ -200,15 +229,7 @@ function qoderRefreshToken(a: any) {
   return act(`qtoken:${a.id}`, () => call('qoder_refresh_account', { id: a.id }))
 }
 function qoderRemove(a: any) {
-  Modal.confirm({
-    title: t('删除账号', 'Delete account'),
-    content: t(
-      '从账号库删除该账号？（不影响客户端当前登录）',
-      'Remove this account from the store? (the IDE stays signed in)'
-    ),
-    okButtonProps: { status: 'danger' },
-    onOk: () => act('qdelete', () => call('qoder_delete_account', { id: a.id })),
-  })
+  removeAccounts([{ provider: 'qoder', id: a.id, name: a.note || a.name || a.email || a.uid }])
 }
 
 // ── Trae ──
@@ -246,13 +267,9 @@ function traeSwitch(a: any) {
   })
 }
 function traeRemove(a: any) {
-  Modal.confirm({
-    title: t('删除账号', 'Delete account'),
-    content: t('从本机加密账号库删除此账号？', 'Remove this account from the local vault?'),
-    okButtonProps: { status: 'danger' },
-    onOk: () => act('tdelete', () => call('trae_delete', { id: a.id })),
-  })
+  removeAccounts([{ provider: 'trae', id: a.id, name: a.note || a.username || a.userId }])
 }
+
 async function traeRefreshAll(ids: string[]) {
   await act(
     'trae-all',
@@ -397,6 +414,14 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
     }}</a-button>
   </div>
 
+  <div v-if="total" class="account-batch-bar">
+    <a-checkbox :model-value="allSelected" :indeterminate="selectedAccounts.length > 0 && !allSelected" @change="checked => selectedAccounts = checked ? [...visibleKeys] : []">{{ t('全选当前筛选', 'Select all filtered') }}</a-checkbox>
+    <span>{{ t(`已选 ${selectedAccounts.length} / ${total} 个账号`, `${selectedAccounts.length} / ${total} selected`) }}</span>
+    <a-button :disabled="!selectedAccounts.length" @click="dialog = { kind: 'json-export-batch' }">{{ t('导出所选', 'Export selected') }}</a-button>
+    <a-button status="danger" :disabled="!selectedAccounts.length" :loading="busy('accounts-delete')" @click="removeSelected">{{ t('批量删除', 'Delete selected') }}</a-button>
+    <a-button type="text" :disabled="!selectedAccounts.length" @click="selectedAccounts = []">{{ t('取消选择', 'Clear selection') }}</a-button>
+  </div>
+
   <template v-if="show('workbuddy')">
     <div class="section-title">
       <ProviderMark provider="workbuddy" /><b>WorkBuddy</b
@@ -430,6 +455,8 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         v-for="a in wbAccounts"
         :key="a.id"
         :account="a"
+        :selected="selectedAccounts.includes(accountKey('workbuddy', a.id))"
+        @select="checked => selectedAccounts = toggleSelection(selectedAccounts, accountKey('workbuddy', a.id), checked)"
         :clients="clients"
         :now="state.now"
         :compact="compact"
@@ -445,6 +472,8 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         @json="dialog = { kind: 'json-view', provider: 'workbuddy', id: a.id, name: accountName(a) }"
         @relogin="dialog = { kind: 'wb-oauth', variant: a.variant, accountId: a.id }"
         @renew="wbRenew(a)"
+
+        @remove="removeAccounts([{ provider: 'workbuddy', id: a.id, name: accountName(a) }])"
       />
     </div>
   </template>
@@ -490,6 +519,8 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         v-for="a in qoderAccounts"
         :key="a.id"
         :account="a"
+        :selected="selectedAccounts.includes(accountKey('qoder', a.id))"
+        @select="checked => selectedAccounts = toggleSelection(selectedAccounts, accountKey('qoder', a.id), checked)"
         :compact="compact"
         @switch="dialog = { kind: 'qoder-switch', account: a }"
         @claim="qoderClaim(a)"
@@ -541,6 +572,8 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
         v-for="a in traeAccounts"
         :key="a.id"
         :account="a"
+        :selected="selectedAccounts.includes(accountKey('trae', a.id))"
+        @select="checked => selectedAccounts = toggleSelection(selectedAccounts, accountKey('trae', a.id), checked)"
         :compact="compact"
         @refresh="traeRun(a, 'trae_refresh', t('用量刷新完成', 'Usage refreshed'))"
         @switch="traeSwitch(a)"
@@ -617,5 +650,5 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
     :name="dialog.name"
     @close="dialog = null"
   />
-  <AccountBatchExportDialog v-if="dialog?.kind === 'json-export-batch'" :accounts="exportAccounts" @close="dialog = null" />
+  <AccountBatchExportDialog v-if="dialog?.kind === 'json-export-batch'" :accounts="exportAccounts" :initial-selected="selectedAccounts.length ? selectedAccounts : undefined" @close="dialog = null" />
 </template>

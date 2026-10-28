@@ -1,0 +1,101 @@
+{
+  "evidence": "Installed CLI under desktop sidecar client-info environment; all network replaced by loopback fixtures",
+  "desktopVersion": "5.9.3",
+  "cliVersion": "2.165.0",
+  "nodeVersion": "v22.21.1",
+  "productionRequests": 0,
+  "records": [
+    {
+      "headers": {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-requested-with": "XMLHttpRequest",
+        "x-stainless-arch": "arm64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "MacOS",
+        "x-stainless-package-version": "6.25.0",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v22.21.1",
+        "x-conversation-id": "01a18113-ace8-75c5-a377-b2d5c5e114f4",
+        "x-agent-purpose": "conversation",
+        "x-ide-type": "WorkBuddy",
+        "x-ide-name": "WorkBuddy",
+        "x-ide-version": "5.9.3",
+        "x-agent-intent": "craft",
+        "x-agent-runtime": "other",
+        "x-user-id": "[REDACTED]",
+        "x-domain": "[REDACTED]",
+        "x-private-data": "false",
+        "x-codebuddy-request": "1",
+        "x-request-id": "01a18113ae8c788fa2921d9daa303a6f",
+        "x-conversation-message-id": "01a18113ae8c788fa2921d9daa303a6f",
+        "x-conversation-request-id": "01a18113ae3b76e5b5a0d56a03f00e99",
+        "x-root-request-id": "01a18113ae3b76e5b5a0d56a03f00e99",
+        "x-agent-type": "main",
+        "baggage": "codebuddy.session_id=01a18113-ace8-75c5-a377-b2d5c5e114f4,codebuddy.conversation_request_id=01a18113ae3b76e5b5a0d56a03f00e99",
+        "content-encoding": "gzip",
+        "traceparent": "00-6d050705021ac70c1a5acaeaa485b979-06aaf6f0e919ae90-01",
+        "b3": "6d050705021ac70c1a5acaeaa485b979-06aaf6f0e919ae90-1",
+        "x-b3-traceid": "6d050705021ac70c1a5acaeaa485b979",
+        "x-b3-spanid": "06aaf6f0e919ae90",
+        "x-b3-sampled": "1",
+        "x-trace-id": "6d050705021ac70c1a5acaeaa485b979",
+        "x-product": "SaaS",
+        "user-agent": "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0",
+        "authorization": "[REDACTED]",
+        "content-length": "5533",
+        "accept-encoding": "gzip, compress, deflate, br",
+        "host": "127.0.0.1:52391",
+        "connection": "close"
+      },
+      "model": "hy3",
+      "stream": true,
+      "messageCount": 2,
+      "path": "/v2/chat/completions",
+      "bodyKeys": [
+        "extra_vars",
+        "max_tokens",
+        "messages",
+        "model",
+        "reasoning_effort",
+        "reasoning_summary",
+        "stream",
+        "stream_options",
+        "temperature",
+        "verbosity"
+      ],
+      "messageSchema": [
+        {
+          "role": "system",
+          "contentType": "string"
+        },
+        {
+          "role": "user",
+          "contentType": "object"
+        }
+      ],
+      "parameters": {
+        "temperature": 0.9,
+        "max_tokens": 64000,
+        "stream_options": {
+          "include_usage": true
+        },
+        "reasoning_effort": "high",
+        "verbosity": "high",
+        "reasoning_summary": "auto"
+      }
+    }
+  ],
+  "cliExitCode": 0,
+  "responseFixture": {
+    "format": "text/event-stream",
+    "content": "synthetic OK",
+    "usage": {
+      "prompt_tokens": 1,
+      "completion_tokens": 1,
+      "total_tokens": 2
+    },
+    "terminal": "[DONE]"
+  }
+}

@@ -1533,3 +1533,37 @@ async fn credit_first_prefers_richer_accounts_across_providers() {
         assert_eq!(wait_logs(&f, i + 1).await[0].account_id, "intl:u2");
     }
 }
+
+#[tokio::test]
+async fn account_batch_delete_reports_partial_failures_and_preserves_other_accounts() {
+    use crate::account_json::AccountRef;
+    let f = fixture().await;
+    let trae_id = f.hub.trae.pool_accounts()[0].id.clone();
+    let account = || AccountRef { provider:"trae".into(), id:trae_id.clone() };
+    assert!(f.hub.delete_accounts(&[account()], false).is_err());
+    assert!(f.hub.delete_accounts(&[], true).is_err());
+    assert!(f.hub.delete_accounts(&[account(), AccountRef { provider:"unknown".into(), id:"bad".into() }], true).is_err());
+    assert!(f.hub.trae.store.account(&trae_id).is_ok());
+    let result = f.hub.delete_accounts(&[account(), account(), AccountRef { provider:"workbuddy".into(),id:"missing".into() }],true).unwrap();
+    assert_eq!(result["count"],1);
+    assert_eq!(result["failed"],1);
+    assert_eq!(result["results"].as_array().unwrap().len(),2);
+    assert!(f.hub.trae.store.account(&trae_id).is_err());
+    assert!(!f.hub.pool_accounts().iter().any(|a| a.provider == agentdock_core::provider::ProviderKind::Trae && a.id == trae_id));
+    assert!(!f.hub.qoder.accounts().is_empty());
+}
+
+#[tokio::test]
+async fn late_auth_callbacks_do_not_recreate_deleted_account_suspensions() {
+    use agentdock_core::provider::ProviderKind;
+    let f = fixture().await;
+    f.hub.wb.update_store(|store| {
+        store.accounts.push(serde_json::from_value(json!({"id":"deleted-fixture","name":"fixture","source":"test","sourceId":"fixture-only","variant":"cn","enabled":true})).unwrap());
+        Ok(())
+    }).unwrap();
+    f.hub.delete_accounts(&[crate::account_json::AccountRef {provider:"workbuddy".into(),id:"deleted-fixture".into()}], true).unwrap();
+    f.hub.disable_account_auth(ProviderKind::Workbuddy, "deleted-fixture");
+    f.hub.restore_login_observed(ProviderKind::Workbuddy, "deleted-fixture", None).unwrap();
+    assert!(!f.hub.settings().auth_disabled_accounts.contains("workbuddy/deleted-fixture"));
+    assert!(!f.hub.runtime.lock().unwrap().auth_failed.contains("workbuddy/deleted-fixture"));
+}

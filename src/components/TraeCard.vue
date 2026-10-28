@@ -25,7 +25,7 @@ import AccountAuthAlert from './AccountAuthAlert.vue'
 import AccountDisabledBar from './AccountDisabledBar.vue'
 import { credits, updated } from '../lib/account-display'
 import CardProxyRow from './CardProxyRow.vue'
-const props = defineProps<{ account: any; compact?: boolean }>()
+const props = defineProps<{ account: any; compact?: boolean; selected?: boolean }>()
 const emit = defineEmits<{
   refresh: []
   switch: []
@@ -36,6 +36,7 @@ const emit = defineEmits<{
   token: []
   models: []
   remove: []
+  select: [boolean]
   json: []
 }>()
 const a = computed(() => props.account)
@@ -77,7 +78,8 @@ const color = computed(() => Array.from(String(name.value)).reduce((n, c) => n +
           ></a-tooltip>
         </div>
       </div>
-      <a-dropdown trigger="click"
+      <a-checkbox class="account-select" :model-value="selected" :aria-label="`${t('选择账号', 'Select account')} ${name}`" @change="checked => emit('select', !!checked)" />
+      <a-dropdown trigger="click" position="br" :popup-max-height="false"
         ><button class="card-more" :aria-label="t('账号操作', 'Account actions')"><IconMore /></button
         ><template #content
           ><a-doption @click="emit('note')"><IconEdit /> {{ t('修改备注', 'Edit note') }}</a-doption

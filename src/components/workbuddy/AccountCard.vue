@@ -35,6 +35,7 @@ const props = defineProps<{
   now: number
   busy: boolean
   creditLoading: boolean
+  selected?: boolean
   compact: boolean
 }>()
 const emit = defineEmits<{
@@ -48,6 +49,8 @@ const emit = defineEmits<{
   switch: [string]
   json: []
   relogin: []
+  remove: []
+  select: [boolean]
 }>()
 const name = computed(() => accountName(props.account, revealPhones.value))
 const expired = computed(() => !!props.account.expiresAt && props.account.expiresAt <= props.now)
@@ -146,7 +149,8 @@ const targets = computed(() => [
           >
         </div>
       </div>
-      <a-dropdown trigger="click"
+      <a-checkbox class="account-select" :model-value="selected" :aria-label="`${t('选择账号', 'Select account')} ${name}`" @change="checked => emit('select', !!checked)" />
+      <a-dropdown trigger="click" position="br" :popup-max-height="false"
         ><button class="card-more" :aria-label="t('账号操作', 'Account actions')"><IconMore /></button
         ><template #content
           ><a-doption @click="emit('info')"><IconInfoCircle /> {{ t('账号信息', 'Account info') }}</a-doption
@@ -157,6 +161,7 @@ const targets = computed(() => [
           ><a-doption @click="setAccountDisabled('workbuddy', account.id, !account.disabled)"
             ><template v-if="account.disabled"><IconPlayCircle /> {{ t('启用账号', 'Enable account') }}</template
             ><span v-else class="danger-option"><IconStop /> {{ t('禁用账号', 'Disable account') }}</span></a-doption
+          ><a-doption :disabled="busy" @click="emit('remove')"><span class="danger-option">{{ t('删除账号', 'Delete account') }}</span></a-doption
           ></template
         ></a-dropdown
       >

@@ -41,7 +41,7 @@ function readInstalledSession(executable, authPath) {
     ? path.resolve(executable, '../../Resources') : path.join(path.dirname(executable), 'resources');
   const main = path.join(resources, 'app.asar/main');
   const product = JSON.parse(fs.readFileSync(path.join(resources, 'app.asar.unpacked/cli/product.json'), 'utf8'));
-  if (product.genieVersion !== '5.9.2') throw new Error('unsupported_profile');
+  if (product.genieVersion !== '5.9.3') throw new Error('unsupported_profile');
   const crypto = installedCodec(main);
   const native = process._linkedBinding('electron_browser_workbuddy_storage');
   const capabilities = crypto.G(native.loggerGet());

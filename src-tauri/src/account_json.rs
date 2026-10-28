@@ -44,26 +44,7 @@ pub fn export(hub: &Shared, provider: &str, id: &str) -> Result<Value, String> {
                 .find(|a| a.id == id)
                 .cloned()
                 .ok_or("账号不存在")?;
-            let record = if a.source == "switch" {
-                std::fs::read(workbuddy::pool::switch_file()?)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                    .and_then(|v| v.as_array().and_then(|l| l.iter().find(|r| r["id"] == a.source_id.as_str()).cloned()))
-                    .ok_or("WorkBuddy Switch 账号库中找不到该账号的登录记录")?
-            } else {
-                // Client-login account: rebuild a library-shaped record from the live login.
-                let c = workbuddy::pool::credentials(&a)?;
-                json!({
-                    "uid": c.uid,
-                    "nickname": a.name,
-                    "access_token": c.token,
-                    "domain": c.domain,
-                    "enterpriseId": c.enterprise,
-                    "variant": a.variant,
-                    "expiresAt": a.expires_at,
-                })
-            };
-            (if a.variant == "ai" { "intl" } else { "cn" }.to_owned(), record)
+            return workbuddy::account_transfer::export_account(&a);
         }
         "qoder" => {
             let a = hub.qoder.accounts()

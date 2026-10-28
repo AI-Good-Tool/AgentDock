@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::Sha1;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -497,17 +497,67 @@ pub fn load_accounts() -> Vec<Account> {
     serde_json::from_value(v.get("accounts").cloned().unwrap_or(json!([]))).unwrap_or_default()
 }
 
-pub fn save_accounts(accounts: &[Account]) -> Result<(), String> {
-    fs::create_dir_all(switch_dir()).map_err(|e| e.to_string())?;
-    let doc = json!({ "accounts": accounts });
-    let tmp = accounts_file().with_extension("tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
-    fs::rename(&tmp, accounts_file()).map_err(|e| e.to_string())?;
-    Ok(())
+/// Serialize local read/modify/write operations; never hold this lock over HTTP.
+pub fn update_accounts<T>(
+    edit: impl FnOnce(&mut Vec<Account>) -> Result<T, String>,
+) -> Result<T, String> {
+    update_accounts_at(&accounts_file(), edit)
+}
+
+fn update_accounts_at<T>(
+    path: &Path,
+    edit: impl FnOnce(&mut Vec<Account>) -> Result<T, String>,
+) -> Result<T, String> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("账号库路径无效")?;
+    fs::create_dir_all(parent).map_err(|_| "无法创建账号库目录")?;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(path.with_extension("json.lock"))
+        .map_err(|_| "无法锁定账号库")?;
+    lock.lock().map_err(|_| "无法锁定账号库")?;
+    let mut accounts: Vec<Account> = match fs::read(path) {
+        Ok(data) => {
+            let doc: Value =
+                serde_json::from_slice(&data).map_err(|_| "账号库格式错误，未覆盖原文件")?;
+            serde_json::from_value(
+                doc.get("accounts")
+                    .cloned()
+                    .ok_or("账号库缺少 accounts 字段")?,
+            )
+            .map_err(|_| "账号库格式错误，未覆盖原文件")?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+        Err(_) => return Err("无法读取账号库".into()),
+    };
+    let result = edit(&mut accounts)?;
+    let data = serde_json::to_vec_pretty(&json!({"accounts": accounts}))
+        .map_err(|_| "无法序列化账号库")?;
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let saved = (|| {
+        let mut file = options.open(&tmp).map_err(|_| "无法写入账号库")?;
+        file.write_all(&data).map_err(|_| "无法写入账号库")?;
+        file.sync_all().map_err(|_| "无法同步账号库")?;
+        fs::rename(&tmp, path).map_err(|_| "无法保存账号库")
+    })();
+    if saved.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    saved?;
+    Ok(result)
 }
 
 pub fn find_account<'a>(
@@ -536,65 +586,65 @@ pub fn capture_current(edition_key: &str) -> Result<(Account, bool), String> {
         .to_string();
     let blob = B64.encode(fs::read(auth_dat_path(ed)).map_err(|e| e.to_string())?);
 
-    let mut accounts = load_accounts();
-    let idx = accounts
-        .iter()
-        .position(|a| a.edition == edition_key && a.uid == uid);
-    let is_new = idx.is_none();
-    if is_new {
-        accounts.push(Account {
-            edition: edition_key.to_string(),
-            uid: uid.clone(),
-            ..Default::default()
-        });
-    }
-    let acc = {
-        let i = idx.unwrap_or(accounts.len() - 1);
-        &mut accounts[i]
-    };
-    acc.name = user
-        .get("name")
-        .and_then(|x| x.as_str())
-        .or(user.get("email").and_then(|x| x.as_str()))
-        .or(user.get("phone").and_then(|x| x.as_str()))
-        .unwrap_or(&uid[..uid.len().min(8)])
-        .to_string();
-    acc.email = user
-        .get("email")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.phone = user
-        .get("phone")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.avatarUrl = user
-        .get("avatarUrl")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.token = token.to_string();
-    acc.refreshToken = sess
-        .get("refreshToken")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.expiresAt = sess
-        .get("expiresAt")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.refreshTokenExpiresAt = sess
-        .get("refreshTokenExpiresAt")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.authBlob = blob;
-    acc.savedAt = chrono::Utc::now().to_rfc3339();
-    let result = acc.clone();
-    save_accounts(&accounts)?;
-    Ok((result, is_new))
+    update_accounts(|accounts| {
+        let idx = accounts
+            .iter()
+            .position(|a| a.edition == edition_key && a.uid == uid);
+        let is_new = idx.is_none();
+        if is_new {
+            accounts.push(Account {
+                edition: edition_key.to_string(),
+                uid: uid.clone(),
+                ..Default::default()
+            });
+        }
+        let acc = {
+            let i = idx.unwrap_or(accounts.len() - 1);
+            &mut accounts[i]
+        };
+        acc.name = user
+            .get("name")
+            .and_then(|x| x.as_str())
+            .or(user.get("email").and_then(|x| x.as_str()))
+            .or(user.get("phone").and_then(|x| x.as_str()))
+            .unwrap_or(&uid[..uid.len().min(8)])
+            .to_string();
+        acc.email = user
+            .get("email")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.phone = user
+            .get("phone")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.avatarUrl = user
+            .get("avatarUrl")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.token = token.to_string();
+        acc.refreshToken = sess
+            .get("refreshToken")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.expiresAt = sess
+            .get("expiresAt")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.refreshTokenExpiresAt = sess
+            .get("refreshTokenExpiresAt")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.authBlob = blob;
+        acc.savedAt = chrono::Utc::now().to_rfc3339();
+        let result = acc.clone();
+        Ok((result, is_new))
+    })
 }
 
 pub fn live_uid(edition_key: &str) -> String {
@@ -686,14 +736,20 @@ pub fn refresh_account_token(acc: &mut Account) -> bool {
 
 /// 刷新后持久化 + 若该账号正登录客户端则回写 auth.v1.dat
 pub fn persist_and_writeback(acc: &Account) {
-    let mut accounts = load_accounts();
-    if let Some(stored) = find_account(&mut accounts, &acc.edition, &acc.uid) {
+    let persisted = update_accounts(|accounts| {
+        let Some(stored) = find_account(accounts, &acc.edition, &acc.uid) else {
+            return Ok(false);
+        };
         stored.token = acc.token.clone();
         stored.refreshToken = acc.refreshToken.clone();
         stored.expiresAt = acc.expiresAt.clone();
         stored.refreshTokenExpiresAt = acc.refreshTokenExpiresAt.clone();
+        Ok(true)
+    });
+    // A delayed refresh must not resurrect or write back a deleted account.
+    if persisted != Ok(true) {
+        return;
     }
-    let _ = save_accounts(&accounts);
 
     if live_uid(&acc.edition) == acc.uid && !acc.uid.is_empty() {
         if let Some(ed) = edition(&acc.edition) {
@@ -708,11 +764,12 @@ pub fn persist_and_writeback(acc: &Account) {
                 }
                 if write_auth_dat(ed, &sess).is_ok() {
                     if let Ok(raw) = fs::read(auth_dat_path(ed)) {
-                        let mut accounts = load_accounts();
-                        if let Some(stored) = find_account(&mut accounts, &acc.edition, &acc.uid) {
-                            stored.authBlob = B64.encode(raw);
-                            let _ = save_accounts(&accounts);
-                        }
+                        let _ = update_accounts(|accounts| {
+                            if let Some(stored) = find_account(accounts, &acc.edition, &acc.uid) {
+                                stored.authBlob = B64.encode(raw);
+                            }
+                            Ok(())
+                        });
                     }
                 }
             }
@@ -889,20 +946,12 @@ pub fn claim_all(
 ) -> Vec<Value> {
     let mut accounts = load_accounts();
     let mut results = vec![];
-    let mut changed = false;
     for acc in accounts.iter_mut() {
         if edition_filter.is_some_and(|f| acc.edition != f) || skip.contains(&acc.id()) {
             continue;
         }
-        let before = (acc.token.clone(), acc.refreshToken.clone());
         let res = claim_account(acc, dry_run);
         results.push(res);
-        if (acc.token.clone(), acc.refreshToken.clone()) != before {
-            changed = true;
-        }
-    }
-    if changed {
-        let _ = save_accounts(&accounts);
     }
     if !dry_run {
         append_claim_log(&results, trigger);
@@ -1104,11 +1153,14 @@ pub fn switch_account(account_id: &str, steps: &mut Vec<String>) -> Result<Strin
     // Prefer rebuilding OS/user-bound ciphertext from the token, including imported accounts.
     let blob = if !target.token.is_empty() {
         let b64 = build_auth_blob(ed, &target)?;
-        let mut accounts = load_accounts();
-        if let Some(a) = accounts.iter_mut().find(|a| a.id() == account_id) {
+        update_accounts(|accounts| {
+            let a = accounts
+                .iter_mut()
+                .find(|a| a.id() == account_id)
+                .ok_or("账号已移除")?;
             a.authBlob = b64.clone();
-        }
-        let _ = save_accounts(&accounts);
+            Ok(())
+        })?;
         steps.push("已使用本机密钥重新构造登录态".into());
         B64.decode(b64).map_err(|_| "登录态构造失败".to_string())?
     } else {
@@ -1120,7 +1172,10 @@ pub fn switch_account(account_id: &str, steps: &mut Vec<String>) -> Result<Strin
     steps.push(format!("正在启动 {}…", ed.label));
     // The login is already written: a failed relaunch must not report a failed switch.
     if let Err(e) = launch_app(&target.edition) {
-        steps.push(format!("登录态已切换，但未能自动启动：{e}，请手动打开 {}", ed.label));
+        steps.push(format!(
+            "登录态已切换，但未能自动启动：{e}，请手动打开 {}",
+            ed.label
+        ));
     }
     Ok(format!("已切换到 {}（{}）", target.name, ed.label))
 }
@@ -1175,21 +1230,21 @@ pub fn import_accounts_value(v: Value) -> Result<usize, String> {
         serde_json::from_value(v.get("accounts").cloned().unwrap_or(json!([])))
             .map_err(|e| e.to_string())?
     };
-    let mut accounts = load_accounts();
-    let mut n = 0;
-    for a in new {
-        if a.uid.is_empty() || a.edition.is_empty() {
-            continue;
+    update_accounts(|accounts| {
+        let mut n = 0;
+        for a in new {
+            if a.uid.is_empty() || a.edition.is_empty() {
+                continue;
+            }
+            if let Some(exist) = find_account(accounts, &a.edition, &a.uid) {
+                *exist = a;
+            } else {
+                accounts.push(a);
+            }
+            n += 1;
         }
-        if let Some(exist) = find_account(&mut accounts, &a.edition, &a.uid) {
-            *exist = a;
-        } else {
-            accounts.push(a);
-        }
-        n += 1;
-    }
-    save_accounts(&accounts)?;
-    Ok(n)
+        Ok(n)
+    })
 }
 
 // ───────────────────────── OAuth 设备登录（添加账号） ─────────────────────────
@@ -1392,66 +1447,67 @@ pub fn save_login_account(edition_key: &str, sess: &Value) -> Result<(Account, b
     if uid.is_empty() {
         return Err("登录结果缺少用户 ID".into());
     }
-    let mut accounts = load_accounts();
-    let idx = accounts
-        .iter()
-        .position(|a| a.edition == edition_key && a.uid == uid);
-    let is_new = idx.is_none();
-    if is_new {
-        accounts.push(Account {
-            edition: edition_key.to_string(),
-            uid: uid.clone(),
-            ..Default::default()
-        });
-    }
-    let acc = {
-        let i = idx.unwrap_or(accounts.len() - 1);
-        &mut accounts[i]
-    };
-    acc.name = user
-        .get("name")
-        .and_then(|x| x.as_str())
-        .filter(|s| !s.is_empty())
-        .or(user.get("email").and_then(|x| x.as_str()))
-        .or(user.get("phone").and_then(|x| x.as_str()))
-        .unwrap_or(&uid[..uid.len().min(8)])
-        .to_string();
-    acc.email = user
-        .get("email")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.phone = user
-        .get("phone")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.avatarUrl = user
-        .get("avatarUrl")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.token = token.to_string();
-    acc.refreshToken = sess
-        .get("refreshToken")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.expiresAt = sess
-        .get("expiresAt")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.refreshTokenExpiresAt = sess
-        .get("refreshTokenExpiresAt")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    acc.savedAt = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    // OAuth 登录的账号客户端磁盘上没有它的 auth.v1.dat，必须现场构造登录态供切换使用
-    acc.authBlob = build_auth_blob(_ed, acc)?;
-    let saved = acc.clone();
-    save_accounts(&accounts)?;
+    let (saved, is_new) = update_accounts(|accounts| {
+        let idx = accounts
+            .iter()
+            .position(|a| a.edition == edition_key && a.uid == uid);
+        let is_new = idx.is_none();
+        if is_new {
+            accounts.push(Account {
+                edition: edition_key.to_string(),
+                uid: uid.clone(),
+                ..Default::default()
+            });
+        }
+        let acc = {
+            let i = idx.unwrap_or(accounts.len() - 1);
+            &mut accounts[i]
+        };
+        acc.name = user
+            .get("name")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .or(user.get("email").and_then(|x| x.as_str()))
+            .or(user.get("phone").and_then(|x| x.as_str()))
+            .unwrap_or(&uid[..uid.len().min(8)])
+            .to_string();
+        acc.email = user
+            .get("email")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.phone = user
+            .get("phone")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.avatarUrl = user
+            .get("avatarUrl")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.token = token.to_string();
+        acc.refreshToken = sess
+            .get("refreshToken")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.expiresAt = sess
+            .get("expiresAt")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.refreshTokenExpiresAt = sess
+            .get("refreshTokenExpiresAt")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        acc.savedAt = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // OAuth 登录的账号客户端磁盘上没有它的 auth.v1.dat，必须现场构造登录态供切换使用
+        acc.authBlob = build_auth_blob(_ed, acc)?;
+        let saved = acc.clone();
+        Ok((saved, is_new))
+    })?;
     // 若该账号正登录客户端，顺带回写登录态
     if live_uid(edition_key) == uid {
         let _ = persist_and_writeback(&saved);
@@ -1465,4 +1521,96 @@ pub fn quota_info(acc: &Account) -> (u16, Value) {
         return (0, json!({}));
     };
     api_call(ed, "/sash/api/v2/me/usage", "GET", &acc.token, None)
+}
+
+#[cfg(test)]
+mod account_store_tests {
+    use super::*;
+    fn account(uid: &str) -> Account {
+        Account {
+            uid: uid.into(),
+            edition: "cn".into(),
+            token: "fixture-old".into(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn delayed_refresh_preserves_deletions_new_accounts_and_notes() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let path = dir.join("accounts.json");
+        update_accounts_at(&path, |rows| {
+            rows.extend([account("deleted"), account("kept")]);
+            Ok(())
+        })
+        .unwrap();
+        let delayed = account("deleted");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let delete_path = path.clone();
+        let deletion = std::thread::spawn(move || {
+            update_accounts_at(&delete_path, |rows| {
+                rows.retain(|a| a.uid != "deleted");
+                rows[0].note = "concurrent note".into();
+                rows.push(account("new"));
+                locked_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+            .unwrap()
+        });
+        locked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let refresh_path = path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let refresh = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            update_accounts_at(&refresh_path, |rows| {
+                if let Some(row) = find_account(rows, &delayed.edition, &delayed.uid) {
+                    row.token = "fixture-fresh".into();
+                }
+                Ok(())
+            })
+            .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        release_tx.send(()).unwrap();
+        deletion.join().unwrap();
+        refresh.join().unwrap();
+        let doc: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let rows = doc["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["uid"], "kept");
+        assert_eq!(rows[0]["note"], "concurrent note");
+        assert_eq!(rows[1]["uid"], "new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn corrupt_store_and_rejected_edits_preserve_original_bytes() {
+        let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.json");
+        fs::write(&path, b"corrupt fixture").unwrap();
+        assert!(update_accounts_at(&path, |rows| {
+            rows.push(account("new"));
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"corrupt fixture");
+        let valid = br#"{"accounts":[]}"#;
+        fs::write(&path, valid).unwrap();
+        assert!(update_accounts_at::<()>(&path, |rows| {
+            rows.push(account("new"));
+            Err("fixture rejection".into())
+        })
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), valid);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

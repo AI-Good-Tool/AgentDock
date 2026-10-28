@@ -31,28 +31,41 @@ class DeviceTokens {
     this.inFlight = this.refresh().finally(() => { this.inFlight = undefined; });
     return this.inFlight;
   }
+  fetchNative() {
+    if (this.nativeInFlight) return this.nativeInFlight;
+    this.sdk ??= this.load();
+    const stopRunLoop = this.sdk.startRunLoop?.();
+    const pending = (async () => {
+      try {
+        const token = await this.sdk.fetchDeviceToken({ usingCachedMessage: true, includesOutdatedMessage: false,
+          includesDeviceInfo: true, timeoutMs: 15000 });
+        if (typeof token !== 'string' || !token.trim() || /[\r\n]/.test(token)) throw new Error('invalid token');
+        // A valid late result can restore the cache after the caller times out.
+        this.value = token;
+        this.expires = this.now() + 300000;
+        this.failures = 0;
+        this.retryAt = 0;
+        return token;
+      } finally { stopRunLoop?.(); }
+    })();
+    this.nativeInFlight = pending;
+    const clear = () => { if (this.nativeInFlight === pending) this.nativeInFlight = undefined; };
+    pending.then(clear, clear);
+    return pending;
+  }
   async refresh() {
     let timeout;
-    let stopRunLoop;
     try {
-      this.sdk ??= this.load();
-      stopRunLoop = this.sdk.startRunLoop?.();
-      const token = await Promise.race([
-        this.sdk.fetchDeviceToken({ usingCachedMessage: true, includesOutdatedMessage: false,
-          includesDeviceInfo: true, timeoutMs: 15000 }),
+      // Timing out a waiter does not cancel the native operation or its run loop.
+      return await Promise.race([
+        this.fetchNative(),
         new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('timeout')), 15500); }),
       ]);
-      if (typeof token !== 'string' || !token.trim() || /[\r\n]/.test(token)) throw new Error('invalid token');
-      this.value = token;
-      this.expires = this.now() + 300000;
-      this.failures = 0;
-      this.retryAt = 0;
-      return token;
     } catch {
-      this.value = undefined;
+      if (this.now() >= this.expires) this.value = undefined;
       this.retryAt = this.now() + Math.min(300000, 30000 * 2 ** Math.min(this.failures++, 4));
       throw new Error('device_token_unavailable');
-    } finally { clearTimeout(timeout); stopRunLoop?.(); }
+    } finally { clearTimeout(timeout); }
   }
 }
 
@@ -115,7 +128,7 @@ function listenBridge(server, { socket, tcp }, ready) {
 }
 function validateProfile(product, cli, nodeVersion) {
   const cliVersion = cli.publishConfig?.customPackage?.version || cli.version;
-  if (nodeVersion !== 'v22.21.1' || product.genieVersion !== '5.9.2' || cliVersion !== '2.165.0')
+  if (nodeVersion !== 'v22.21.1' || product.genieVersion !== '5.9.3' || cliVersion !== '2.165.0')
     throw new Error('unsupported_profile');
 }
 function installedProfile() {

@@ -3,14 +3,15 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { decodeSession, currentSession } = require('./official-session.cjs');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
-test('installed 5.9.2 codec decodes a synthetic envelope without reading native keys or user login files', {
+test('installed 5.9.3 codec decodes a synthetic envelope without reading native keys or user login files', {
   skip: process.platform !== 'darwin' || !fs.existsSync('/Applications/WorkBuddy.app/Contents/Resources/app.asar'),
 }, () => {
   const script = `
-    const { installedCodec, decodeSession } = require(${JSON.stringify(path.join(__dirname, 'official-session.cjs'))});
+    const { installedCodec, decodeSession, readInstalledSession } = require(${JSON.stringify(path.join(__dirname, 'official-session.cjs'))});
     const main='/Applications/WorkBuddy.app/Contents/Resources/app.asar/main';
     const codec=installedCodec(main), runtime=require(main+'/dist.js');
     const bytes=Buffer.alloc(32,7), key={key:bytes,keyId:runtime.C(bytes)};
@@ -21,12 +22,37 @@ test('installed 5.9.2 codec decodes a synthetic envelope without reading native 
     bytes.fill(0);
     const native=process._linkedBinding('electron_browser_workbuddy_storage');
     if(result.auth.refreshToken!=='synthetic-refresh'||typeof native.loggerGet!=='function')process.exit(1);
+    // Exercise the real installed version gate, but stop before accessing native keys.
+    const binding=process._linkedBinding;
+    process._linkedBinding=function(name){
+      if(name==='electron_browser_workbuddy_storage')throw Error('synthetic-native-provider');
+      return binding.call(this,name);
+    };
+    require('node:assert/strict').throws(
+      ()=>readInstalledSession(process.execPath,'/synthetic-not-read.json'),
+      /synthetic-native-provider/,
+    );
     console.log('synthetic-codec-ok');
   `;
   assert.equal(execFileSync('/Applications/WorkBuddy.app/Contents/MacOS/Electron', ['-e', script], {
     env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', AGENTDOCK_READ_SESSION: '' },
     timeout: 10000, encoding: 'utf8',
   }).trim(), 'synthetic-codec-ok');
+});
+
+test('unverified session profiles are rejected before loading a codec or native keys', t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-session-profile-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const executable = path.join(directory, 'Contents/MacOS/Electron');
+  const resources = process.platform === 'darwin'
+    ? path.resolve(executable, '../../Resources') : path.join(path.dirname(executable), 'resources');
+  const productPath = path.join(resources, 'app.asar.unpacked/cli/product.json');
+  fs.mkdirSync(path.dirname(productPath), { recursive: true });
+  const { readInstalledSession } = require('./official-session.cjs');
+  for (const version of ['5.9.2', '5.9.4', undefined]) {
+    fs.writeFileSync(productPath, JSON.stringify({ genieVersion: version }));
+    assert.throws(() => readInstalledSession(executable, '/synthetic-not-read.json'), /unsupported_profile/);
+  }
 });
 
 // Test delegation/traversal without loading the installed client or its keys.

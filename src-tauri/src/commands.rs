@@ -209,6 +209,11 @@ pub async fn set_account_disabled(hub: State<'_, Shared>, provider_key: String, 
     let hub = hub.inner().clone();
     blocking(move || hub.set_account_disabled(p, &id, disabled).map(|_| json!({"ok":true}))).await?
 }
+#[tauri::command]
+pub async fn delete_accounts(hub: State<'_, Shared>, accounts: Vec<crate::account_json::AccountRef>, confirmed: bool) -> Res {
+    let hub = hub.inner().clone();
+    blocking(move || hub.delete_accounts(&accounts, confirmed)).await?
+}
 
 #[tauri::command]
 pub fn clear_account_runtime(hub: State<'_, Shared>, key: String) -> Value {
@@ -818,7 +823,6 @@ pub fn qoder_claim_blocking(id: Option<String>, skip: &std::collections::HashSet
         match accounts.iter().position(|a| a.id() == aid) {
             Some(i) => {
                 let r = qc::claim_account(&mut accounts[i], false);
-                let _ = qc::save_accounts(&accounts);
                 qc::append_claim_log(&[r.clone()], "manual");
                 let ok = matches!(r["phase"].as_str(), Some("claimed" | "nothing" | "dry_run"));
                 json!({"ok":ok,"message":format!("{}：{}", r["name"].as_str().unwrap_or(""), r["msg"].as_str().unwrap_or(""))})
@@ -855,7 +859,6 @@ pub async fn qoder_credits(hub: State<'_, Shared>, id: String) -> Res {
             hub.qoder.cache_credits(&id, json!({"ok":false,"error":e}));
             return json!({"ok":false,"message":e});
         }
-        let _ = qc::save_accounts(&accounts);
         let acc = &accounts[i];
         let (s1, summary) = qc::credits_summary(acc);
         let (s2, camps) = qc::get_campaigns(acc);
@@ -883,12 +886,14 @@ pub async fn qoder_credits(hub: State<'_, Shared>, id: String) -> Res {
 #[tauri::command]
 pub async fn qoder_set_note(id: String, note: String) -> Res {
     blocking(move || {
-        let mut accounts = qoder::qcore::load_accounts();
-        for a in accounts.iter_mut().filter(|a| a.id() == id) {
-            a.note = note.clone();
+        match qoder::qcore::update_accounts(|accounts| {
+            let a = accounts.iter_mut().find(|a| a.id() == id).ok_or("账号不存在")?;
+            a.note = note;
+            Ok(())
+        }) {
+            Ok(()) => json!({"ok":true,"message":"已保存备注"}),
+            Err(e) => json!({"ok":false,"message":e}),
         }
-        let _ = qoder::qcore::save_accounts(&accounts);
-        json!({"ok":true,"message":"已保存备注"})
     })
     .await
 }
@@ -896,13 +901,13 @@ pub async fn qoder_set_note(id: String, note: String) -> Res {
 pub async fn qoder_delete_account(hub: State<'_, Shared>, id: String) -> Res {
     let hub = hub.inner().clone();
     blocking(move || {
-        let accounts: Vec<_> = qoder::qcore::load_accounts().into_iter().filter(|a| a.id() != id).collect();
-        let _ = qoder::qcore::save_accounts(&accounts);
-        hub.qoder.forget_account(&id);
-        let _ = hub.set_account_disabled(ProviderKind::Qoder, &id, false);
-        json!({"ok":true,"message":"已删除"})
+        let result = hub.delete_accounts(&[crate::account_json::AccountRef { provider: "qoder".into(), id }], true)?;
+        if result["failed"].as_u64().unwrap_or(0) > 0 {
+            return Err("删除失败：请刷新并检查本地账号库权限".into());
+        }
+        Ok(json!({"ok":true,"message":"已删除","warning":result["results"][0]["warning"]}))
     })
-    .await
+    .await?
 }
 #[tauri::command]
 pub async fn qoder_set_auto_claim(hub: State<'_, Shared>, enabled: bool) -> Res {
@@ -1130,9 +1135,11 @@ pub async fn trae_import(hub: State<'_, Shared>, variant: String, account: Value
 pub async fn trae_delete(hub: State<'_, Shared>, id: String) -> Res {
     let hub = hub.inner().clone();
     blocking(move || {
-        hub.trae.delete(&id)?;
-        let _ = hub.set_account_disabled(ProviderKind::Trae, &id, false);
-        Ok(json!({"ok":true}))
+        let result = hub.delete_accounts(&[crate::account_json::AccountRef { provider: "trae".into(), id }], true)?;
+        if result["failed"].as_u64().unwrap_or(0) > 0 {
+            return Err("删除失败：请刷新并检查本地账号库权限".into());
+        }
+        Ok(json!({"ok":true,"message":"已删除","warning":result["results"][0]["warning"]}))
     })
     .await?
 }

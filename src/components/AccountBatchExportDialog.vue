@@ -5,11 +5,12 @@ import ProviderMark from './ProviderMark.vue'
 import { call } from '../api'
 import { act, busy, providerLabel } from '../store'
 import { t } from '../i18n'
+import { accountKey } from '../lib/account-selection'
 
-const props = defineProps<{ accounts: { provider: string; id: string; name: string; region: string }[] }>()
+const props = defineProps<{ accounts: { provider: string; id: string; name: string; region: string }[]; initialSelected?: string[] }>()
 const emit = defineEmits<{ close: [] }>()
-const key = (a: { provider: string; id: string }) => `${a.provider}/${a.id}`
-const selected = ref(props.accounts.map(key))
+const key = (a: { provider: string; id: string }) => accountKey(a.provider, a.id)
+const selected = ref(props.initialSelected ? props.accounts.map(key).filter(k => props.initialSelected!.includes(k)) : props.accounts.map(key))
 const all = computed(() => props.accounts.length > 0 && selected.value.length === props.accounts.length)
 async function save() {
   const accounts = props.accounts.filter(a => selected.value.includes(key(a))).map(({ provider, id }) => ({ provider, id }))

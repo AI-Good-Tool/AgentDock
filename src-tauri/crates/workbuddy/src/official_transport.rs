@@ -162,7 +162,7 @@ impl Worker {
                     )
                 });
                 return Err(
-                    "请安装已验证的 WorkBuddy 5.9.2，以获取官方 Node 运行时与设备 SDK".into(),
+                    "请安装已验证的 WorkBuddy 5.9.3，以获取官方 Node 运行时与设备 SDK".into(),
                 );
             }
         };
@@ -222,7 +222,7 @@ impl Worker {
         })
         .await
         .map_err(|_| "查找 WorkBuddy 安装路径失败")?
-        .ok_or("请安装 WorkBuddy 5.9.2；也可在 Switch 中设置其自定义安装路径")?;
+        .ok_or("请安装 WorkBuddy 5.9.3；也可在 Switch 中设置其自定义安装路径")?;
         let key = Uuid::new_v4().simple().to_string();
         // Windows uses an ephemeral loopback listener plus a process-private random secret.
         // No unauthenticated bridge, named-pipe pathname or command-shell interpolation.
@@ -556,7 +556,7 @@ upstream.listen(0,'127.0.0.1',()=>{{
         assert_eq!(headers["acp-connection-id"], context.connection);
         assert!(headers.get("x-wb-bridge-key").is_none());
         let official: Value =
-            serde_json::from_str(include_str!("../evidence/official-desktop-offline.json"))
+            serde_json::from_str(include_str!("../evidence/workbuddy-5.9.3-offline.json"))
                 .unwrap();
         let dynamic = [
             "host",

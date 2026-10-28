@@ -80,6 +80,49 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<(), String> {
 }
 
 impl Hub {
+    /// Native credential stores are changed only by an explicit desktop delete.
+    pub fn delete_accounts(&self, accounts: &[crate::account_json::AccountRef], confirmed: bool) -> Result<Value, String> {
+        if !confirmed { return Err("删除账号需要明确确认".into()); }
+        if accounts.is_empty() || accounts.iter().any(|a| a.id.trim().is_empty() || ProviderKind::parse(&a.provider).is_none()) {
+            return Err("请选择有效的平台和账号".into());
+        }
+        let _writer = self.account_writer.lock().unwrap();
+        let mut seen = std::collections::HashSet::new();
+        let mut results = vec![];
+        for a in accounts.iter().filter(|a| seen.insert((&a.provider, &a.id))) {
+            let provider = ProviderKind::parse(&a.provider).unwrap();
+            let result = match provider {
+                ProviderKind::Workbuddy => self.wb.delete_accounts(&[a.id.clone()], true).map(|_| ()),
+                ProviderKind::Qoder => {
+                    qoder::qcore::update_accounts(|records| {
+                        let before = records.len();
+                        records.retain(|record| record.id() != a.id);
+                        if records.len() == before { Err("账号不存在".into()) } else { Ok(()) }
+                    }).map(|_| self.qoder.forget_account(&a.id))
+                }
+                ProviderKind::Trae => self.trae.delete(&a.id),
+            };
+            match result {
+                Ok(()) => {
+                    let key = agentdock_core::provider::account_key(provider, &a.id);
+                    let cleanup = self.update_settings(|s| {
+                        s.disabled_accounts.remove(&key);
+                        s.auth_disabled_accounts.remove(&key);
+                        Ok(())
+                    });
+                    let mut rt = self.runtime.lock().unwrap();
+                    rt.cooldown.remove(&key);
+                    rt.auth_failed.remove(&key);
+                    rt.model_cooldown.retain(|(account, _), _| account != &key);
+                    results.push(json!({"provider":a.provider,"id":a.id,"ok":true,
+                        "warning":cleanup.err().map(|_| "账号已删除，但暂停标记清理失败，重新导入后请检查状态")}));
+                }
+                Err(_) => results.push(json!({"provider":a.provider,"id":a.id,"ok":false,"error":"删除失败：账号已移除或本地账号库无法写入，请刷新并检查存储权限"})),
+            }
+        }
+        let count = results.iter().filter(|r| r["ok"] == true).count();
+        Ok(json!({"count":count,"failed":results.len()-count,"results":results}))
+    }
     /// Open every provider under `dir` (created and migrated by `paths`).
     pub fn open(dir: &Path) -> Result<Shared, String> {
         qoder::qcore::set_data_dir(dir.join("qoder"));
@@ -479,7 +522,12 @@ impl Hub {
         token.filter(|t| !t.is_empty()).map(|t| agentdock_core::provider::credential_revision(&t))
     }
     fn current_credential_revision(&self, provider: ProviderKind, id: &str, revision: Option<u64>) -> bool {
-        revision.is_none_or(|expected| self.credential_revision(provider, id) == Some(expected))
+        let exists = match provider {
+            ProviderKind::Workbuddy => self.wb.store.lock().unwrap().accounts.iter().any(|a| a.id == id),
+            ProviderKind::Qoder => self.qoder.accounts().iter().any(|a| a.id() == id),
+            ProviderKind::Trae => self.trae.store.account(id).is_ok(),
+        };
+        exists && revision.is_none_or(|expected| self.credential_revision(provider, id) == Some(expected))
     }
     pub fn restore_login_observed(&self, provider: ProviderKind, id: &str, revision: Option<u64>) -> Result<(), String> {
         let _writer = self.account_writer.lock().unwrap();

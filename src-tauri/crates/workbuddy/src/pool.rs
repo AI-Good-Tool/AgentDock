@@ -201,6 +201,27 @@ fn save(path: &PathBuf, store: &Store) -> Result<(), String> {
 }
 
 impl AppState {
+    /// Remove this application's references only. Existing client/Switch logins
+    /// and historical usage remain intact; already running requests may finish.
+    pub fn delete_accounts(&self, ids: &[String], confirmed: bool) -> Result<usize, String> {
+        if !confirmed {
+            return Err("删除账号需要明确确认".into());
+        }
+        let ids = crate::account_transfer::selected_ids(ids)?;
+        let count = self.update_store(|store| {
+            if ids.iter().any(|id| !store.accounts.iter().any(|a| a.id == *id)) {
+                return Err("部分账号已移除，请刷新后重新选择".into());
+            }
+            store.accounts.retain(|a| !ids.contains(a.id.as_str()));
+            store.resources.retain(|id, _| !ids.contains(id.as_str()));
+            store.model_limits.retain(|id, _| !ids.contains(id.as_str()));
+            store.checkin_states.retain(|id, _| !ids.contains(id.as_str()));
+            Ok(ids.len())
+        })?;
+        self.runtime.lock().unwrap().auth_failed.retain(|id, _| !ids.contains(id.as_str()));
+        Ok(count)
+    }
+
     // Serialize metadata writers, not routing readers. Disk I/O must never hold
     // the store/runtime locks; publish only after a successful atomic save.
     pub fn update_store<T>(
@@ -311,7 +332,7 @@ impl AppState {
             Some(wb_switch_core::modules::account::lock_accounts_at(path).map_err(|_| "无法锁定账号库")?)
         } else { None };
         let current = if account.source == "switch" {
-            read_json(&path.to_path_buf())?.as_array().and_then(|rows| rows.iter().find(|r| r["id"] == account.source_id && r["uid"].as_str() == account.id.split_once(':').map(|(_, uid)| uid))).cloned()
+            read_json(&path.to_path_buf())?.as_array().and_then(|rows| rows.iter().find(|r| r["id"] == account.source_id && r["uid"].as_str() == account.id.split_once(':').map(|(_, uid)| uid) && wb_switch_core::modules::account::variant_of(r).as_str() == account.variant)).cloned()
                 .and_then(|r| r["access_token"].as_str().map(agentdock_core::provider::credential_revision))
         } else { credentials(&account).ok().map(|c| agentdock_core::provider::credential_revision(&c.token)) };
         if current != Some(revision) { return Ok(false); }
@@ -321,8 +342,11 @@ impl AppState {
     fn cache_credit_inner(&self, id: &str, credit: Value, revision: Option<u64>) -> Result<(), String> {
         let auth_failed = credit["authFailed"] == true;
         let authenticated = credit["ok"] == true;
-        if auth_failed { self.runtime.lock().unwrap().auth_failed.insert(id.into(), true); }
+        let mut account_present = false;
         let result = self.update_store(|store| {
+            if !store.accounts.iter().any(|a| a.id == id) { return Err("账号已移除，忽略迟到的查询结果".into()); }
+            account_present = true;
+            if auth_failed { self.runtime.lock().unwrap().auth_failed.insert(id.into(), true); }
             if credit["ok"] == true {
                 if let Some(account) = store.accounts.iter().find(|a| a.id == id).cloned() {
                     crate::statistics::observe_credit(
@@ -349,7 +373,7 @@ impl AppState {
             Ok(())
         });
         // Run after releasing metadata locks; the hub reconciles login state.
-        if auth_failed || (authenticated && result.is_ok()) {
+        if (auth_failed && account_present) || (authenticated && result.is_ok()) {
             let sink = self.login_status_sink.lock().unwrap().clone();
             if let Some(sink) = sink { sink(id, auth_failed, revision); }
         }
@@ -388,6 +412,7 @@ impl AppState {
             return Ok(());
         }
         self.update_store(|store| {
+            if !store.accounts.iter().any(|a| a.id == id) { return Err("账号已移除，忽略迟到的限额结果".into()); }
             let limits = store.model_limits.entry(id.into()).or_default();
             limits.retain(|l| l.reset_at > now);
             if let Some(old) = limits.iter_mut().find(|l| l.model == model) {
@@ -669,7 +694,7 @@ impl AppState {
             v["credit"]=store.resources.get(&a.id).cloned().unwrap_or(Value::Null);
             v["presentation"]=rt.presentations.get(&a.id).cloned().unwrap_or(Value::Null);
             v["modelLimits"]=json!(combined_limits(&store,&rt,&a.id,Utc::now().timestamp_millis()));v
-        }).collect::<Vec<_>>(), "version": "5.9.2", "catalogVariant": store.catalog_variant.as_deref().unwrap_or("cn"), "autoCheckin":store.auto_checkin,"checkinConfig":store.checkin_config,"checkinRecords":store.checkin_records,"clients":rt.clients,
+        }).collect::<Vec<_>>(), "version": crate::official::DESKTOP_VERSION, "catalogVariant": store.catalog_variant.as_deref().unwrap_or("cn"), "autoCheckin":store.auto_checkin,"checkinConfig":store.checkin_config,"checkinRecords":store.checkin_records,"clients":rt.clients,
             "settings": store.settings, "accountPriority":store.account_priority, "accountRefresh": rt.account_refresh, "officialProfile": crate::official::profile_summary(store.settings.use_device_sdk) })
     }
 
@@ -1017,8 +1042,12 @@ pub fn credentials(account: &Account) -> Result<Credential, String> {
         }
         raw
     } else { return Err("不支持的账号来源，请重新导入".into()); };
+    credential_from_record(account, &raw)
+}
+
+fn credential_from_record(account: &Account, raw: &Value) -> Result<Credential, String> {
     if account.source == "switch" && (raw["uid"].as_str() != account.id.split_once(':').map(|(_, uid)| uid)
-        || wb_switch_core::modules::account::variant_of(&raw).as_str() != account.variant) {
+        || wb_switch_core::modules::account::variant_of(raw).as_str() != account.variant) {
         return Err("原始账号身份或地区已变化，请重新导入，未使用其他账号的凭据".into());
     }
     let token = raw["access_token"]
@@ -1091,6 +1120,70 @@ mod tests {
         assert_eq!(store.resources["acknowledged"]["authFailed"],false);
         assert!(store.resources["network"].get("authFailed").is_none());
         assert!(store.resources["forbidden"].get("authFailed").is_none());
+    }
+    #[test]
+    fn delete_selection_is_confirmed_atomic_durable_and_blocks_future_acquires() {
+        let s = state();
+        let mut second = s.store.lock().unwrap().accounts[0].clone();
+        second.id = "b".into();
+        s.store.lock().unwrap().accounts.push(second);
+        s.store.lock().unwrap().resources.insert("a".into(), json!({"ok":true}));
+        assert!(s.delete_accounts(&["a".into()], false).is_err());
+        assert!(s.delete_accounts(&[], true).is_err());
+        assert!(s.delete_accounts(&["a".into(), "missing".into()], true).is_err());
+        assert_eq!(s.store.lock().unwrap().accounts.len(), 2);
+        let (_, lease) = s.acquire("credits", Some("a")).unwrap();
+        assert_eq!(s.delete_accounts(&["a".into(), "a".into()], true).unwrap(), 1);
+        assert!(s.acquire("credits", Some("a")).is_err());
+        assert!(s.acquire("credits", Some("b")).is_ok());
+        assert!(!s.store.lock().unwrap().resources.contains_key("a"));
+        let saved: Store = serde_json::from_slice(&std::fs::read(&s.path).unwrap()).unwrap();
+        assert_eq!(saved.accounts.len(), 1);
+        assert_eq!(saved.accounts[0].id, "b");
+        drop(lease);
+        std::fs::remove_file(&s.path).unwrap();
+    }
+    #[test]
+    fn delete_disk_failure_preserves_account_and_cached_data() {
+        let s = state();
+        s.store.lock().unwrap().resources.insert("a".into(), json!({"ok":true}));
+        std::fs::create_dir(&s.path).unwrap();
+        assert!(s.delete_accounts(&["a".into()], true).is_err());
+        assert_eq!(s.store.lock().unwrap().accounts[0].id, "a");
+        assert!(s.store.lock().unwrap().resources.contains_key("a"));
+        std::fs::remove_dir(&s.path).unwrap();
+        let _ = std::fs::remove_file(s.path.with_extension("tmp"));
+    }
+    #[test]
+    fn late_results_cannot_recreate_deleted_account_metadata() {
+        let s = state();
+        s.cache_credit("a", json!({"ok":false,"authFailed":true})).unwrap();
+        s.delete_accounts(&["a".into()], true).unwrap();
+        for credit in [json!({"ok":true,"totalRemaining":42}), json!({"ok":false,"authFailed":true})] {
+            assert!(s.cache_credit("a", credit).is_err());
+        }
+        assert!(s.record_model_limit("a", Some("hy3".into()), Utc::now().timestamp_millis()+60000).is_err());
+        let saved: Store = serde_json::from_slice(&std::fs::read(&s.path).unwrap()).unwrap();
+        assert!(saved.accounts.is_empty());
+        assert!(saved.resources.is_empty());
+        assert!(saved.model_limits.is_empty());
+        assert!(s.runtime.lock().unwrap().auth_failed.is_empty());
+        std::fs::remove_file(&s.path).unwrap();
+    }
+    #[test]
+    fn switch_credentials_require_the_imported_uid_and_region() {
+        let s = state();
+        let mut account = s.store.lock().unwrap().accounts[0].clone();
+        account.source = "switch".into();
+        account.id = "cn:fixture-uid".into();
+        account.source_id = "fixture-id".into();
+        let raw = json!({"id":"fixture-id","uid":"fixture-uid","variant":"cn","access_token":"fixture-token"});
+        assert!(credential_from_record(&account, &raw).is_ok());
+        for patch in [json!({"uid":"different-uid"}), json!({"variant":"ai"}), json!({"access_token":""})] {
+            let mut changed = raw.clone();
+            for (key, value) in patch.as_object().unwrap() { changed[key] = value.clone(); }
+            assert!(credential_from_record(&account, &changed).is_err());
+        }
     }
     fn state() -> Shared {
         let state = AppState::new(std::env::temp_dir().join(Uuid::new_v4().to_string()))

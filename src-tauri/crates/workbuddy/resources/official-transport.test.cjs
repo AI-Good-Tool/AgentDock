@@ -9,13 +9,15 @@ const zlib = require('node:zlib');
 const { once } = require('node:events');
 const { DeviceTokens, createBridge, createMacRunLoop, runtimeHeaders, installedRoot, listenBridge, validateProfile } = require('./official-transport.cjs');
 
-test('5.9.2 accepts CLI package.version without legacy publishConfig and rejects unverified profiles', () => {
-  validateProfile({ genieVersion: '5.9.2' }, { version: '2.165.0' }, 'v22.21.1');
-  validateProfile({ genieVersion: '5.9.2' }, { publishConfig: { customPackage: { version: '2.165.0' } } }, 'v22.21.1');
+test('5.9.3 accepts CLI package.version without legacy publishConfig and rejects unverified profiles', () => {
+  validateProfile({ genieVersion: '5.9.3' }, { version: '2.165.0' }, 'v22.21.1');
+  validateProfile({ genieVersion: '5.9.3' }, { publishConfig: { customPackage: { version: '2.165.0' } } }, 'v22.21.1');
   for (const args of [
     [{ genieVersion: '5.8.3' }, { version: '2.161.0' }, 'v22.21.1'],
-    [{ genieVersion: '5.9.2' }, { version: '2.161.0' }, 'v22.21.1'],
-    [{ genieVersion: '5.9.2' }, { version: '2.165.0' }, 'v24.0.0'],
+    [{ genieVersion: '5.9.2' }, { version: '2.165.0' }, 'v22.21.1'],
+    [{ genieVersion: '5.9.4' }, { version: '2.165.0' }, 'v22.21.1'],
+    [{ genieVersion: '5.9.3' }, { version: '2.161.0' }, 'v22.21.1'],
+    [{ genieVersion: '5.9.3' }, { version: '2.165.0' }, 'v24.0.0'],
   ]) assert.throws(() => validateProfile(...args), /unsupported_profile/);
 });
 
@@ -75,6 +77,74 @@ test('SDK run-loop pump stops after success and failure, including concurrent wa
     fetchDeviceToken: async () => { if (fail) throw Error('fixture'); return 'fixture'; } }));
   await Promise.all([tokens.get(), tokens.get()]); assert.equal(starts, 1); assert.equal(stops, 1);
   tokens.expires = 0; fail = true; await assert.rejects(tokens.get()); assert.equal(starts, 2); assert.equal(stops, 2);
+});
+
+test('SDK retries after a watchdog timeout reuse the pending native call and its run loop', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 100, starts = 0, stops = 0;
+  const native = [];
+  const tokens = new DeviceTokens(() => ({
+    startRunLoop: () => { starts++; return () => { stops++; }; },
+    fetchDeviceToken: () => new Promise(resolve => { native.push(resolve); }),
+  }), () => now);
+  const first = assert.rejects(tokens.get(), /device_token_unavailable/);
+  const concurrent = assert.rejects(tokens.get(), /device_token_unavailable/);
+  now += 15500; t.mock.timers.tick(15500);
+  await Promise.all([first, concurrent]);
+  assert.equal(native.length, 1); assert.equal(starts, 1); assert.equal(stops, 0);
+  await assert.rejects(tokens.get(), /device_token_unavailable/);
+  now += 30000;
+  const retry = tokens.get();
+  const waiter = tokens.get();
+  assert.equal(native.length, 1); assert.equal(starts, 1);
+  native[0]('late-valid-token');
+  assert.deepEqual(await Promise.all([retry, waiter]), ['late-valid-token', 'late-valid-token']);
+  assert.equal(stops, 1);
+  assert.equal(await tokens.get(), 'late-valid-token');
+  now += 300000;
+  const expired = tokens.get();
+  assert.equal(native.length, 2); assert.equal(starts, 2);
+  native[1]('renewed-token');
+  assert.equal(await expired, 'renewed-token'); assert.equal(stops, 2);
+});
+
+test('a valid native result arriving after timeout restores the cache during backoff', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 100, calls = 0, stops = 0, resolveNative;
+  const tokens = new DeviceTokens(() => ({
+    startRunLoop: () => () => { stops++; },
+    fetchDeviceToken: () => { calls++; return new Promise(resolve => { resolveNative = resolve; }); },
+  }), () => now);
+  const failed = assert.rejects(tokens.get(), /device_token_unavailable/);
+  now += 15500; t.mock.timers.tick(15500);
+  // Resolve at the timeout boundary, before the outer rejection is observed.
+  resolveNative('late-cached-token');
+  await failed;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(await tokens.get(), 'late-cached-token');
+  assert.equal(calls, 1); assert.equal(stops, 1);
+});
+
+test('a late native rejection releases the run loop and permits a new call after backoff', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let now = 100, starts = 0, stops = 0;
+  const native = [];
+  const tokens = new DeviceTokens(() => ({
+    startRunLoop: () => { starts++; return () => { stops++; }; },
+    fetchDeviceToken: () => new Promise((resolve, reject) => { native.push({ resolve, reject }); }),
+  }), () => now);
+  const failed = assert.rejects(tokens.get(), /device_token_unavailable/);
+  now += 15500; t.mock.timers.tick(15500); await failed;
+  assert.equal(stops, 0);
+  native[0].reject(new Error('late private native error'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stops, 1);
+  await assert.rejects(tokens.get(), /device_token_unavailable/);
+  now += 30000;
+  const retry = tokens.get();
+  assert.equal(native.length, 2); assert.equal(starts, 2);
+  native[1].resolve('recovered-token');
+  assert.equal(await retry, 'recovered-token'); assert.equal(stops, 2);
 });
 
 test('macOS main-loop timer is serviced by the pump with no native device SDK or network', { skip: process.platform !== 'darwin' || !fs.existsSync('/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/node_modules/koffi') }, async () => {

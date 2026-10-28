@@ -177,7 +177,7 @@ const pool = {
     autoCheckin: true,
     checkinConfig: { start: '09:00', end: '24:00' },
     checkinRecords: [{ at: now - 3600e3, accountId: 'cn:a1', submit: true, status: { today_checked_in: true, today_credit: 20 }, error: null, trigger: 'scheduled' }],
-    version: '5.9.2',
+    version: '5.9.3',
   },
   qoder: {
     editions: { cn: { label: 'Qoder CN 国内版', installed: true, running: false, currentUid: 'u1', currentName: 'Qoder 演示 01' }, intl: { label: 'Qoder 国际版', installed: true, running: true, currentUid: '', currentName: '' } },
@@ -305,6 +305,17 @@ export function preview(command: string, args?: Record<string, any>): unknown {
       return { format: 'agentdock-account', version: 1, provider: args?.provider, region: 'cn', exportedAt: iso(now), account: { id: 'c7d1-preview', uid: '07efe4fd-a82c-4270-a2f2-27b1b16f0c11', nickname: '大飞龙', access_token: 'eyJhbGciOiJIUzI1NiJ9.preview.signature', refresh_token: 'rt-preview-0000000000', domain: 'www.workbuddy.cn', variant: 'cn', expiresAt: now + 20 * day, enterpriseId: null, verified: true, plan: { name: 'Pro', credits: 1200.5 } } }
     case 'account_json_import':
       return { ok: true, count: args?.json?.accounts?.length ?? (Array.isArray(args?.json) ? args.json.length : 1), message: '演示：账号 JSON 已导入' }
+    case 'delete_accounts': {
+      if (!args?.confirmed) throw new Error('删除需要确认')
+      const results = (args.accounts ?? []).map((a: { provider: 'workbuddy' | 'qoder' | 'trae'; id: string }) => {
+        const list = pool[a.provider].accounts
+        const index = list.findIndex(item => item.id === a.id)
+        if (index < 0) return { ...a, ok: false }
+        list.splice(index, 1)
+        return { ...a, ok: true }
+      })
+      return { count: results.filter((r: any) => r.ok).length, failed: results.filter((r: any) => !r.ok).length, results }
+    }
     case 'account_json_save_batch':
       return { ok: true, count: args?.accounts?.length ?? 0, path: '/preview/Downloads/agentdock-accounts.json', message: '演示：已导出所选账号 JSON' }
     case 'app_update_check':

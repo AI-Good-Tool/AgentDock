@@ -51,6 +51,7 @@ pub fn run_desktop() {
             commands::pool_snapshot,
             commands::set_account_enabled,
             commands::set_account_disabled,
+            commands::delete_accounts,
             commands::clear_account_runtime,
             commands::catalog_snapshot,
             commands::sync_catalog,

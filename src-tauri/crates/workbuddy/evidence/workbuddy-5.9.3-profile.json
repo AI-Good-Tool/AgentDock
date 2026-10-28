@@ -1,0 +1,35 @@
+{
+  "recordedAt": "2026-10-28T05:55:11.894905+00:00",
+  "appPath": "/Applications/WorkBuddy.app",
+  "version": "5.9.3",
+  "bundleVersion": "5.9.3",
+  "bundleId": "com.tencent.workbuddy.mac",
+  "endpoint": "https://www.workbuddy.cn",
+  "clientCommit": "d46924219e79332f49c37ccebf27292f87001b19",
+  "clientBuildDate": "2026-10-27T09:23:43.713Z",
+  "genieVersion": "5.9.3",
+  "cliVersion": "2.165.0",
+  "deviceSdk": {
+    "name": "workbuddy-turing-sdk",
+    "version": "0.1.0",
+    "variant": "domestic",
+    "channelId": 109144
+  },
+  "sha256": {
+    "app.asar": "12a2be53ec7db2943a9958f6986d7807adcf083bd79b307d26706d83750effa7",
+    "app.asar.unpacked/cli/product.json": "2495b11cc30f1abd786e79eb2ae34bce85f9bd49ce83503ec79c8f4b23526359",
+    "app.asar.unpacked/cli/dist/codebuddy-lite-wb.mjs": "5cebda9a075c17a5eefa302342a5b2e1c236455cee05b09fac11244600f91465",
+    "app.asar.unpacked/cli/package.json": "3a58eeb08d1622c295786e2b11435d0b1188af962c48220e6dd9ebd75cb18de4",
+    "app.asar.unpacked/native/turing-sdk/index.cjs": "443335df97a7f3d568cc536b2ce6abce4596d2c6bc9fb55a32f7f545fc3b6775",
+    "app.asar.unpacked/native/turing-sdk/build/Release/turing-sdk-variant.json": "f1f80b950afbe34544a33bd1187c4e484f3b1b1b9d6ebd0a1b89094cd740454e",
+    "app.asar.unpacked/native/turing-sdk/build/Release/turing_sdk.node": "8d408c7ed32170ebcbdbd91b0470bace9ce100fa6ea50f195b86d3b0565e7857"
+  },
+  "bundledModelCount": 58,
+  "evidenceLevel": "static-client-and-offline-runtime",
+  "openaiSdkVersion": "6.25.0",
+  "nodeVersion": "v22.21.1",
+  "electronVersion": "37.10.3",
+  "chromeVersion": "138.0.7204.251",
+  "runtimeEvidence": "workbuddy-5.9.3-offline.json",
+  "productionRequests": 0
+}

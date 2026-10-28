@@ -131,11 +131,9 @@ async fn checkin_run(
             let cutoff = now - 30 * 24 * 60 * 60 * 1000;
             store.checkin_records.retain(|r| r.at >= cutoff);
             // Account state must survive independent of the bounded operation history.
-            store
-                .checkin_states
-                .entry(record_id)
-                .or_default()
-                .observe(&record);
+            if store.accounts.iter().any(|a| a.id == record_id) {
+                store.checkin_states.entry(record_id).or_default().observe(&record);
+            }
             store.checkin_records.push(record);
             if store.checkin_records.len() > 1000 {
                 store
