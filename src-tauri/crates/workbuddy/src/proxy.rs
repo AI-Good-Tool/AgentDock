@@ -185,12 +185,14 @@ async fn query_checkin_status(
         {
             continue;
         }
-        if !response.status().is_success() {
-            return Err("查询签到状态被上游拒绝，未执行签到".into());
+        let status = response.status();
+        let result = response.json::<Value>().await;
+        if !status.is_success() {
+            return Err(crate::checkin::rejection("查询签到状态", status.as_u16(), result.as_ref().unwrap_or(&Value::Null), &[&credential.token]));
         }
-        let result: Value = response.json().await.map_err(|_| "签到状态不是 JSON")?;
+        let result = result.map_err(|_| "签到状态不是 JSON")?;
         if ![json!(0), json!(200)].contains(&result["code"]) {
-            return Err("查询签到状态失败，未执行签到".into());
+            return Err(crate::checkin::rejection("查询签到状态", status.as_u16(), &result, &[&credential.token]));
         }
         return Ok(result);
     }
@@ -256,20 +258,25 @@ async fn checkin_inner(
             .await
             .map_err(|_| "签到连接失败，请先重新查询状态")?;
         lease.status = res.status().as_u16();
-        result = res.json().await.map_err(|_| "签到响应不是 JSON")?;
+        let status = res.status();
+        let response = res.json::<Value>().await;
+        if !status.is_success() {
+            return Err(crate::checkin::rejection("签到", status.as_u16(), response.as_ref().unwrap_or(&Value::Null), &[&cred.token]));
+        }
+        result = response.map_err(|_| "签到响应不是 JSON")?;
         if ![json!(0), json!(200)].contains(&result["code"]) {
             let msg = result["message"]
                 .as_str()
                 .or_else(|| result["msg"].as_str())
                 .unwrap_or("");
             if !msg.contains("已签到") && !msg.to_lowercase().contains("repeat") {
-                return Err("签到被上游拒绝，请查询活动资格".into());
+                return Err(crate::checkin::rejection("签到", status.as_u16(), &result, &[&cred.token]));
             }
         }
         // Query again to display authoritative post-checkin status rather than guess its schema.
         result = query_checkin_status(&state, &a, &cred)
             .await
-            .map_err(|_| "签到已提交，但复查失败；请先查询状态，不要重复提交")?;
+            .map_err(|error| format!("签到已提交，但复查失败；请先查询状态，不要重复提交：{error}"))?;
     }
     if ![json!(0), json!(200)].contains(&result["code"]) {
         return Err("签到已提交，但复查失败；请先查询状态，不要重复提交".into());

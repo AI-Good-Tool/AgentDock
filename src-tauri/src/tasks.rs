@@ -96,13 +96,14 @@ async fn run_locked(hub: &Shared, trigger: &str, _lock: RunLock) -> Value {
     agentdock_core::applog::info("checkin", || {
         (
             format!("开始签到（{}）", trigger_label(trigger)),
-            json!({"workbuddy": c.workbuddy, "qoder": c.qoder, "trae": c.trae}),
+            json!({"workbuddy": c.workbuddy, "qoder": c.qoder, "trae": c.trae, "accountIntervalSeconds": c.account_interval_seconds}),
         )
     });
-    let workbuddy = if c.workbuddy { json!(workbuddy_pass(hub, trigger).await) } else { json!("disabled") };
-    let qoder = if c.qoder { qoder_pass(hub, trigger).await } else { json!("disabled") };
+    let interval = c.account_interval();
+    let workbuddy = if c.workbuddy { json!(workbuddy_pass(hub, trigger, interval).await) } else { json!("disabled") };
+    let qoder = if c.qoder { qoder_pass(hub, trigger, interval).await } else { json!("disabled") };
     let trae = if c.trae {
-        json!(hub.trae.checkin_pass(trigger, &hub.disabled_ids(agentdock_core::provider::ProviderKind::Trae)).await)
+        json!(hub.trae.checkin_pass(trigger, &hub.disabled_ids(agentdock_core::provider::ProviderKind::Trae), || hub.checkin_pacer.acquire(interval)).await)
     } else {
         json!("disabled")
     };
@@ -157,7 +158,7 @@ fn trigger_label(trigger: &str) -> &'static str {
 
 /// Opted-in WorkBuddy CN accounts whose official status is not yet "checked
 /// in today" (Shanghai day); each check queries status before submitting.
-async fn workbuddy_pass(hub: &Shared, trigger: &str) -> Vec<Value> {
+async fn workbuddy_pass(hub: &Shared, trigger: &str, interval: Duration) -> Vec<Value> {
     let shanghai = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
     let today = chrono::Utc::now().with_timezone(&shanghai).date_naive();
     let disabled = hub.disabled_ids(agentdock_core::provider::ProviderKind::Workbuddy);
@@ -183,6 +184,7 @@ async fn workbuddy_pass(hub: &Shared, trigger: &str) -> Vec<Value> {
     let mut out = vec![];
     let mut done = vec![];
     for (id, name) in due {
+        let _pacing = hub.checkin_pacer.acquire(interval).await;
         let r = workbuddy::proxy::checkin_by(hub.wb.clone(), id.clone(), true, trigger).await;
         if r.is_ok() {
             done.push(id.clone());
@@ -199,8 +201,8 @@ async fn workbuddy_pass(hub: &Shared, trigger: &str) -> Vec<Value> {
     out
 }
 
-async fn qoder_pass(hub: &Shared, trigger: &str) -> Value {
-    match qoder_auto_claim(hub, trigger).await {
+async fn qoder_pass(hub: &Shared, trigger: &str, interval: Duration) -> Value {
+    match qoder_auto_claim(hub, trigger, interval).await {
         Some(results) => json!(results),
         None => json!([]),
     }
@@ -208,7 +210,7 @@ async fn qoder_pass(hub: &Shared, trigger: &str) -> Value {
 
 /// Run by hand, every account is claimed and recorded. Otherwise claim only
 /// when a campaign is claimable (or a token needs refreshing).
-pub async fn qoder_auto_claim(hub: &Shared, trigger: &str) -> Option<Vec<Value>> {
+pub async fn qoder_auto_claim(hub: &Shared, trigger: &str, interval: Duration) -> Option<Vec<Value>> {
     let recovery = hub.clone();
     let trigger = trigger.to_owned();
     let results = tokio::task::spawn_blocking(move || {
@@ -221,12 +223,13 @@ pub async fn qoder_auto_claim(hub: &Shared, trigger: &str) -> Option<Vec<Value>>
             active.next().is_some()
         } else {
             active.filter(|a| !a.token.is_empty()).any(|acc| {
+                let _pacing = recovery.checkin_pacer.acquire_blocking(interval);
                 let (status, data) = qc::get_campaigns(acc);
                 (status == 200 && !qc::claimable_campaigns(&data).is_empty())
                     || (status == 401 && !acc.refreshToken.is_empty())
             })
         };
-        let results = need.then(|| qc::claim_all(None, false, &trigger, &disabled));
+        let results = need.then(|| qc::claim_all(None, false, &trigger, &disabled, || recovery.checkin_pacer.acquire_blocking(interval)));
         if recovery.restore_changed_logins(agentdock_core::provider::ProviderKind::Qoder, &before).is_err() {
             agentdock_core::applog::warn("accounts", || ("签到续期后保存登录恢复状态失败".into(), json!({"provider":"qoder"})));
         }

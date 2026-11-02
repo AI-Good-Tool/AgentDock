@@ -292,7 +292,11 @@ impl Provider {
     /// One pass of the unified check-in plan over CN accounts not yet checked
     /// today: every one when run by hand, otherwise those with auto check-in on.
     /// Accounts in `skip` (disabled by the user) are left out.
-    pub async fn checkin_pass(self: &Arc<Self>, trigger: &str, skip: &std::collections::HashSet<String>) -> Vec<Value> {
+    pub async fn checkin_pass<F, Fut, G>(self: &Arc<Self>, trigger: &str, skip: &std::collections::HashSet<String>, before_account: F) -> Vec<Value>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = G>,
+    {
         let manual = trigger == "manual";
         let due: Vec<(String, String)> = self
             .store
@@ -304,6 +308,7 @@ impl Provider {
             .collect();
         let mut results = vec![];
         for (id, name) in due {
+            let _pacing = before_account().await;
             let Ok(_busy) = self.exclusive(&id) else {
                 results.push(json!({"id": id, "name": name, "ok": false, "message": "账号正忙，稍后重试"}));
                 continue;
@@ -425,6 +430,17 @@ impl Provider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn empty_checkin_pass_does_not_enter_the_account_queue() {
+        let dir = std::env::temp_dir().join(format!("agentdock-trae-empty-{}", uuid::Uuid::new_v4()));
+        let provider = Provider::open(&dir).unwrap();
+        let result = provider.checkin_pass("manual", &Default::default(), || async {
+            panic!("an empty platform must not enter the account queue");
+        }).await;
+        assert!(result.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn checkin_day_uses_shanghai_calendar() {
         let t = chrono::DateTime::parse_from_rfc3339("2026-10-20T17:30:00Z")

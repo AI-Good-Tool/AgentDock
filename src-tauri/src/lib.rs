@@ -7,6 +7,7 @@ pub mod app_update;
 pub mod applog;
 pub mod backup;
 pub mod catalog;
+pub mod checkin_pacing;
 pub mod checkin_schedule;
 pub mod commands;
 pub mod logs;

@@ -43,6 +43,7 @@ pub struct Hub {
     pub applog: Arc<crate::applog::AppLog>,
     /// Unified check-in scheduler status (last/next run, per-platform results).
     pub checkin: Mutex<Value>,
+    pub checkin_pacer: crate::checkin_pacing::Pacer,
     /// Wakes the check-in scheduler after its settings change.
     pub checkin_wake: tokio::sync::Notify,
 }
@@ -168,6 +169,7 @@ impl Hub {
             qoder_scheduler: Mutex::new(json!({"lastRun":null,"lastResults":[]})),
             applog,
             checkin: Mutex::new(json!({})),
+            checkin_pacer: Default::default(),
             checkin_wake: tokio::sync::Notify::new(),
         })))
     }
@@ -198,6 +200,7 @@ impl Hub {
             qoder_scheduler: Mutex::new(json!({})),
             applog: crate::applog::AppLog::new(dir),
             checkin: Mutex::new(json!({})),
+            checkin_pacer: Default::default(),
             checkin_wake: tokio::sync::Notify::new(),
         }))
     }

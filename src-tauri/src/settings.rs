@@ -59,6 +59,8 @@ pub struct CheckinSettings {
     pub scheduled: bool,
     /// Legacy interval, retained when importing older settings.
     pub interval_minutes: u32,
+    /// Pause after one account completes before starting the next.
+    pub account_interval_seconds: u32,
     #[serde(default)]
     pub schedule: Option<crate::checkin_schedule::Schedule>,
 }
@@ -71,11 +73,15 @@ impl Default for CheckinSettings {
             on_startup: true,
             scheduled: true,
             interval_minutes: 60,
+            account_interval_seconds: 3,
             schedule: Some(crate::checkin_schedule::Schedule::default()),
         }
     }
 }
 impl CheckinSettings {
+    pub fn account_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.account_interval_seconds))
+    }
     pub fn schedule(&self) -> crate::checkin_schedule::Schedule {
         self.schedule.clone().unwrap_or_else(|| {
             if self.interval_minutes == 60 {
@@ -219,6 +225,9 @@ impl Settings {
         if self.recent_images.is_some_and(|n| !(1..=100).contains(&n)) {
             return Err("保留的图片数量需为 1–100".into());
         }
+        if self.checkin.account_interval_seconds > 300 {
+            return Err("签到账号间隔需为 0–300 秒".into());
+        }
         self.checkin.schedule().validate()?;
         crate::checkin_schedule::validate_zone(&self.timezone)?;
         if !["light", "dark", "system"].contains(&self.theme.as_str()) {
@@ -231,6 +240,23 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checkin_account_interval_defaults_for_old_files_and_validates_custom_values() {
+        let mut settings: Settings = serde_json::from_str(r#"{"version":3,"checkin":{"workbuddy":false}}"#).unwrap();
+        assert_eq!(settings.checkin.account_interval_seconds, 3);
+        assert!(!settings.checkin.workbuddy);
+        for seconds in [0, 3, 15, 300] {
+            settings.checkin.account_interval_seconds = seconds;
+            settings.validate().unwrap();
+            let value = serde_json::to_value(&settings).unwrap();
+            assert_eq!(value["checkin"]["accountIntervalSeconds"], seconds);
+            let restored: Settings = serde_json::from_value(value).unwrap();
+            assert_eq!(restored.checkin.account_interval().as_secs(), u64::from(seconds));
+        }
+        settings.checkin.account_interval_seconds = 301;
+        assert!(settings.validate().is_err());
+        assert!(serde_json::from_value::<Settings>(serde_json::json!({"checkin":{"accountIntervalSeconds":-1}})).is_err());
+    }
     #[test]
     fn checkin_upgrade_defaults_to_seven_and_preserves_custom_intervals() {
         use crate::checkin_schedule::{Kind, Schedule};

@@ -26,7 +26,7 @@ const settings = {
   lang: new URLSearchParams(location.search).get('lang') || 'system',
   timezone: 'system',
   tokenFormat: 'km',
-  checkin: { workbuddy: true, qoder: true, trae: true, onStartup: true, scheduled: true, intervalMinutes: 60, schedule: { kind: 'daily', every: 1, time: '07:00', weekdays: [1, 2, 3, 4, 5], date: '' } },
+  checkin: { workbuddy: true, qoder: true, trae: true, onStartup: true, scheduled: true, intervalMinutes: 60, accountIntervalSeconds: 3, schedule: { kind: 'daily', every: 1, time: '07:00', weekdays: [1, 2, 3, 4, 5], date: '' } },
   logging: true,
   version: 3,
 } as Record<string, any>

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "agentdock"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 description = "AgentDock — WorkBuddy / Qoder / Trae unified local workspace and model gateway"
 
@@ -47,6 +47,7 @@ chrono-tz = "0.10"
 fs2 = "0.4"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 agentdock-qoder = { path = "crates/qoder", features = ["fixtures"] }
 agentdock-trae = { path = "crates/trae", features = ["fixtures"] }
 

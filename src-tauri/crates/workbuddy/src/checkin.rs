@@ -146,6 +146,34 @@ pub fn retry_due(attempt: Option<&Attempt>, day: &str, now: i64) -> bool {
     };
     now - a.at >= delay * 60_000
 }
+
+/// Keep useful upstream diagnostics without storing arbitrary response fields.
+pub fn rejection(action: &str, http_status: u16, data: &Value, secrets: &[&str]) -> String {
+    let mut details = crate::diagnostics::RequestDetails::default();
+    details.upstream_error(data, secrets);
+    let error = &details.error;
+    let message = error["displayMessage"].as_str()
+        .or_else(|| error["message"].as_str())
+        .or_else(|| error["msg"].as_str())
+        .unwrap_or("上游未提供错误说明");
+    let lower = message.to_lowercase();
+    let code = error.get("code").map(|code| {
+        code.as_str().map(str::to_owned).unwrap_or_else(|| code.to_string())
+    });
+    let reason = if http_status == 429 || code.as_deref() == Some("429")
+        || lower.contains("too many") || lower.contains("rate limit")
+        || message.contains("频繁") || message.contains("限流")
+    {
+        "请求过于频繁，请稍后再试"
+    } else if http_status == 401 || code.as_deref() == Some("401") {
+        "登录凭证已失效，请重新登录"
+    } else {
+        "请求被上游拒绝"
+    };
+    let code = code.map(|code| format!("，code {code}")).unwrap_or_default();
+    format!("{action}失败：{reason}（HTTP {http_status}{code}）：{message}")
+}
+
 pub fn normalize(data: &Value) -> Result<Value, String> {
     if !data.is_object() {
         return Err("签到状态数据异常，未执行签到".into());
@@ -190,6 +218,23 @@ pub fn normalize(data: &Value) -> Result<Value, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn rejection_distinguishes_rate_limits_auth_and_business_errors_without_leaking_secrets() {
+        let rate = rejection("签到", 429, &Value::Null, &[]);
+        assert!(rate.contains("请求过于频繁"));
+        assert!(rate.contains("HTTP 429"));
+        let rate = rejection("签到", 200, &json!({"code":429,"msg":"too many requests"}), &[]);
+        assert!(rate.contains("请求过于频繁"));
+        let auth = rejection("查询签到状态", 401, &json!({"code":"Unauthorized","message":"expired"}), &[]);
+        assert!(auth.contains("请重新登录"));
+        let business = rejection("签到", 200, &json!({
+            "code": 1001, "message": "活动未开放 token=fixture-secret", "access_token":"fixture-secret", "data":{"private":"ignored"}
+        }), &["fixture-secret"]);
+        assert!(business.contains("code 1001"));
+        assert!(business.contains("活动未开放 token=[REDACTED]"));
+        assert!(!business.contains("fixture-secret"));
+        assert!(!business.contains("ignored"));
+    }
     #[test]
     fn cached_state_survives_log_eviction_and_error_preserves_last_success() {
         let mut state = AccountState::default();

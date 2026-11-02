@@ -691,6 +691,7 @@ pub async fn wb_switch_client(hub: State<'_, Shared>, id: String, target: String
 }
 #[tauri::command]
 pub async fn wb_checkin(hub: State<'_, Shared>, id: String, submit: bool) -> Res {
+    let _pacing = hub.checkin_pacer.acquire(hub.settings().checkin.account_interval()).await;
     let r = workbuddy::proxy::checkin(hub.wb.clone(), id.clone(), submit).await;
     if submit && r.is_ok() {
         // The reward lands in the credit balance: refresh it so the pool and check-in views agree.
@@ -816,9 +817,10 @@ pub async fn qoder_switch_account(id: String) -> Res {
     .await
 }
 /// Without an id, claims every account except the disabled ones in `skip`.
-pub fn qoder_claim_blocking(id: Option<String>, skip: &std::collections::HashSet<String>) -> Value {
+pub fn qoder_claim_blocking(id: Option<String>, skip: &std::collections::HashSet<String>, pacer: &crate::checkin_pacing::Pacer, interval: std::time::Duration) -> Value {
     use qoder::qcore as qc;
     if let Some(aid) = id {
+        let _pacing = pacer.acquire_blocking(interval);
         let mut accounts = qc::load_accounts();
         match accounts.iter().position(|a| a.id() == aid) {
             Some(i) => {
@@ -830,7 +832,7 @@ pub fn qoder_claim_blocking(id: Option<String>, skip: &std::collections::HashSet
             None => json!({"ok":false,"message":"账号不存在"}),
         }
     } else {
-        let results = qc::claim_all(None, false, "manual", skip);
+        let results = qc::claim_all(None, false, "manual", skip, || pacer.acquire_blocking(interval));
         let total: f64 = results.iter().filter_map(|r| r["credits"].as_f64()).sum();
         let lines: Vec<String> = results.iter().map(|r| format!("{} {}", r["name"].as_str().unwrap_or(""), r["msg"].as_str().unwrap_or(""))).collect();
         json!({"ok":true,"message":format!("共领取 {} Credits。{}", total, lines.join("；")),"results":results})
@@ -839,9 +841,10 @@ pub fn qoder_claim_blocking(id: Option<String>, skip: &std::collections::HashSet
 #[tauri::command]
 pub async fn qoder_claim(hub: State<'_, Shared>, id: Option<String>) -> Res {
     let hub = hub.inner().clone();
+    let interval = hub.settings().checkin.account_interval();
     blocking(move || {
         let before = hub.credential_revisions(ProviderKind::Qoder);
-        let result = qoder_claim_blocking(id, &hub.disabled_ids(ProviderKind::Qoder));
+        let result = qoder_claim_blocking(id, &hub.disabled_ids(ProviderKind::Qoder), &hub.checkin_pacer, interval);
         hub.restore_changed_logins(ProviderKind::Qoder, &before)?;
         Ok(result)
     }).await?
@@ -1104,6 +1107,7 @@ pub async fn trae_refresh_token(hub: State<'_, Shared>, id: String) -> Res {
 }
 #[tauri::command]
 pub async fn trae_checkin(hub: State<'_, Shared>, id: String) -> Res {
+    let _pacing = hub.checkin_pacer.acquire(hub.settings().checkin.account_interval()).await;
     let _busy = hub.trae.exclusive(&id)?;
     let result = hub.trae.checkin(&id, "manual").await?;
     drop(_busy);

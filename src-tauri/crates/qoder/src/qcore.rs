@@ -938,11 +938,12 @@ pub fn claim_account(acc: &mut Account, dry_run: bool) -> Value {
 
 /// `trigger` (manual / startup / scheduled / launchd) is kept with the claim log
 /// entry. Accounts whose id is in `skip` (disabled by the user) are left out.
-pub fn claim_all(
+pub fn claim_all<G>(
     edition_filter: Option<&str>,
     dry_run: bool,
     trigger: &str,
     skip: &std::collections::HashSet<String>,
+    mut before_account: impl FnMut() -> G,
 ) -> Vec<Value> {
     let mut accounts = load_accounts();
     let mut results = vec![];
@@ -950,6 +951,7 @@ pub fn claim_all(
         if edition_filter.is_some_and(|f| acc.edition != f) || skip.contains(&acc.id()) {
             continue;
         }
+        let _pacing = before_account();
         let res = claim_account(acc, dry_run);
         results.push(res);
     }

@@ -55,6 +55,7 @@ export interface CheckinSettings {
   onStartup: boolean
   scheduled: boolean
   intervalMinutes: number
+  accountIntervalSeconds: number
   schedule?: CheckinSchedule | null
 }
 export interface CheckinSchedule {

@@ -22,7 +22,7 @@ onMounted(async () => {
 
 // Unified schedule (all three platforms)
 const plan = computed<CheckinSettings>(
-  () => state.app?.settings.checkin ?? { workbuddy: true, qoder: true, trae: true, onStartup: true, scheduled: true, intervalMinutes: 60 }
+  () => state.app?.settings.checkin ?? { workbuddy: true, qoder: true, trae: true, onStartup: true, scheduled: true, intervalMinutes: 60, accountIntervalSeconds: 3 }
 )
 const status = computed(() => state.app?.checkin ?? {})
 // Partial patches (merged server-side) with a key per field, so quick toggles never drop or revert each other.
@@ -168,6 +168,21 @@ async function traeAll() {
           <small class="plan-result">{{ t('上次：', 'Last: ') }}{{ resultText(p.key) }}</small>
         </div>
         <a-switch :model-value="plan[p.key]" :loading="busy(`checkin:${p.key}`)" @change="(v) => setPlan({ [p.key]: !!v })" />
+      </div>
+    </div>
+    <div class="field-row" style="grid-template-columns: minmax(0, 1fr) auto">
+      <div><b>{{ t('账号签到间隔', 'Account check-in interval') }}</b><small>{{ t('账号依次执行，处理完成后再等待所设秒数；默认 3 秒，0 表示不额外等待。手动批量、启动后、定时及系统任务共用此设置。', 'Accounts run in sequence, waiting this long after each completes. Default: 3 seconds; 0 adds no delay. Shared by manual batches, startup, scheduled and system tasks.') }}</small></div>
+      <div class="control end">
+        <a-input-number
+          :model-value="plan.accountIntervalSeconds ?? 3"
+          :min="0"
+          :max="300"
+          :precision="0"
+          :disabled="busy('checkin:accountIntervalSeconds')"
+          :aria-label="t('账号签到间隔（秒）', 'Account check-in interval (seconds)')"
+          style="width: 150px"
+          @change="(v) => v != null && setPlan({ accountIntervalSeconds: v })"
+        ><template #suffix>{{ t('秒', 's') }}</template></a-input-number>
       </div>
     </div>
     <div class="field-row">
