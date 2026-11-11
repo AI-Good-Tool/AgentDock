@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { revealPhones, setAccountDisabled } from '../../store'
 import { computed } from 'vue'
+import ProviderMark from '../ProviderMark.vue'
 import { IconMobile,
   IconPlayCircle,
   IconStop,
@@ -77,7 +78,7 @@ const travelTip = computed(() =>
 )
 const color = computed(() => Array.from(name.value).reduce((n, c) => n + c.charCodeAt(0), 0) % 3)
 const targets = computed(() => [
-  { id: 'workbuddy', name: t('设为当前', 'Use'), mark: 'W', available: true },
+  { id: 'workbuddy', name: 'WorkBuddy', mark: 'W', available: true },
   {
     id: 'ide',
     name: 'IDE',
@@ -86,12 +87,12 @@ const targets = computed(() => [
       ?.available,
   },
   { id: 'vscode', name: 'VS Code', mark: '‹›', available: props.clients?.vscode?.available },
-  { id: 'cli', name: t('CLI 当前', 'CLI'), mark: '>_', available: props.clients?.cli?.available },
+  { id: 'cli', name: 'CLI', mark: '>_', available: props.clients?.cli?.available },
 ])
 </script>
 <template>
   <article
-    class="switch-card"
+    class="switch-card wb-account-card"
     :class="[
       { 'current-card': active.workbuddy, 'compact-card': compact, 'auth-invalid-card': loginInvalid && !account.disabled, 'account-disabled-card': account.disabled },
       `tone-${color}`,
@@ -165,9 +166,9 @@ const targets = computed(() => [
           ></template
         ></a-dropdown
       >
-      <span v-if="active.workbuddy || active.cli" class="client-watermark">{{
-        active.cli ? '>_' : 'W'
-      }}</span>
+      <div v-if="targets.some(target => active[target.id])" class="wb-current-clients">
+        <span v-for="target in targets.filter(target => active[target.id])" :key="target.id"><IconCheck /> {{ target.name }}</span>
+      </div>
     </header>
     <AccountDisabledBar v-if="account.disabled" provider="workbuddy" :id="account.id" />
     <AccountAuthAlert v-else-if="loginInvalid" :expired="expired" :disabled="!account.enabled" />
@@ -234,24 +235,18 @@ const targets = computed(() => [
       </div>
     </section>
     <footer class="switch-card-footer">
-      <div class="client-buttons">
-        <button :disabled="busy" :title="t('手动续期登录 Token', 'Renew the login token now')" @click="emit('renew')">
-          <IconRefresh :spin="busy" /> {{ t('续期', 'Renew') }}
-        </button>
-        <button
-          v-for="target in targets"
-          :key="target.id"
+      <div class="wb-client-heading"><span>{{ t('客户端账号', 'Client accounts') }}</span><button :disabled="busy" :title="t('手动续期登录 Token', 'Renew the login token now')" @click="emit('renew')"><IconRefresh :spin="busy" /> {{ t('续期', 'Renew') }}</button></div>
+      <div class="wb-client-grid">
+        <button v-for="target in targets" :key="target.id" type="button"
           :disabled="busy || (!target.available && !active[target.id])"
           :class="[{ selected: active[target.id] }, target.id]"
-          :title="
-            target.available || active[target.id]
-              ? t(`切换 ${target.id} 账号`, `Switch ${target.id} account`)
-              : t(`未配置 ${target.id} 客户端或扩展`, `${target.id} client not configured`)
-          "
-          @click="emit('switch', target.id)"
-        >
-          <i>{{ target.mark }}</i
-          ><IconCheck v-if="active[target.id]" /><span v-else>{{ target.name }}</span>
+          :aria-label="t(`切换 ${target.name} 账号`, `Switch ${target.name} account`)"
+          :title="target.available || active[target.id] ? t(`切换 ${target.name} 账号及会话`, `Switch ${target.name} account and sessions`) : t(`未配置 ${target.name} 客户端或扩展`, `${target.name} client not configured`)"
+          @click="emit('switch', target.id)">
+          <ProviderMark v-if="target.id === 'workbuddy'" provider="workbuddy" />
+          <i v-else>{{ target.mark }}</i>
+          <span><b>{{ target.name }}</b><small>{{ active[target.id] ? t('当前账号', 'Signed in') : target.available ? t('切换账号', 'Switch account') : t('未配置', 'Not configured') }}</small></span>
+          <IconCheck v-if="active[target.id]" class="wb-client-check" />
         </button>
       </div>
       <div class="account-toggle-row">
@@ -290,3 +285,27 @@ const targets = computed(() => [
     </footer>
   </article>
 </template>
+
+
+<style scoped>
+.wb-account-card .switch-card-header { padding-bottom: 38px; }
+.wb-current-clients { position: absolute; left: 17px; right: 17px; bottom: 11px; display: flex; flex-wrap: wrap; gap: 8px; }
+.wb-current-clients span { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font-size: 10px; font-weight: 600; }
+.wb-client-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; color: var(--muted); font-size: 10px; }
+.wb-client-heading button { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: var(--muted); padding: 3px 0 3px 6px; cursor: pointer; font-size: 11px; }
+.wb-client-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.wb-client-grid > button { position: relative; display: flex; align-items: center; gap: 8px; min-height: 48px; padding: 8px 9px; border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: var(--surface); text-align: left; cursor: pointer; transition: background .15s, border-color .15s; }
+.wb-client-grid > button:hover:enabled { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 4%, var(--surface)); }
+.wb-client-grid > button:focus-visible, .wb-client-heading button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wb-client-grid > button:disabled { opacity: .48; cursor: default; }
+.wb-client-grid > button.selected { border-color: color-mix(in srgb, var(--accent) 35%, var(--line)); background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
+.wb-client-grid i, .wb-client-grid :deep(.pmark) { width: 25px; height: 25px; border-radius: 7px; flex: none; }
+.wb-client-grid i { display: grid; place-items: center; font: 700 13px monospace; color: white; background: #9477d4; }
+.wb-client-grid .vscode i { background: #448dc3; }
+.wb-client-grid .cli i { background: #303c38; }
+.wb-client-grid b { display: block; font-size: 11px; font-weight: 600; }
+.wb-client-grid small { display: block; font-size: 9px; margin-top: 3px; color: var(--muted); }
+.wb-client-check { margin-left: auto; flex: none; color: var(--accent); font-size: 13px; }
+.compact-card .wb-client-grid > button { min-height: 40px; padding: 6px 8px; }
+.compact-card .wb-client-grid small { display: none; }
+</style>

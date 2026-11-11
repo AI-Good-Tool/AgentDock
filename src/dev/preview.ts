@@ -293,6 +293,26 @@ export function preview(command: string, args?: Record<string, any>): unknown {
       if (command === 'wb_renew_token') return { ok: true, message: 'Token 已续期，登录状态已刷新' }
       return command === 'wb_import_accounts' ? { count: 1, accountId: id, updated: true } : { done: true, added: true, accountId: id }
     }
+    case 'wb_switch_preview':
+      if (args?.target === 'cli') return { sessions: [], groups: [] }
+      return {
+        sourceUid: 'u1', targetUid: 'u2', storeStatus: 'ready', supported: true,
+        sessions: [
+          { id: 'copy1', workspaceHash: 'workspace1', title: '为 AgentDock 设计新的设置页', cwd: '/projects/agentdock', updatedAt: now - 3600e3, hasHistory: true },
+          { id: 'copy2', workspaceHash: 'workspace2', title: '排查本地开发环境', cwd: '/projects/tooling', updatedAt: now - day, hasHistory: true },
+          { id: 'copy3', workspaceHash: 'workspace2', title: '仅云端保存的对话', updatedAt: now - day, hasHistory: false },
+        ],
+        groups: [
+          { groupId: 'g1', title: '重构签到调度', cwd: '/projects/agentdock', verdict: 'fastForward', previewToken: 'preview-safe', availableModes: ['fastForward'], defaultChecked: true, recordCount: { source: 128, target: 96, baseline: 96 }, reason: '来源包含目标全文和新增记录' },
+          { groupId: 'g2', title: '排查 Tauri 构建失败', verdict: 'ahead', availableModes: [], defaultChecked: false, recordCount: { source: 32, target: 48, baseline: 32 }, reason: '目标账号包含新内容，保留目标内容' },
+          { groupId: 'g3', title: '解决后端启动依赖报错', verdict: 'identical', availableModes: [], defaultChecked: false, recordCount: { source: 24, target: 24, baseline: 24 }, reason: '两边内容一致' },
+          { groupId: 'g4', title: '红米 Buds 8 Pro 与小米 Air 5 对比', verdict: 'diverge', previewToken: 'preview-conflict', availableModes: ['overwrite'], defaultChecked: false, extraB: 74, recordCount: { source: 86, target: 98, baseline: 24 }, reason: '双方都有新增内容，需明确选择覆盖' },
+          { groupId: 'g5', title: '归档已经完成的任务', verdict: 'identical', previewToken: 'preview-archive', availableModes: [], archiveAction: 'statusOnly', defaultChecked: false, recordCount: { source: 16, target: 16, baseline: 16 }, reason: '来源已归档，目标可以同步归档状态' },
+          { groupId: 'g6', title: '本地正文缺失的会话', verdict: 'unknown', availableModes: [], defaultChecked: false, reason: '目标正文不可读取' },
+        ],
+      }
+    case 'wb_switch_client':
+      return { ok: true, target: args?.target, sessionCopy: { copied: (args?.copySessionIds || []).length ? args?.copySessionIds : args?.copyItems || [] }, sessionSync: { synced: args?.syncSelections || [], skipped: [], errors: [] } }
     case 'wb_session_accounts':
       return { variant: args?.variant, current: 'u1', running: args?.variant === 'cn', accounts: args?.variant === 'cn' ? [{ uid: 'u1', name: 'wb-main', current: true, inLibrary: true }, { uid: 'u2', name: 'wb-backup', current: false, inLibrary: true }] : [{ uid: 'u9', name: 'wb-global', current: false, inLibrary: true }] }
     case 'wb_list_sessions':

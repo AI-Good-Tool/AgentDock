@@ -124,15 +124,93 @@ pub async fn refresh_credit(state: Shared, id: String) -> Result<Value, String> 
     Ok(credit)
 }
 
+/// Preview the same client-specific session sources used by Switch's dialogs.
+pub fn switch_preview(state: &Shared, id: &str, target: &str) -> Result<Value, String> {
+    let a = state
+        .store
+        .lock()
+        .unwrap()
+        .accounts
+        .iter()
+        .find(|a| a.id == id)
+        .cloned()
+        .ok_or("账号不存在")?;
+    let raw = source_account(&a)?;
+    if target == "cli" {
+        return Ok(json!({"sessions": [], "groups": []}));
+    }
+    let (listing, links) = match target {
+        "workbuddy" => {
+            let variant = switch::account::variant_of(&raw);
+            let uid = switch::session::current_user_uid(variant);
+            let sessions = uid
+                .as_deref()
+                .map(|u| switch::session::list_sessions_for_user(variant, u))
+                .unwrap_or(json!([]));
+            let links = if uid.as_deref() == raw["uid"].as_str() || uid.is_none() {
+                Ok(json!({"groups": []}))
+            } else {
+                switch::session::session_links_preview(variant, &raw)
+            };
+            (json!({"sourceUid": uid, "sessions": sessions}), links)
+        }
+        "ide" if a.variant == "cn" => (
+            switch::codebuddy_ide_session::list_current_codebuddy_ide_sessions(),
+            switch::codebuddy_ide_session_sync::links_preview(&raw),
+        ),
+        "ide" => (
+            switch::codebuddy_ide_session::list_current_intl_ide_sessions(),
+            switch::codebuddy_ide_session_sync::links_preview_intl(&raw),
+        ),
+        "vscode" => {
+            let uid = switch::vscode_ext::active_ext_uid();
+            let listing = uid
+                .as_deref()
+                .map(switch::vscode_session::list_vscode_sessions)
+                .unwrap_or(json!({"sessions": []}));
+            (listing, switch::vscode_session_sync::links_preview(&raw))
+        }
+        _ => return Err("不支持的客户端".into()),
+    };
+    let same = listing["sourceUid"].as_str().is_some() && listing["sourceUid"] == raw["uid"];
+    let mut result = json!({
+        "sourceUid": listing["sourceUid"], "targetUid": raw["uid"], "sameAccount": same,
+        "sessions": if same { json!([]) } else { listing["sessions"].clone() },
+        "skipped": listing["skipped"], "groups": [],
+    });
+    if !same {
+        match links {
+            Ok(links) => {
+                result["groups"] = links["groups"].clone();
+                result["storeStatus"] = links["storeStatus"].clone();
+                result["storeError"] = links["storeError"].clone();
+                result["supported"] = links["supported"].clone();
+            }
+            Err(error) => result["previewError"] = json!(error),
+        }
+    }
+    Ok(result)
+}
+
 pub fn switch_client(
     state: &Shared,
     id: &str,
     target: &str,
     confirmed: bool,
     frozen: &HashSet<String>,
+    copy_ids: &[String],
+    copy_items: &[switch::vscode_session::CopyItem],
+    selections: &[switch::session::SyncSelection],
+    progress: Option<&switch::switch::ProgressFn>,
 ) -> Result<Value, String> {
     if !confirmed {
         return Err("请先确认客户端重启和登录态改写".into());
+    }
+    if (target != "workbuddy" && !copy_ids.is_empty())
+        || (!["ide", "vscode"].contains(&target) && !copy_items.is_empty())
+        || (target == "cli" && !selections.is_empty())
+    {
+        return Err("会话迁移参数与目标客户端不匹配".into());
     }
     let a = state
         .store
@@ -146,16 +224,60 @@ pub fn switch_client(
     let raw = source_account(&a)?;
     let source_id = raw["id"].as_str().ok_or("缺少来源账号 ID")?;
     let result = match target {
-        "workbuddy" => switch::switch::switch_account(None, source_id, true, false, &[], &[]),
+        "workbuddy" => {
+            switch::switch::switch_account(progress, source_id, true, false, copy_ids, selections)
+        }
         "cli" => switch::codebuddy_cli::switch_active_account(source_id),
-        "ide" if a.variant == "cn" => switch::codebuddy_cn_ide::switch_account(source_id, true),
-        "ide" => switch::codebuddy_ide::switch_account(source_id, true),
-        "vscode" => switch::vscode_ext::switch_account(source_id, true),
+        "ide" if a.variant == "cn" => {
+            switch::codebuddy_ide_session::switch_codebuddy_cn_ide_with_copy(
+                source_id, true, copy_items, selections,
+            )
+        }
+        "ide" => switch::codebuddy_ide_session::switch_codebuddy_intl_ide_with_copy(
+            source_id, true, copy_items, selections,
+        ),
+        "vscode" => switch::vscode_session::switch_vscode_ext_with_copy(
+            source_id, true, copy_items, selections,
+        ),
         _ => Err("不支持的客户端".into()),
     }?;
     refresh_local(state, frozen)?;
-    // Core switch reports may include profile metadata: keep the frontend result minimal.
-    Ok(json!({"ok":true,"target":target,"status":result["status"]}))
+    Ok(switch_report(target, &result))
+}
+
+/// Expose migration outcomes without forwarding client credentials/profile blobs.
+fn switch_report(target: &str, result: &Value) -> Value {
+    let mut report = json!({"ok":true,"target":target,"status":result["status"]});
+    for key in ["sessionCopy", "sessionSync", "sessionRecovery", "backup"] {
+        if let Some(value) = result.get(key) {
+            report[key] = value.clone();
+        }
+    }
+    report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switch_report_keeps_partial_failures_and_recovery_but_excludes_credentials() {
+        let raw = json!({
+            "access_token": "private", "account": {"refresh_token": "private"},
+            "sessionCopy": {"copied": ["one"], "errors": [{"id": "two", "error": "unreadable"}]},
+            "sessionSync": {"synced": [], "skipped": [{"groupId": "g", "reason": "stale"}]},
+            "sessionRecovery": {"needsRecovery": [{"operationId": "op", "reason": "retry"}]},
+            "backup": "/backup/auth.info"
+        });
+        let report = switch_report("workbuddy", &raw);
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["sessionCopy"], raw["sessionCopy"]);
+        assert_eq!(report["sessionSync"], raw["sessionSync"]);
+        assert_eq!(report["sessionRecovery"], raw["sessionRecovery"]);
+        assert_eq!(report["backup"], raw["backup"]);
+        assert!(report.get("access_token").is_none());
+        assert!(report.get("account").is_none());
+    }
 }
 
 pub fn observe_limit(state: &Shared, id: &str, model: &str, data: &Value) -> bool {

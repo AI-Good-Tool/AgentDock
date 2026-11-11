@@ -682,10 +682,40 @@ pub async fn wb_refresh_credits(hub: State<'_, Shared>, ids: Vec<String>) -> Res
     workbuddy::settings::refresh_accounts(hub.wb.clone(), ids).await
 }
 #[tauri::command]
-pub async fn wb_switch_client(hub: State<'_, Shared>, id: String, target: String, confirmed: bool) -> Res {
+pub async fn wb_switch_preview(hub: State<'_, Shared>, id: String, target: String) -> Res {
+    let wb = hub.wb.clone();
+    blocking(move || workbuddy::switch_bridge::switch_preview(&wb, &id, &target)).await?
+}
+#[tauri::command]
+pub async fn wb_switch_client(
+    app: tauri::AppHandle,
+    hub: State<'_, Shared>,
+    id: String,
+    target: String,
+    confirmed: bool,
+    copy_session_ids: Option<Vec<String>>,
+    copy_items: Option<Vec<wb_switch_core::modules::vscode_session::CopyItem>>,
+    sync_selections: Option<Value>,
+) -> Res {
+    use tauri::Emitter;
+    let selections =
+        wb_switch_core::modules::session::parse_sync_selections(sync_selections.as_ref())?;
     let hub = hub.inner().clone();
     blocking(move || {
-        workbuddy::switch_bridge::switch_client(&hub.wb, &id, &target, confirmed, &hub.disabled_ids(ProviderKind::Workbuddy))
+        let progress: wb_switch_core::modules::switch::ProgressFn = Box::new(move |message| {
+            let _ = app.emit("wb-switch-progress", json!({"message": message}));
+        });
+        workbuddy::switch_bridge::switch_client(
+            &hub.wb,
+            &id,
+            &target,
+            confirmed,
+            &hub.disabled_ids(ProviderKind::Workbuddy),
+            &copy_session_ids.unwrap_or_default(),
+            &copy_items.unwrap_or_default(),
+            &selections,
+            Some(&progress),
+        )
     })
     .await?
 }

@@ -104,6 +104,7 @@ pub fn run_desktop() {
             commands::wb_refresh_statuses,
             commands::wb_refresh_credits,
             commands::wb_renew_token,
+            commands::wb_switch_preview,
             commands::wb_switch_client,
             commands::wb_checkin,
             commands::wb_credit_statistics,

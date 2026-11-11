@@ -7,6 +7,7 @@ import PageHead from '../components/PageHead.vue'
 import AccountCard from '../components/workbuddy/AccountCard.vue'
 import AddAccountDialog from '../components/workbuddy/AddAccountDialog.vue'
 import WbDrawers from '../components/WbDrawers.vue'
+import WbSwitchDialog from '../components/workbuddy/WbSwitchDialog.vue'
 import QoderCard from '../components/QoderCard.vue'
 import QoderSwitchDialog from '../components/QoderSwitchDialog.vue'
 import QoderInfoDialog from '../components/QoderInfoDialog.vue'
@@ -157,27 +158,7 @@ async function wbCredits(ids: string[]) {
   }
 }
 function wbSwitch(a: any, target: string) {
-  const names: Record<string, string> = {
-    workbuddy: 'WorkBuddy',
-    ide: 'CodeBuddy IDE',
-    vscode: 'VS Code',
-    cli: 'CodeBuddy CLI',
-  }
-  Modal.confirm({
-    title: t(`切换 ${names[target]} 账号`, `Switch ${names[target]} account`),
-    content: t(
-      `将 ${names[target]} 切换为「${accountName(a)}」。此操作会备份并改写目标客户端登录态，关闭正在运行的目标客户端；CLI 会话会中断，其余目标会重新打开。请先保存工作。`,
-      `Switch ${names[target]} to “${accountName(a)}”. The target client's login is backed up and rewritten and the running client is closed (CLI sessions end; others reopen). Save your work first.`
-    ),
-    okText: t('确认切换', 'Switch'),
-    cancelText: t('取消', 'Cancel'),
-    onOk: () =>
-      act(
-        'wb-switch',
-        () => call('wb_switch_client', { id: a.id, target, confirmed: true }),
-        t('客户端账号已切换', 'Client account switched')
-      ),
-  })
+  dialog.value = { kind: 'wb-switch', account: a, target }
 }
 function wbImport(source: string) {
   return act(
@@ -620,6 +601,7 @@ const qEditions = computed(() => state.pool?.qoder?.editions ?? {})
     :account="state.pool?.workbuddy?.accounts.find((a: any) => a.id === dialog!.id)"
     @close="dialog = null"
   />
+  <WbSwitchDialog v-if="dialog?.kind === 'wb-switch'" :account="dialog.account" :target="dialog.target" @close="dialog = null" />
   <QoderSwitchDialog
     v-if="dialog?.kind === 'qoder-switch'"
     :account="dialog.account"
