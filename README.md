@@ -6,6 +6,7 @@
   <p>
     <a href="https://github.com/AI-Good-Tool/AgentDock/releases">下载安装</a> ·
     <a href="#快速开始">快速开始</a> ·
+    <a href="#账号删除与批量导出">账号删除与批量导出</a> ·
     <a href="#workbuddy-账号与会话">WorkBuddy 账号与会话</a> ·
     <a href="#界面预览">界面预览</a> ·
     <a href="https://github.com/AI-Good-Tool/AgentDock/issues">反馈问题</a>
@@ -86,6 +87,22 @@ curl http://127.0.0.1:24800/v1/chat/completions \
 ```
 
 </details>
+
+## 账号删除与批量导出
+
+「账号池」支持管理 WorkBuddy、Qoder 和 Trae 的账号。批量操作可覆盖当前筛选范围内的多个平台。
+
+- **删除单个账号**时，打开账号卡片右上角的「⋯」，选择「删除账号」，核对确认框后点击「确认删除」。
+- **批量删除**时，勾选账号卡片，或点击「全选当前筛选」，再点击「批量删除」并确认。更改平台、地区或搜索条件时，隐藏的账号会自动取消勾选。部分删除失败时，AgentDock 会保留失败项并提示结果。
+- **批量导出**时，勾选账号后点击「导出所选」，也可以从页面顶部打开「批量导出」。在弹窗里核对或调整当前筛选范围内的选择，再点击 **导出到「下载」**。JSON 保留平台和地区，可通过「导入 JSON」恢复。文件包含完整登录凭据，请妥善保管。
+
+删除 WorkBuddy 账号会将其移出 AgentDock 账号池，原始 WorkBuddy Switch 账号库保留。删除 Qoder 或 Trae 账号会移除本机账号库中的对应记录。三个平台的客户端当前登录均保留。删除后，账号停止接收新请求和定时任务，已开始的请求可以继续完成。
+
+以下截图使用演示账号。
+
+![AgentDock 账号卡片的完整下拉菜单，底部显示删除账号](docs/images/account-pool-menu.jpg)
+
+![AgentDock 账号池全选当前筛选后显示导出所选、批量删除和取消选择](docs/images/account-pool-batch.jpg)
 
 ## WorkBuddy 账号与会话
 
